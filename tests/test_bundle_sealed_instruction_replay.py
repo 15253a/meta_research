@@ -66,8 +66,6 @@ def test_completed_signed_operation_replays_without_rewriting_frozen_inputs(seal
     assert authority.issued[-1]["capability_binding_hash"] == canonical_hash(dispatch.runtime_binding.as_dict())
     assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == original
 
-    # A real installed Skill revision changes the common profile identity. It
-    # does not authorize old roots to migrate their frozen runtime binding.
     source = Path(_developer(runner.calls[0][0]).split("Role skill source: ", 1)[1].splitlines()[0])
     original_read = Path.read_text
 
@@ -77,10 +75,14 @@ def test_completed_signed_operation_replays_without_rewriting_frozen_inputs(seal
 
     monkeypatch.setattr(Path, "read_text", refreshed)
     current = provider.runtime_binding()
-    assert not bundle_bindings_compatible(dispatch.runtime_binding, current)
-    for old_request in (dispatch, replace(dispatch, job_ref="bundle-job:stale-next", generation=3)):
-        with pytest.raises(BundleSkillUnavailable, match="^bundle_runtime_binding_drift$"):
-            provider.schedule_targets(old_request)
+    assert current.packaged_skill_bundle_hash != dispatch.runtime_binding.packaged_skill_bundle_hash
+    assert bundle_bindings_compatible(dispatch.runtime_binding, current)
+    assert provider.schedule_targets(dispatch) == first
+    assert len(runner.calls) == 2
+    with pytest.raises(BundleSkillUnavailable, match="^bundle_runtime_binding_drift$"):
+        provider.schedule_targets(
+            replace(dispatch, runtime_binding=replace(dispatch.runtime_binding, model_ref="other-model"))
+        )
     assert len(runner.calls) == 2
     assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == original
 

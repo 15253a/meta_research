@@ -59,6 +59,7 @@ from meta_research.sealed_provider_operations import (
     read_business_input, read_completed_operation, read_sealed_invocation,
 )
 from meta_research.semantic_mcp import SemanticMcpError
+from meta_research.runtime_binding_compatibility import plan_bindings_compatible
 from meta_research.root_capabilities import merge_root_capability_bindings
 from meta_research.quest_drafting import (
     PROVIDER_RESULT_MAX_BYTES,
@@ -470,7 +471,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
 
     @resource_preparation
     def generate_draft(self, request: PlanSkillRequest) -> PlanSkillDraft:
-        if request.runtime_binding != self.runtime_binding():
+        if not plan_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise PlanSkillUnavailable("plan_runtime_binding_drift")
         lineage = _plan_owner_rejection_prompt(request)
         goal_guidance = (
@@ -714,7 +715,7 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         # Root policy organizes advisory review before returning a candidate.
         # This retained adapter seam validates/checkpoints that candidate; it
         # neither launches a review turn nor attests a review/approval event.
-        if request.runtime_binding != self.runtime_binding():
+        if not plan_bindings_compatible(request.runtime_binding, self.runtime_binding()):
             raise PlanSkillUnavailable("plan_runtime_binding_drift")
         if request.native_session_ref != draft.primary_session_ref:
             raise PlanSkillUnavailable("codex_primary_session_changed")

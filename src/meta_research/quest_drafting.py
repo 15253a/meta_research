@@ -1954,6 +1954,7 @@ def _remove_durable_job(directory: Path) -> None:
         "provider-started.json",
         "supervisor-exit.json",
         "call-observation.json",
+        "root-session-observation-gap.json",
         "supervisor-stop.json",
         "supervisor.lock",
         "pid.json",

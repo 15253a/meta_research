@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from functools import partial
 
 from meta_research.stage_provider_failure import settle_stage_provider_failure
@@ -10,6 +11,7 @@ from dataclasses import asdict, dataclass
 from typing import cast
 
 from meta_research.feed import DurableFeed
+from meta_research.runtime_binding_compatibility import idea_bindings_compatible
 from meta_research.idea_skill import (
     stage_provider,
     IdeaSkillDraft,
@@ -49,6 +51,7 @@ from meta_research.owners.research_memory import (
     ResearchMemoryInterface,
 )
 
+LOGGER = logging.getLogger(__name__)
 
 IDEA_CONTEXT_PACK_SCHEMA_REF = "meta-research/idea-context-pack/v2"
 _CYCLE_EVENT = "advancement_engine.initial_cycle_activated"
@@ -95,6 +98,7 @@ class IdeaStageWorker:
         self._human_collaboration = human_collaboration
         self._transient_error: str | None = None
         self._provider_cursor_cycle_ref: str | None = None
+        self._provider_boundary_attempted: bool = False
 
     @property
     def transient_error(self) -> str | None:
@@ -151,10 +155,10 @@ class IdeaStageWorker:
             unit_kinds=("idea_primary",),
         ):
             return True
-        transient_error: str | None = None
         advanced = False
         self._transient_error = None
         cycles = list(self._discover_cycles())
+        transient_error: str | None = self._transient_error
         if self._provider_cursor_cycle_ref is not None:
             cursor = next(
                 (
@@ -167,7 +171,22 @@ class IdeaStageWorker:
             if cursor is not None:
                 cycles = cycles[cursor + 1 :] + cycles[: cursor + 1]
         for current in cycles:
-            step = self._process_cycle(current)
+            self._transient_error = None
+            self._provider_boundary_attempted = False
+            try:
+                step = self._process_cycle(current)
+            except OwnerConflict as error:
+                LOGGER.warning(
+                    "idea_stage cycle isolated quest_ref=%s cycle_ref=%s error_code=%s",
+                    current.question.quest_ref,
+                    current.cycle_ref,
+                    error.code,
+                )
+                transient_error = transient_error or error.code
+                self._provider_cursor_cycle_ref = current.cycle_ref
+                if self._provider_boundary_attempted:
+                    break
+                continue
             if step.advanced:
                 advanced = True
             if self._transient_error is not None:
@@ -465,7 +484,7 @@ class IdeaStageWorker:
         except IdeaSkillUnavailable as error:
             self._transient_error = error.code
             return _CycleStep(False, provider_boundary_attempted=True)
-        if runtime_binding != run.runtime_binding:
+        if not idea_bindings_compatible(runtime_binding, run.runtime_binding):
             self._transient_error = "idea_runtime_binding_drift"
             return _CycleStep(False, provider_boundary_attempted=True)
         invocation = run.primary_invocation
@@ -546,6 +565,7 @@ class IdeaStageWorker:
             draft = None
             try:
                 try:
+                    self._provider_boundary_attempted = True
                     draft = provider.generate_draft(skill_request)
                     draft_hash = validate_idea_skill_draft(skill_request, draft)
                 except IdeaSkillUnavailable as error:
@@ -673,6 +693,7 @@ class IdeaStageWorker:
         )
         result = None
         try:
+            self._provider_boundary_attempted = True
             result = provider.finalize_draft(skill_request, draft)
             draft_hash, outcome_hash, _review_hash = validate_idea_skill_result(
                 skill_request,
@@ -872,11 +893,21 @@ class IdeaStageWorker:
         for foreground in self._advancement_engine.query_active_foregrounds(
             stage="idea"
         ):
-            question = self._research_graph.query_question_by_ref(
-                cast(str, foreground["question_ref"])
-            )
-            if question is None or question.quest_ref != foreground["quest_ref"]:
-                raise OwnerConflict("idea_cycle_index_invalid")
+            try:
+                question = self._research_graph.query_question_by_ref(
+                    cast(str, foreground["question_ref"])
+                )
+                if question is None or question.quest_ref != foreground["quest_ref"]:
+                    raise OwnerConflict("idea_cycle_index_invalid")
+            except OwnerConflict as error:
+                LOGGER.warning(
+                    "idea_stage discovery isolated quest_ref=%s cycle_ref=%s error_code=%s",
+                    foreground.get("quest_ref"),
+                    foreground.get("cycle_ref"),
+                    error.code,
+                )
+                self._transient_error = self._transient_error or error.code
+                continue
             values.append(
                 _CurrentCycle(
                     cast(int, foreground["epoch"]),

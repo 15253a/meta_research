@@ -19,6 +19,7 @@ from meta_research.owners.agent_runtime import _bundle_inbox_checkpoint_from_row
 from meta_research.owners.agent_runtime_harness import AgentRuntimeHarnessError
 from meta_research.stage_session_retirement import retired_stage_ids
 from meta_research.target_session_retirement import replaced_target_sessions
+from meta_research.target_workspace_cleanup import _path_variants
 from meta_research.provider_supervisor import (ProviderSupervisorError, read_transport_envelope,
     read_transport_key_for_operation, SUPERVISOR_EXIT_SCHEMA, SUPERVISOR_EXIT_SCHEMA_V2)
 
@@ -380,16 +381,25 @@ def _pending_human_uploads(connection):
 
 
 def _resolve_protected_paths(paths):
-    # Preserve both the registered locator and its actual original (parent aliases).
-    try:
-        return tuple(set(paths) | {path.resolve(strict=False) for path in paths})
-    except (OSError, RuntimeError, ValueError) as error:
-        raise OwnerConflict('workspace_cleanup_material_reference_invalid') from error
+    # Preserve both the lexical registered locator and its resolved original when reachable.
+    resolved = []
+    seen = set()
+    for path in paths:
+        for variant in _path_variants(path):
+            if variant not in seen:
+                seen.add(variant)
+                resolved.append(variant)
+    return tuple(resolved)
 
 
 def _paths_overlap(left, right):
-    left, right = left.resolve(strict=False), right.resolve(strict=False)
-    return left == right or left in right.parents or right in left.parents
+    left_variants = _path_variants(left)
+    right_variants = _path_variants(right)
+    return any(
+        lv == rv or lv in rv.parents or rv in lv.parents
+        for lv in left_variants
+        for rv in right_variants
+    )
 
 
 def _verified_candidate_path(runtime, candidate):
@@ -531,7 +541,8 @@ def cleanup_cycle_sessions(runtime, candidates, *, dry_run):
 # Target provider-argv.json is read when recovering a historical human-wait receipt.
 _LAUNCH_SCRATCH = ("native-provider-argv.json", "supervisor-ready.json",
                    "supervisor-heartbeat.json", "supervisor-stop.json",
-                   "supervisor.lock", ".last-message.supervisor.tmp")
+                   "supervisor.lock", ".last-message.supervisor.tmp",
+                   "provider-stderr.log", "root-session-observation-gap.json")
 
 
 def _prune_spool(directory, digest, dry_run, protected_paths):

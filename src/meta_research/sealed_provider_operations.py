@@ -23,6 +23,7 @@ from meta_research.provider_supervisor import (
     read_transport_envelope, write_exit_receipt,
 )
 from meta_research.quest_drafting import PROVIDER_STREAM_MAX_BYTES, _text_exceeds_limit
+from meta_research.runtime_binding_compatibility import root_capability_profile_compatible
 
 PROVIDER_OPERATION_SCHEMA = "meta-research/codex-provider-operation/v3"
 _COMPLETION_ENVELOPE_MAX_BYTES = 64 * 1024
@@ -167,19 +168,33 @@ def read_invocation(
 ) -> dict[str, object]:
     typed_invocation = read_sealed_invocation(path, key=key)
     expected_keys = {*expected_base, "transport_mode"}
-    identity_fields = set(expected_base).difference(
-        {
-            "schema_ref",
-            "prompt_max_bytes",
-            "stream_max_bytes",
-            "result_max_bytes",
-        }
+    hot_updatable_profile = (
+        "root_capability_profile" in expected_base
+        and "root_capability_profile_hash" in expected_base
+        and isinstance(expected_base["root_capability_profile"], dict)
     )
+    ignored_fields = {
+        "schema_ref",
+        "prompt_max_bytes",
+        "stream_max_bytes",
+        "result_max_bytes",
+    }
+    if hot_updatable_profile:
+        ignored_fields.update({"root_capability_profile", "root_capability_profile_hash"})
+    identity_fields = set(expected_base).difference(ignored_fields)
     if (
         set(typed_invocation) != expected_keys
         or any(
             typed_invocation.get(name) != expected_base[name]
             for name in identity_fields
+        )
+        or (
+            hot_updatable_profile
+            and not root_capability_profile_compatible(
+                typed_invocation.get("root_capability_profile"),
+                typed_invocation.get("root_capability_profile_hash"),
+                cast(dict[str, object], expected_base["root_capability_profile"]),
+            )
         )
     ):
         raise ProviderOperationUnavailable("codex_operation_identity_conflict")

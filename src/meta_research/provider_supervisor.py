@@ -956,69 +956,92 @@ def write_exit_receipt(
             _file_sha256(result_path) if result_path.is_file() else None
         ),
     }
-    _write_signed_envelope(path, payload, key)
 
-    # An observation cannot invalidate the signed execution receipt. Keep the
-    # additional report separately so historical receipt schemas stay exact.
+    # Publish call-observation and root-session observation index (or gap) BEFORE
+    # revealing supervisor-exit.json so exit never races ahead of usage metadata.
     if stderr_path is None:
         stderr_path = stdout_path.with_name("provider-stderr.log")
-    try:
-        from meta_research.provider_call_observations import observe_provider_files
-        observation = observe_provider_files(
-            prompt_path,
-            stdout_path,
-            stderr_path=stderr_path,
-            stderr_limited=stderr_limited,
-            codex_home=codex_home,
-            operation_scope=operation_scope,
-        )
-        _write_signed_envelope(path.with_name("call-observation.json"), {
-            **observation, "invocation_hash": invocation_hash,
-            "output_schema_utf8_bytes": schema_path.stat().st_size,
-            "stdout_file_hash": payload["stdout_file_hash"],
-            "prompt_file_hash": payload["prompt_file_hash"],
-        }, key)
-        try:
-            from meta_research.root_session_usage import (
-                write_root_session_observation_index,
-            )
+    observation_path = path.with_name("call-observation.json")
+    from meta_research.provider_call_observations import observe_provider_files
+    from meta_research.root_session_usage import (
+        RootSessionUsageError,
+        _workspace_for_operation,
+        write_root_session_observation_gap,
+        write_root_session_observation_index,
+    )
 
+    try:
+
+        obs_payload: dict[str, object] | None = None
+        if observation_path.is_file():
+            candidate_obs = _read_signed_envelope(observation_path, key)
+            if candidate_obs.get("invocation_hash") != invocation_hash:
+                raise ProviderSupervisorError("provider_supervisor_spool_invalid")
+            if candidate_obs.get("status") == "unavailable":
+                try:
+                    write_root_session_observation_gap(
+                        path.parent,
+                        key=key,
+                        invocation_hash=invocation_hash,
+                        operation_scope=operation_scope,
+                        failure_code=str(
+                            candidate_obs.get("failure_code")
+                            or "provider_observation_failed"
+                        ),
+                    )
+                except (OSError, ProviderSupervisorError, ValueError, TypeError):
+                    pass
+                _write_signed_envelope(path, payload, key)
+                return
+            obs_payload = candidate_obs
+
+        if obs_payload is None:
+            rollout_cursor_dir: Path | None = None
+            try:
+                workspace = _workspace_for_operation(path.parent)
+            except (RootSessionUsageError, OSError):
+                workspace = None
+            else:
+                rollout_cursor_dir = workspace / "provider-observations" / "rollout-cursors"
+
+            observation = observe_provider_files(
+                prompt_path,
+                stdout_path,
+                stderr_path=stderr_path,
+                stderr_limited=stderr_limited,
+                codex_home=codex_home,
+                operation_scope=operation_scope,
+                rollout_cursor_dir=rollout_cursor_dir,
+            )
+            obs_payload = {
+                **observation,
+                "invocation_hash": invocation_hash,
+                "output_schema_utf8_bytes": schema_path.stat().st_size,
+                "stdout_file_hash": payload["stdout_file_hash"],
+                "prompt_file_hash": payload["prompt_file_hash"],
+            }
+            _write_signed_envelope(observation_path, obs_payload, key)
+
+        try:
             write_root_session_observation_index(
                 path.parent,
                 key=key,
                 invocation_hash=invocation_hash,
-                observation={
-                    **observation,
-                    "invocation_hash": invocation_hash,
-                    "output_schema_utf8_bytes": schema_path.stat().st_size,
-                    "stdout_file_hash": payload["stdout_file_hash"],
-                    "prompt_file_hash": payload["prompt_file_hash"],
-                },
+                observation=obs_payload,
                 operation_scope=operation_scope,
             )
         except Exception as error:
-            # The execution receipt and operation observation stay authoritative
-            # when the cross-operation pointer cannot be sealed.  Preserve a
-            # signed, actionable gap instead of silently claiming a root total.
             try:
-                _write_signed_envelope(
-                    path.with_name("root-session-observation-gap.json"),
-                    {
-                        "schema_ref": "meta-research/root-session-observation-unavailable/v1",
-                        "invocation_hash": invocation_hash,
-                        "status": "unavailable",
-                        "failure_code": type(error).__name__ or "root_session_observation_failed",
-                        "owner": "harness",
-                        "next_action": "reconcile_root_session_observation_index_before_using_cross_operation_usage",
-                    },
-                    key,
+                write_root_session_observation_gap(
+                    path.parent,
+                    key=key,
+                    invocation_hash=invocation_hash,
+                    operation_scope=operation_scope,
+                    failure_code=type(error).__name__ or "root_session_observation_failed",
                 )
             except (OSError, ProviderSupervisorError, ValueError, TypeError):
                 pass
     except (OSError, ValueError, UnicodeError, ProviderSupervisorError) as error:
-        # Keep the execution receipt authoritative, but leave a signed and
-        # actionable gap marker instead of making a missing sidecar look like
-        # an observation that was never attempted.
         failure_code = {
             OSError: "provider_observation_io_error",
             ValueError: "provider_observation_value_error",
@@ -1036,10 +1059,19 @@ def write_exit_receipt(
                 "next_action": "preserve_exit_receipt_and_reconcile_observation_before_using_usage_evidence",
             }, key)
         except (OSError, ProviderSupervisorError, ValueError, TypeError):
-            # A second failure is itself outside the signed receipt path. The
-            # original execution result remains valid and can be reconciled by
-            # the operation owner using the durable paths and hashes.
             pass
+        try:
+            write_root_session_observation_gap(
+                path.parent,
+                key=key,
+                invocation_hash=invocation_hash,
+                operation_scope=operation_scope,
+                failure_code=failure_code,
+            )
+        except (OSError, ProviderSupervisorError, ValueError, TypeError):
+            pass
+
+    _write_signed_envelope(path, payload, key)
 
 
 def read_verified_exit_receipt(
@@ -1854,9 +1886,6 @@ def _supervise_locked(
         stdout_stream = stack.enter_context(
             stdout_path.open("xb", buffering=0)
         )
-        stderr_stream = stack.enter_context(
-            stderr_path.open("xb", buffering=0)
-        )
         result_stream = (
             stack.enter_context(result_temporary.open("xb", buffering=0))
             if selected_platform == "posix"
@@ -1892,14 +1921,17 @@ def _supervise_locked(
             ):
                 provider_stderr.close()
 
-        # Run before ExitStack closes the destination files. A surviving external
-        # writer can still prevent EOF: daemon readers are only an error-path
-        # fallback; the normal path below requires both readers to finish.
-        stack.push(finish_capture)
         _write_phase_marker(
             paths["ready_path"], schema_ref=ready_schema_ref,
             invocation_hash=invocation_hash, key=key, process_platform=process_platform,
         )
+        # Create provider-stderr.log only after supervisor-ready.json exists so
+        # startup failures never leave an orphan stderr sidecar blocking recovery.
+        stderr_stream = stack.enter_context(
+            stderr_path.open("xb", buffering=0)
+        )
+        # Run before ExitStack closes stdout/stderr/result streams.
+        stack.push(finish_capture)
         write_heartbeat("ready")
         if stop_requested():
             termination_reason = "stopped"
@@ -2015,7 +2047,6 @@ def _supervise_locked(
                         break
                     if (
                         stdout_exceeded.is_set()
-                        or stderr_exceeded.is_set()
                         or result_exceeded.is_set()
                     ):
                         termination_reason = "output_limit"
@@ -2091,7 +2122,6 @@ def _supervise_locked(
                     )
                 if (
                     stdout_exceeded.is_set()
-                    or stderr_exceeded.is_set()
                     or result_exceeded.is_set()
                 ):
                     termination_reason = "output_limit"
@@ -2124,7 +2154,6 @@ def _supervise_locked(
     _fsync_directory(result_path.parent)
     if (
         stdout_path.stat().st_size > stream_max_bytes
-        or stderr_path.stat().st_size > stream_max_bytes
         or result_path.stat().st_size > result_max_bytes
     ):
         termination_reason = "output_limit"
@@ -2136,7 +2165,10 @@ def _supervise_locked(
         schema_path=schema_path,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
-        stderr_limited=stderr_exceeded.is_set(),
+        stderr_limited=(
+            stderr_exceeded.is_set()
+            or (stderr_path.is_file() and stderr_path.stat().st_size > stream_max_bytes)
+        ),
         result_path=result_path,
         returncode=returncode,
         input_bytes=input_bytes,

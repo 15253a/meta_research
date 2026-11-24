@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from functools import partial
 
 from meta_research.stage_provider_failure import settle_stage_provider_failure
@@ -9,6 +10,7 @@ from typing import cast
 
 from meta_research.idea_skill import stage_provider
 from meta_research.feed import DurableFeed
+from meta_research.runtime_binding_compatibility import plan_bindings_compatible
 from meta_research.idea_stage import _public_run
 from meta_research.owners.advancement_engine import (
     AdvancementEngineInterface,
@@ -53,6 +55,7 @@ from meta_research.plan_skill import (
     validate_plan_skill_result,
 )
 
+LOGGER = logging.getLogger(__name__)
 
 _CYCLE_EVENT = "advancement_engine.initial_cycle_activated"
 
@@ -110,6 +113,7 @@ class PlanStageWorker:
         self._provider = provider
         self._transient_error: str | None = None
         self._provider_cursor_cycle_ref: str | None = None
+        self._provider_boundary_attempted: bool = False
 
     @property
     def transient_error(self) -> str | None:
@@ -118,7 +122,6 @@ class PlanStageWorker:
     def process_once(self) -> bool:
         """Advance recoverable Plan work without requiring a per-Run click."""
 
-        transient_error: str | None = None
         if self._agent_runtime.reconcile_pending_provider_cleanup(
             self._provider,
             unit_kinds=("plan_primary",),
@@ -126,6 +129,7 @@ class PlanStageWorker:
             return True
         self._transient_error = None
         cycles = list(self._discover_cycles())
+        transient_error: str | None = self._transient_error
         if self._provider_cursor_cycle_ref is not None:
             cursor = next(
                 (
@@ -138,20 +142,35 @@ class PlanStageWorker:
             if cursor is not None:
                 cycles = cycles[cursor + 1 :] + cycles[: cursor + 1]
         for current in cycles:
-            foreground = self._advancement_engine.query_foreground(
-                current.question.quest_ref
-            )
-            if (
-                foreground is None
-                or foreground.get("cycle_ref") != current.cycle_ref
-                or foreground.get("stage") != "plan"
-                or foreground.get("status") != "active"
-            ):
+            self._transient_error = None
+            self._provider_boundary_attempted = False
+            try:
+                foreground = self._advancement_engine.query_foreground(
+                    current.question.quest_ref
+                )
+                if (
+                    foreground is None
+                    or foreground.get("cycle_ref") != current.cycle_ref
+                    or foreground.get("stage") != "plan"
+                    or foreground.get("status") != "active"
+                ):
+                    continue
+                qualification = self._qualify(current)
+                if qualification.eligible is None:
+                    continue
+                step = self._process_cycle(qualification.eligible)
+            except OwnerConflict as error:
+                LOGGER.warning(
+                    "plan_stage cycle isolated quest_ref=%s cycle_ref=%s error_code=%s",
+                    current.question.quest_ref,
+                    current.cycle_ref,
+                    error.code,
+                )
+                transient_error = transient_error or error.code
+                self._provider_cursor_cycle_ref = current.cycle_ref
+                if self._provider_boundary_attempted:
+                    break
                 continue
-            qualification = self._qualify(current)
-            if qualification.eligible is None:
-                continue
-            step = self._process_cycle(qualification.eligible)
             if self._transient_error is not None:
                 transient_error = transient_error or self._transient_error
             if step.provider_boundary_attempted:
@@ -437,7 +456,7 @@ class PlanStageWorker:
         except PlanSkillUnavailable as error:
             self._transient_error = error.code
             return _CycleStep(False, provider_boundary_attempted=True)
-        if runtime_binding != run.runtime_binding:
+        if not plan_bindings_compatible(runtime_binding, run.runtime_binding):
             self._transient_error = "plan_runtime_binding_drift"
             return _CycleStep(False, provider_boundary_attempted=True)
         if request.accepted_idea_set is None:
@@ -526,6 +545,7 @@ class PlanStageWorker:
             draft = None
             try:
                 try:
+                    self._provider_boundary_attempted = True
                     draft = provider.generate_draft(skill_request)
                     draft_hash = validate_plan_skill_draft(skill_request, draft)
                 except PlanSkillUnavailable as error:
@@ -654,6 +674,7 @@ class PlanStageWorker:
         )
         result = None
         try:
+            self._provider_boundary_attempted = True
             result = provider.finalize_draft(skill_request, draft)
             draft_hash, plan_hash, _review_hash = validate_plan_skill_result(
                 skill_request,
@@ -970,11 +991,21 @@ class PlanStageWorker:
         for foreground in self._advancement_engine.query_active_foregrounds(
             stage="plan"
         ):
-            question = self._research_graph.query_question_by_ref(
-                cast(str, foreground["question_ref"])
-            )
-            if question is None or question.quest_ref != foreground["quest_ref"]:
-                raise OwnerConflict("plan_cycle_index_invalid")
+            try:
+                question = self._research_graph.query_question_by_ref(
+                    cast(str, foreground["question_ref"])
+                )
+                if question is None or question.quest_ref != foreground["quest_ref"]:
+                    raise OwnerConflict("plan_cycle_index_invalid")
+            except OwnerConflict as error:
+                LOGGER.warning(
+                    "plan_stage discovery isolated quest_ref=%s cycle_ref=%s error_code=%s",
+                    foreground.get("quest_ref"),
+                    foreground.get("cycle_ref"),
+                    error.code,
+                )
+                self._transient_error = self._transient_error or error.code
+                continue
             values.append(
                 _CurrentCycle(
                     cast(int, foreground["epoch"]),

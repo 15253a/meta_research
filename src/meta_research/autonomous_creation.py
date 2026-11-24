@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
@@ -8,6 +9,9 @@ from meta_research.acquisition import AcquisitionProvider, effective_acquisition
 from meta_research.database import Database
 from meta_research.owners.common import AcceptanceReceipt, OwnerConflict, canonical_hash
 from meta_research.runtime_conditions import read_runtime_conditions
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class AutonomousHumanCollaboration(Protocol):
@@ -193,6 +197,11 @@ class AutonomousCreationService:
         self._database = database
         self._workspace = workspace
         self._scheduler_cursor: str | None = None
+        self._transient_error: str | None = None
+
+    @property
+    def transient_error(self) -> str | None:
+        return self._transient_error
 
     def start(
         self,
@@ -366,20 +375,45 @@ class AutonomousCreationService:
     def process_once(self) -> bool:
         """Advance one fair work item across at most one Owner boundary."""
 
+        self._transient_error = None
         for kind, ref in self._scheduled_work_items():
-            if kind == "checkpoint":
-                started = self._start_checkpoint_once(ref)
-                if started is None:
+            item_key = f"{kind}:{ref}"
+            try:
+                if kind == "checkpoint":
+                    started = self._start_checkpoint_once(ref)
+                    if started is None:
+                        continue
+                    self._scheduler_cursor = "context:" + cast(
+                        str, started["context_ref"]
+                    )
+                    return True
+                facts = self._facts(context_ref=ref)
+                if facts is None or not self._process_facts_once(facts):
                     continue
-                self._scheduler_cursor = "context:" + cast(
-                    str, started["context_ref"]
-                )
+                self._scheduler_cursor = item_key
                 return True
-            facts = self._facts(context_ref=ref)
-            if facts is None or not self._process_facts_once(facts):
+            except OwnerConflict as error:
+                quest_ref = (
+                    error.details.get("quest_ref")
+                    if isinstance(error.details, dict)
+                    else None
+                )
+                if quest_ref is None and kind == "context":
+                    try:
+                        context = self._human_collaboration.query_autonomous_creation_context(ref)
+                        if isinstance(context, dict) and isinstance(context.get("source"), dict):
+                            quest_ref = context["source"].get("quest_ref")
+                    except OwnerConflict:
+                        pass
+                LOGGER.warning(
+                    "autonomous_creation isolated quest_ref=%s item=%s error_code=%s",
+                    quest_ref,
+                    item_key,
+                    error.code,
+                )
+                self._transient_error = self._transient_error or error.code
+                self._scheduler_cursor = item_key
                 continue
-            self._scheduler_cursor = f"context:{ref}"
-            return True
         return False
 
     def _process_facts_once(self, facts: _AutonomousFacts) -> bool:
@@ -581,31 +615,61 @@ class AutonomousCreationService:
         items: list[tuple[str, str]] = []
         known_checkpoints: set[str] = set()
         for context in contexts:
-            context_ref = _require_ref(
-                context.get("context_ref"), "autonomous_context_ref_invalid"
-            )
-            checkpoint = _mapping_field(context, "checkpoint")
-            checkpoint_ref = _require_ref(
-                checkpoint.get("ref"), "reasoning_checkpoint_ref_invalid"
-            )
+            try:
+                context_ref = _require_ref(
+                    context.get("context_ref"), "autonomous_context_ref_invalid"
+                )
+                checkpoint = _mapping_field(context, "checkpoint")
+                checkpoint_ref = _require_ref(
+                    checkpoint.get("ref"), "reasoning_checkpoint_ref_invalid"
+                )
+            except OwnerConflict as error:
+                source = context.get("source") if isinstance(context, dict) else None
+                quest_ref = (
+                    source.get("quest_ref")
+                    if isinstance(source, dict)
+                    else (
+                        error.details.get("quest_ref")
+                        if isinstance(error.details, dict)
+                        else None
+                    )
+                )
+                LOGGER.warning(
+                    "autonomous_creation discovery isolated quest_ref=%s context_ref=%s error_code=%s",
+                    quest_ref,
+                    context.get("context_ref") if isinstance(context, dict) else None,
+                    error.code,
+                )
+                self._transient_error = self._transient_error or error.code
+                continue
             known_checkpoints.add(checkpoint_ref)
             items.append(("context", context_ref))
 
         for foreground in self._advancement_engine.query_active_foregrounds(
             stage="reasoning"
         ):
-            cycle_ref = _require_ref(
-                foreground.get("cycle_ref"), "reasoning_cycle_ref_invalid"
-            )
-            request = self._advancement_engine.query_reasoning_stage_request(
-                cycle_ref
-            )
-            request_ref = _field(request, "request_ref")
-            if not isinstance(request_ref, str) or not request_ref:
+            try:
+                cycle_ref = _require_ref(
+                    foreground.get("cycle_ref"), "reasoning_cycle_ref_invalid"
+                )
+                request = self._advancement_engine.query_reasoning_stage_request(
+                    cycle_ref
+                )
+                request_ref = _field(request, "request_ref")
+                if not isinstance(request_ref, str) or not request_ref:
+                    continue
+                run = self._agent_runtime.query_reasoning_stage_run(request_ref)
+                checkpoint = _field(run, "autonomous_checkpoint")
+                checkpoint_ref = _field(checkpoint, "checkpoint_ref")
+            except OwnerConflict as error:
+                LOGGER.warning(
+                    "autonomous_creation discovery isolated quest_ref=%s cycle_ref=%s error_code=%s",
+                    foreground.get("quest_ref") if isinstance(foreground, dict) else None,
+                    foreground.get("cycle_ref") if isinstance(foreground, dict) else None,
+                    error.code,
+                )
+                self._transient_error = self._transient_error or error.code
                 continue
-            run = self._agent_runtime.query_reasoning_stage_run(request_ref)
-            checkpoint = _field(run, "autonomous_checkpoint")
-            checkpoint_ref = _field(checkpoint, "checkpoint_ref")
             if (
                 isinstance(checkpoint_ref, str)
                 and checkpoint_ref

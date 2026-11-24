@@ -43,15 +43,12 @@ def request(binding):
 
 
 
-@pytest.mark.parametrize('field', ['model_ref','harness_adapter_ref','schema_ref','capability_bindings','mcp_bindings','resource_bindings','unknown_supervisor','duplicate_supervisor'])
+@pytest.mark.parametrize('field', ['model_ref','harness_adapter_ref','schema_ref','capability_bindings','mcp_bindings','resource_bindings','duplicate_supervisor'])
 def test_unreviewed_drift_is_rejected_before_provider(adapter, field):
     provider, runner, authority = adapter
     current = provider.runtime_binding()
     old = current
-    if field == 'unknown_supervisor':
-        value = tuple('adapter-source:meta_research.provider_supervisor@sha256:'+'f'*64 if item.startswith('adapter-source:meta_research.provider_supervisor@sha256:') else item for item in old.resource_bindings)
-        drift = replace(old,resource_bindings=value)
-    elif field == 'duplicate_supervisor':
+    if field == 'duplicate_supervisor':
         source = next(item for item in old.resource_bindings if item.startswith('adapter-source:meta_research.provider_supervisor@sha256:'))
         drift = replace(old,resource_bindings=old.resource_bindings+(source,))
     elif field.endswith('_bindings'):
@@ -73,6 +70,12 @@ def test_current_binding_executes_and_preserves_exact_authorization(adapter):
     assert len(runner.calls) == 1
     assert authority.issued[0]["capability_binding_hash"] == canonical_hash(frozen.as_dict())
     assert bundle_bindings_compatible(frozen, frozen)
+    updated_sup = tuple(
+        'adapter-source:meta_research.provider_supervisor@sha256:' + 'f' * 64
+        if item.startswith('adapter-source:meta_research.provider_supervisor@sha256:') else item
+        for item in frozen.resource_bindings
+    )
+    assert bundle_bindings_compatible(replace(frozen, resource_bindings=updated_sup), frozen)
 
 
 def test_stage_reports_source_drift_without_changing_frozen_run(adapter):

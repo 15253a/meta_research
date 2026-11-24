@@ -102,8 +102,10 @@ def test_completed_stages_and_running_bundle_remain_readable_after_relocation(
     assert current["stage_run_request"] is not None
     bundle_row = next(row for row in rows if row["stage"] == "bundle")
     run = runtime.owners.agent_runtime.query_bundle_stage_run(bundle_row["request_ref"])
-    # Readback is not authorization to execute using an unreviewed new profile.
-    assert not runtime.bundle_stage._runtime_binding_is_current(run)
+    assert runtime.bundle_stage._runtime_binding_is_current(run)
+    assert not runtime.bundle_stage._runtime_binding_is_current(
+        replace(run, runtime_binding=replace(run.runtime_binding, model_ref="other-model"))
+    )
     assert runtime.bundle_stage.observation.code == "bundle_runtime_binding_drift"
     with runtime._database.read() as connection:
         assert [dict(row) for row in connection.execute(text(

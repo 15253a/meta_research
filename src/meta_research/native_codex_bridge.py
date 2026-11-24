@@ -221,6 +221,8 @@ class NativeCodexBridge:
                     for path in (self.directory / "live-guidance").glob("*.json")]
         for path, command in sorted(commands,
                 key=lambda item: (item[1].get("message", {}).get("prepared_at", 0), item[0].name)):
+            if self.terminal is not None:
+                return
             if path.stem in self._seen:
                 continue
             if closed.exists():
