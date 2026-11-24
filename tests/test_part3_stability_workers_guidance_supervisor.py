@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import subprocess
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,7 @@ from uuid import UUID
 import pytest
 from sqlalchemy import text
 
+import meta_research.web as web_mod
 from meta_research.composition import build_production_runtime
 from meta_research.deepfetch import (
     CodexDeepFetchAdapter,
@@ -93,9 +95,17 @@ from test_deepfetch_adapter import (
     _request as _base_deepfetch_request,
 )
 from test_guidance_scope_alignment import _confirm_guidance
+from test_harness_full_conformance import (
+    _FullConformanceAdapter,
+    _full_request,
+)
 from test_public_autonomous_creation import (
     _AutonomousReasoningSkill,
     _ReadyAutonomousAcquisitionProvider,
+)
+from test_public_bundle_stage import (
+    _AcceptingTargetCandidateProofVerifier,
+    _DeterministicBundleSkill,
 )
 from test_public_idea_stage import _DeterministicIdeaSkill
 from test_public_plan_stage import (
@@ -193,6 +203,11 @@ class _UniquePlanIdeaSkill(_DeterministicPlanIdeaSkill):
 
 
 class _UniquePlanSkill(_DeterministicPlanSkill):
+    def generate_draft(self, request):
+        return _unique_draft(super().generate_draft(request), request)
+
+
+class _UniqueBundleSkill(_DeterministicBundleSkill):
     def generate_draft(self, request):
         return _unique_draft(super().generate_draft(request), request)
 
@@ -358,6 +373,58 @@ def test_stage_workers_isolate_owner_conflict_and_rotate_cursor(tmp_path: Path, 
             rt_idea.owners.advancement_engine.query_foreground = orig_query_fg
     finally:
         rt_idea.close()
+
+    draft_calls = 0
+
+    class _CountingPostFailureIdeaSkill(_UniqueIdeaSkill):
+        def generate_draft(self, request):
+            nonlocal draft_calls
+            draft_calls += 1
+            return super().generate_draft(request)
+
+    rt_post = _stage_runtime(tmp_path, "idea-post-provider", idea_skill=_CountingPostFailureIdeaSkill())
+    try:
+        qa = str(_confirm_direct_quest_with_prefix(rt_post, "post-a")["quest_ref"])
+        qb = str(_confirm_direct_quest_with_prefix(rt_post, "post-b")["quest_ref"])
+        fga = _active_foreground_by_quest(rt_post, qa)
+        fgb = _active_foreground_by_quest(rt_post, qb)
+        for _ in range(10):
+            req_a = rt_post.owners.advancement_engine.query_idea_stage_request(str(fga["cycle_ref"]))
+            req_b = rt_post.owners.advancement_engine.query_idea_stage_request(str(fgb["cycle_ref"]))
+            run_a = None if req_a is None else rt_post.owners.agent_runtime.query_idea_stage_run(req_a.request_ref)
+            run_b = None if req_b is None else rt_post.owners.agent_runtime.query_idea_stage_run(req_b.request_ref)
+            if run_a is not None and run_b is not None:
+                break
+            rt_post.idea_stage.process_once()
+        assert run_a is not None and run_b is not None
+
+        orig_record = rt_post.owners.agent_runtime.record_idea_primary_draft
+
+        def post_provider_boom(**kwargs):
+            if kwargs.get("run_ref") == run_a.run_ref:
+                raise OwnerConflict("post_provider_boom", details={"quest_ref": qa})
+            return orig_record(**kwargs)
+
+        rt_post.idea_stage._provider_cursor_cycle_ref = str(fgb["cycle_ref"])
+        rt_post.owners.agent_runtime.record_idea_primary_draft = post_provider_boom
+        draft_calls = 0
+        try:
+            caplog.clear()
+            assert rt_post.idea_stage.process_once() is False
+            assert draft_calls == 1
+            assert any(
+                qa in rec.message and "post_provider_boom" in rec.message
+                for rec in caplog.records
+            )
+            assert rt_post.idea_stage.transient_error == "post_provider_boom"
+            assert rt_post.idea_stage.process_once() is True
+            assert draft_calls == 2
+            updated_b = rt_post.owners.agent_runtime.query_idea_stage_run(req_b.request_ref)
+            assert updated_b is not None and updated_b.primary_draft is not None
+        finally:
+            rt_post.owners.agent_runtime.record_idea_primary_draft = orig_record
+    finally:
+        rt_post.close()
 
     rt_stages = _stage_runtime(
         tmp_path,
@@ -1291,6 +1358,31 @@ def test_rollout_incremental_offset_reading_and_truncation_fallback(tmp_path: Pa
     assert recovered_obs["native_session"]["status"] == "available"
     assert len(recovered_obs["native_session"]["model_responses"]) == 1
 
+    mid_lines = [
+        json.dumps({"type": "session_meta", "payload": {"id": session_id, "padding": "H" * 1100}}),
+        _response_line(1, 10, 1),
+        _response_line(2, 20, 2),
+        _response_line(3, 30, 3),
+        _response_line(4, 40, 4),
+        _response_line(5, 50, 5),
+        json.dumps({"type": "token_count_marker", "payload": {"padding": "T" * 1100}}),
+    ]
+    rollout.write_text("\n".join(mid_lines) + "\n", encoding="utf-8")
+    pco._NATIVE_ROLLOUT_CACHE.clear()
+    base_mid = observe_provider_files(prompt, stdout, codex_home=codex_home, rollout_cursor_dir=cursor_dir)
+    assert len(base_mid["native_session"]["model_responses"]) == 5
+
+    tampered_mid = list(mid_lines)
+    tampered_mid[3] = _response_line(3, 9999, 9)
+    rollout.write_text("\n".join(tampered_mid) + "\n", encoding="utf-8")
+    pco._NATIVE_ROLLOUT_CACHE.clear()
+    reread_mid = observe_provider_files(prompt, stdout, codex_home=codex_home, rollout_cursor_dir=cursor_dir)
+    inputs_by_resp = {
+        item["response_id"]: item["input_tokens"]
+        for item in reread_mid["native_session"]["model_responses"]
+    }
+    assert inputs_by_resp["resp-3"] == 9999
+
 
 def test_deepfetch_cross_upgrade_operation_scope_reconciliation(tmp_path: Path) -> None:
     workspace = tmp_path / "df-ws"
@@ -1572,3 +1664,265 @@ def test_hot_update_runtime_binding_loosens_skill_and_prompt_hashes_preserving_c
         assert rt.idea_stage.query_current()["stage_commit"] is not None
     finally:
         rt.close()
+
+
+def test_goal_work_intents_isolate_corruption_fulfill_healthy_target_and_escalate_health(
+    tmp_path: Path, caplog
+) -> None:
+    caplog.set_level(logging.WARNING)
+    drafting = _DeterministicDraftingAdapter()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "goal-intents"),
+        proposal_drafter=drafting,
+        intent_drafting_provider=drafting,
+        host_compute_probe=_DeterministicProbe(),
+        idea_skill_provider=_UniquePlanIdeaSkill(),
+        plan_skill_provider=_UniquePlanSkill(no_gap=False),
+        bundle_skill_provider=_UniqueBundleSkill(),
+        harness_adapters=(_FullConformanceAdapter("codex"),),
+    )
+    runtime.owners.research_graph._target_candidate_proof_verifier = (
+        _AcceptingTargetCandidateProofVerifier()
+    )
+    try:
+        if runtime.harnesses.query_status()["status"] != "ready":
+            runtime.harnesses.start_full_conformance(_full_request())
+            for _ in range(4):
+                if runtime.harnesses.query_status()["status"] == "ready":
+                    break
+                assert runtime.harnesses.advance_full_conformance(
+                    mcp_base_url="http://127.0.0.1:0"
+                )
+            assert runtime.harnesses.query_status()["status"] == "ready"
+
+        quest_targets: list[tuple[int, str, str, object]] = []
+        for idx, prefix in ((1, "gi-a"), (2, "gi-b")):
+            qref = str(_confirm_direct_quest_with_prefix(runtime, prefix)["quest_ref"])
+            _advance_quest_to_stage(runtime, qref, "bundle")
+            fg = _active_foreground_by_quest(runtime, qref)
+            cycle_ref = str(fg["cycle_ref"])
+            target_ref = None
+            bundle_run = None
+            for _ in range(20):
+                runtime.bundle_stage.process_once()
+                req = runtime.owners.advancement_engine.query_bundle_stage_request(cycle_ref)
+                if req is None:
+                    continue
+                bundle_run = runtime.owners.agent_runtime.query_bundle_stage_run(req.request_ref)
+                if bundle_run is None:
+                    continue
+                decisions = runtime.owners.agent_runtime.query_bundle_dispatch_decisions(
+                    bundle_run.run_ref
+                )
+                if not decisions:
+                    continue
+                graph = runtime.owners.research_graph.query_target_graph(bundle_run.request_ref)
+                if graph is None:
+                    continue
+                selected = decisions[-1].selected_target_refs[0]
+                if (
+                    runtime.owners.research_graph.query_target_candidate_projection(
+                        target_ref=selected
+                    )
+                    is None
+                ):
+                    continue
+                if runtime.owners.agent_runtime.query_admitted_target_launch(selected) is None:
+                    launch_req = runtime.owners.research_graph.query_target_launch_request(
+                        selected
+                    )
+                    runtime.owners.agent_runtime.admit_target_launch(
+                        launch_req,
+                        dispatch_decision_ref=decisions[-1].decision_ref,
+                        idempotency_key=f"admit-{prefix}",
+                    )
+                target_ref = selected
+                break
+            assert target_ref is not None and bundle_run is not None
+            quest_targets.append((idx, qref, target_ref, bundle_run))
+
+        intent_refs: dict[str, str] = {}
+        for idx, qref, target_ref, bundle_run in quest_targets:
+            with runtime._database.read() as conn:
+                op_row = conn.execute(
+                    text(
+                        "SELECT operation_ref FROM ar_stage_provider_invocations "
+                        "WHERE run_ref=:run_ref AND phase='primary' "
+                        "ORDER BY completed_at DESC,invocation_ref DESC LIMIT 1"
+                    ),
+                    {"run_ref": bundle_run.run_ref},
+                ).first()
+            assert op_row is not None
+            intake = runtime.owners.research_memory.submit_asset_intake(
+                AssetIntakeRequest(
+                    source_kind="text",
+                    custody_mode="managed",
+                    display_name=f"gi-ev-{idx}.txt",
+                    media_type="text/plain",
+                    content=f"Goal evolution evidence {idx}\n".encode("utf-8"),
+                    origin_quest_ref=qref,
+                ),
+                idempotency_key=f"gi-intake-{idx}",
+            )
+            assert intake.status == "accepted" and intake.asset is not None
+            asset = intake.asset
+            runtime.owners.research_graph.accept_asset_role(
+                binding=asset.as_binding(),
+                role="evidence",
+                quest_ref=qref,
+                idempotency_key=f"gi-role-{idx}",
+            )
+            author = ResearchRoot(
+                kind="bundle",
+                run_ref=bundle_run.run_ref,
+                attempt_ref=bundle_run.attempt_ref,
+                root_session_ref=bundle_run.root_session_ref,
+                fence_ref=bundle_run.fence_ref,
+                runtime_binding_hash=bundle_run.runtime_binding_hash,
+                operation_ref=op_row.operation_ref,
+            )
+            with runtime._database.fenced_write() as conn:
+                direction_cut = runtime.owners.research_graph.freeze_quest_direction(
+                    connection=conn,
+                    quest_ref=qref,
+                    author=author,
+                )
+            conditions = direction_cut["conditions"]
+            work = tuple(WorkHandle(**item) for item in direction_cut["work"]["items"])
+            assert any(
+                item.kind == "target" and item.target_ref == target_ref and item.state == "queued"
+                for item in work
+            )
+            decision = EvolutionDecision(
+                expected_revision=direction_cut["goal"]["goal_revision_ref"],
+                conditions_basis=conditions["basis_ref"],
+                work_basis=direction_cut["work"]["basis_ref"],
+                cause={
+                    "kind": "evidence",
+                    "evidence": [
+                        {"source_ref": asset.asset_ref, "version_ref": asset.version_ref}
+                    ],
+                },
+                replacement={
+                    "goal": f"Stop queued target {idx}",
+                    "completion_criteria": "Verify do_not_start intent reconciliation.",
+                },
+                criteria_review="Stop queued work before activation.",
+                judgment="Block queued target under updated goal.",
+                conditions={
+                    "runtime_conditions_ref": conditions["runtime_conditions"]["revision"],
+                    "assessments": [
+                        {
+                            "condition_ref": item["condition_ref"],
+                            "disposition": "preserved",
+                            "explanation": "Preserved.",
+                        }
+                        for item in conditions["enduring"]
+                    ],
+                    "newly_identified": [],
+                },
+                arrangements=tuple(
+                    WorkDecision(
+                        kind=("do_not_start" if item.kind == "target" else "finish_stage_boundary"),
+                        work=item,
+                        reason=(
+                            "Do not start queued target after goal change."
+                            if item.kind == "target"
+                            else "Finish current stage boundary."
+                        ),
+                    )
+                    for item in work
+                ),
+                following_direction="Continue after blocking queued target.",
+            )
+            runtime.owners.research_graph.evolve_quest_goal(
+                author=author,
+                quest_ref=qref,
+                direction_cut=direction_cut,
+                effect_id=f"gi-evolve-{idx}",
+                decision=decision,
+            )
+            with runtime._database.read() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT i.intent_ref FROM rg_goal_work_intents i "
+                        "JOIN rg_quest_goal_revisions r ON r.revision_ref=i.revision_ref "
+                        "WHERE r.quest_ref=:quest_ref AND i.decision_kind='do_not_start' "
+                        "ORDER BY i.created_at DESC LIMIT 1"
+                    ),
+                    {"quest_ref": qref},
+                ).first()
+            assert row is not None
+            intent_refs[qref] = str(row.intent_ref)
+
+        qa = quest_targets[0][1]
+        qb = quest_targets[1][1]
+        target_b = quest_targets[1][2]
+        intent_a = intent_refs[qa]
+        intent_b = intent_refs[qb]
+
+        with runtime._database.fenced_write() as conn:
+            conn.execute(
+                text(
+                    "UPDATE rg_goal_work_intents SET decision_json=:bad WHERE intent_ref=:intent_ref"
+                ),
+                {"bad": '{"corrupt":true}', "intent_ref": intent_a},
+            )
+
+        runtime.goal_work_reconciler._intent_cursor = intent_b
+        caplog.clear()
+        assert runtime.goal_work_reconciler.process_once() is True
+        assert any(
+            qa in rec.message
+            and intent_a in rec.message
+            and "goal_work_intent_invalid" in rec.message
+            for rec in caplog.records
+        )
+        assert runtime.goal_work_reconciler.transient_error == "goal_work_intent_invalid"
+
+        with runtime._database.read() as conn:
+            block = conn.execute(
+                text(
+                    "SELECT intent_ref FROM ar_target_goal_admission_blocks WHERE target_ref=:target_ref"
+                ),
+                {"target_ref": target_b},
+            ).first()
+        assert block is not None and block.intent_ref == intent_b
+        assert runtime.goal_work_reconciler.process_once() is False
+        assert runtime.goal_work_reconciler.transient_error == "goal_work_intent_invalid"
+
+        async def _run_worker_once(coro_fn, rt) -> web_mod.ReconciliationHealth:
+            health = web_mod.ReconciliationHealth()
+            changed = asyncio.Event()
+            task = asyncio.create_task(coro_fn(rt, health, on_health_change=changed.set))
+            try:
+                await asyncio.wait_for(changed.wait(), timeout=5.0)
+            finally:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            return health
+
+        goal_health = asyncio.run(_run_worker_once(web_mod._process_goal_work, runtime))
+        assert goal_health.status == "unavailable"
+        assert goal_health.last_error == "goal_work_intent_invalid"
+
+        fake_auto = SimpleNamespace(
+            autonomous_creation=SimpleNamespace(
+                process_once=lambda: False, transient_error="auto_isolated_error"
+            )
+        )
+        auto_health = asyncio.run(_run_worker_once(web_mod._process_autonomous_creation, fake_auto))
+        assert auto_health.status == "unavailable"
+        assert auto_health.last_error == "auto_isolated_error"
+
+        fake_cmp = SimpleNamespace(
+            quest_completion=SimpleNamespace(
+                process_once=lambda: False, transient_error="completion_isolated_error"
+            )
+        )
+        cmp_health = asyncio.run(_run_worker_once(web_mod._process_quest_completion, fake_cmp))
+        assert cmp_health.status == "unavailable"
+        assert cmp_health.last_error == "completion_isolated_error"
+    finally:
+        runtime.close()

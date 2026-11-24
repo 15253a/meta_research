@@ -98,6 +98,7 @@ class IdeaStageWorker:
         self._human_collaboration = human_collaboration
         self._transient_error: str | None = None
         self._provider_cursor_cycle_ref: str | None = None
+        self._provider_boundary_attempted: bool = False
 
     @property
     def transient_error(self) -> str | None:
@@ -171,6 +172,7 @@ class IdeaStageWorker:
                 cycles = cycles[cursor + 1 :] + cycles[: cursor + 1]
         for current in cycles:
             self._transient_error = None
+            self._provider_boundary_attempted = False
             try:
                 step = self._process_cycle(current)
             except OwnerConflict as error:
@@ -182,6 +184,8 @@ class IdeaStageWorker:
                 )
                 transient_error = transient_error or error.code
                 self._provider_cursor_cycle_ref = current.cycle_ref
+                if self._provider_boundary_attempted:
+                    break
                 continue
             if step.advanced:
                 advanced = True
@@ -561,6 +565,7 @@ class IdeaStageWorker:
             draft = None
             try:
                 try:
+                    self._provider_boundary_attempted = True
                     draft = provider.generate_draft(skill_request)
                     draft_hash = validate_idea_skill_draft(skill_request, draft)
                 except IdeaSkillUnavailable as error:
@@ -688,6 +693,7 @@ class IdeaStageWorker:
         )
         result = None
         try:
+            self._provider_boundary_attempted = True
             result = provider.finalize_draft(skill_request, draft)
             draft_hash, outcome_hash, _review_hash = validate_idea_skill_result(
                 skill_request,

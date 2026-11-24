@@ -248,18 +248,23 @@ def _load_prior_rollout_state(
         ):
             return None
     head_hex = candidate.get("head_anchor_hex")
+    mid_hex = candidate.get("mid_anchor_hex")
     tail_hex = candidate.get("tail_anchor_hex")
-    if not isinstance(head_hex, str) or not isinstance(tail_hex, str):
+    if not isinstance(head_hex, str) or not isinstance(mid_hex, str) or not isinstance(tail_hex, str):
         return None
     try:
         expected_head = bytes.fromhex(head_hex)
+        expected_mid = bytes.fromhex(mid_hex)
         expected_tail = bytes.fromhex(tail_hex)
     except ValueError:
         return None
     anchor_len = min(prev_offset, _ROLLOUT_ANCHOR_BYTES)
-    if len(expected_head) != anchor_len or len(expected_tail) != anchor_len:
+    mid_offset = max(0, (prev_offset - anchor_len) // 2)
+    if len(expected_head) != anchor_len or len(expected_mid) != anchor_len or len(expected_tail) != anchor_len:
         return None
     if _read_stream_slice(stream, 0, anchor_len) != expected_head:
+        return None
+    if _read_stream_slice(stream, mid_offset, anchor_len) != expected_mid:
         return None
     if _read_stream_slice(stream, prev_offset - anchor_len, anchor_len) != expected_tail:
         return None
@@ -436,7 +441,9 @@ def _native_session_observation(
             prefix_hash = "incremental:" + digest.hexdigest()
         if offset > 0 and not sample["limited"]:
             anchor_len = min(offset, _ROLLOUT_ANCHOR_BYTES)
+            mid_offset = max(0, (offset - anchor_len) // 2)
             head_hex = _read_stream_slice(stream, 0, anchor_len).hex()
+            mid_hex = _read_stream_slice(stream, mid_offset, anchor_len).hex()
             tail_hex = _read_stream_slice(stream, offset - anchor_len, anchor_len).hex()
             disk_state = {
                 "session_id": session_id,
@@ -449,6 +456,7 @@ def _native_session_observation(
                 "prefix_limit": _NATIVE_PREFIX_LIMIT,
                 "line_limit": _LINE_LIMIT,
                 "head_anchor_hex": head_hex,
+                "mid_anchor_hex": mid_hex,
                 "tail_anchor_hex": tail_hex,
                 "prefix_sha256": prefix_hash,
                 "sha256_mode": sha256_mode,

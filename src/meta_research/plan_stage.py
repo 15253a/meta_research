@@ -113,6 +113,7 @@ class PlanStageWorker:
         self._provider = provider
         self._transient_error: str | None = None
         self._provider_cursor_cycle_ref: str | None = None
+        self._provider_boundary_attempted: bool = False
 
     @property
     def transient_error(self) -> str | None:
@@ -142,6 +143,7 @@ class PlanStageWorker:
                 cycles = cycles[cursor + 1 :] + cycles[: cursor + 1]
         for current in cycles:
             self._transient_error = None
+            self._provider_boundary_attempted = False
             try:
                 foreground = self._advancement_engine.query_foreground(
                     current.question.quest_ref
@@ -166,6 +168,8 @@ class PlanStageWorker:
                 )
                 transient_error = transient_error or error.code
                 self._provider_cursor_cycle_ref = current.cycle_ref
+                if self._provider_boundary_attempted:
+                    break
                 continue
             if self._transient_error is not None:
                 transient_error = transient_error or self._transient_error
@@ -541,6 +545,7 @@ class PlanStageWorker:
             draft = None
             try:
                 try:
+                    self._provider_boundary_attempted = True
                     draft = provider.generate_draft(skill_request)
                     draft_hash = validate_plan_skill_draft(skill_request, draft)
                 except PlanSkillUnavailable as error:
@@ -669,6 +674,7 @@ class PlanStageWorker:
         )
         result = None
         try:
+            self._provider_boundary_attempted = True
             result = provider.finalize_draft(skill_request, draft)
             draft_hash, plan_hash, _review_hash = validate_plan_skill_result(
                 skill_request,

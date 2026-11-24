@@ -113,6 +113,7 @@ class ReasoningStageWorker:
         self._human_guidance = human_guidance
         self._transient_error: str | None = None
         self._provider_cursor_cycle_ref: str | None = None
+        self._provider_boundary_attempted: bool = False
 
     @property
     def transient_error(self) -> str | None:
@@ -145,6 +146,7 @@ class ReasoningStageWorker:
                 cycles = cycles[cursor + 1 :] + cycles[: cursor + 1]
         for current in cycles:
             self._transient_error = None
+            self._provider_boundary_attempted = False
             try:
                 step = self._process_cycle(current)
             except OwnerConflict as error:
@@ -156,6 +158,8 @@ class ReasoningStageWorker:
                 )
                 transient_error = transient_error or error.code
                 self._provider_cursor_cycle_ref = current.cycle_ref
+                if self._provider_boundary_attempted:
+                    break
                 continue
             if self._transient_error is not None:
                 transient_error = transient_error or self._transient_error
@@ -415,6 +419,7 @@ class ReasoningStageWorker:
             operation = self._freeze_completion_operation(
                 run, job_ref, "autonomous-resume", unit_ref
             )
+            self._provider_boundary_attempted = True
             decision = provider.decide_after_deepfetch(skill_request, checkpoint.checkpoint, facts, summary)
             if isinstance(decision.get("final_output"), dict):
                 decision = {**decision, "final_output": _assemble_provider_document(
@@ -562,6 +567,7 @@ class ReasoningStageWorker:
             draft = None
             try:
                 try:
+                    self._provider_boundary_attempted = True
                     draft = provider.generate_draft(skill_request)
                     draft = replace(draft, draft=_assemble_provider_document(
                         skill_request, draft.draft,
@@ -707,6 +713,7 @@ class ReasoningStageWorker:
             operation = (None if self._human_guidance is None else GuidanceRuntimeScope(
                 "reasoning", run.run_ref, run.attempt_ref, run.root_session_ref,
                 run.fence_ref, run.runtime_binding_hash))
+            self._provider_boundary_attempted = True
             result = provider.finalize_draft(skill_request, draft)
             result = _assemble_provider_result(skill_request, result)
             if isinstance(result, ReasoningAutonomousCheckpointResult):
@@ -1037,6 +1044,7 @@ class ReasoningStageWorker:
                 operation = self._freeze_completion_operation(
                     run, job_ref, "autonomous-resume", unit_ref
                 )
+                self._provider_boundary_attempted = True
                 result = provider.resume_after_autonomous_creation(
                     skill_request,
                     checkpoint,

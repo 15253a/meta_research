@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any, cast
 
 from sqlalchemy import text
@@ -11,7 +12,9 @@ from meta_research.owners.common import OwnerConflict, canonical_hash, decoded_o
 LOGGER = logging.getLogger(__name__)
 
 
-def _rotate_by_key(items: list[Any], cursor: str | None, key_fn) -> list[Any]:
+def _rotate_by_key(
+    items: list[Any], cursor: str | None, key_fn: Callable[[Any], str]
+) -> list[Any]:
     if cursor is None or not items:
         return items
     index = next((idx for idx, item in enumerate(items) if key_fn(item) == cursor), None)

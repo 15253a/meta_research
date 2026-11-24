@@ -4283,6 +4283,7 @@ async def _process_autonomous_creation(
         timeout_code='autonomous_creation_operation_timeout',
         timeout_seconds=REASONING_FOLLOWUP_WORKER_WATCHDOG_SECONDS,
         on_health_change=on_health_change,
+        transient_error=lambda: runtime.autonomous_creation.transient_error,
     )
 
 
@@ -4298,6 +4299,7 @@ async def _process_quest_completion(
         timeout_code='quest_completion_operation_timeout',
         timeout_seconds=REASONING_FOLLOWUP_WORKER_WATCHDOG_SECONDS,
         on_health_change=on_health_change,
+        transient_error=lambda: runtime.quest_completion.transient_error,
     )
 
 
@@ -4313,6 +4315,7 @@ async def _process_goal_work(
         timeout_code="goal_work_operation_timeout",
         timeout_seconds=ASSET_WORKER_WATCHDOG_SECONDS,
         on_health_change=on_health_change,
+        transient_error=lambda: runtime.goal_work_reconciler.transient_error,
     )
 
 
