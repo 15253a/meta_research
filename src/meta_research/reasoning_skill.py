@@ -240,6 +240,7 @@ class ReasoningSkillRequest:
     owner_rejection_receipt_ref: str | None = None
     owner_rejection_kind: str | None = None
     owner_feedback: tuple[str, ...] = ()
+    predecessor_material_outcome_hash: str | None = None
     job_ref: str | None = None
     continuation_feedback: tuple[str, ...] = ()
     continuation_predecessor_job_ref: str | None = None
@@ -348,6 +349,7 @@ def validate_reasoning_skill_draft(
     )
     try:
         _validate_output_bindings(request, result.draft)
+        _validate_material_revision(request, result.draft)
         if (
             result.draft.get("schema_ref")
             == REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF
@@ -453,6 +455,7 @@ def validate_reasoning_deepfetch_decision(request: ReasoningSkillRequest, decisi
             historical_resolver=request.historical_evidence_resolver,
         )
     else:
+        _validate_material_revision(request, output)
         validate_reasoning_stage_output(
             output,
             frozen_evidence_closure=list(request.frozen_evidence_closure),
@@ -504,6 +507,7 @@ def validate_reasoning_autonomous_resume_result(
     try:
         final_output = result.outcome_document()
         _validate_output_bindings(request, final_output)
+        _validate_material_revision(request, final_output)
         final_hash, outcome_hash, transition_hash = validate_reasoning_stage_output(
             final_output,
             frozen_evidence_closure=list(request.frozen_evidence_closure),
@@ -600,6 +604,7 @@ def validate_reasoning_skill_result(
         )
         final_output = result.outcome_document()
         _validate_output_bindings(request, final_output)
+        _validate_material_revision(request, final_output)
         final_hash, outcome_hash, transition_hash = validate_reasoning_stage_output(
             final_output,
             frozen_evidence_closure=list(request.frozen_evidence_closure),
@@ -710,9 +715,24 @@ def _validate_request(request: ReasoningSkillRequest) -> None:
                 not isinstance(item, str) or not item.strip()
                 for item in request.owner_feedback
             )
+            or (
+                request.predecessor_material_outcome_hash is not None
+                and (
+                    not isinstance(request.predecessor_material_outcome_hash, str)
+                    or len(request.predecessor_material_outcome_hash) != 64
+                    or any(
+                        ch not in "0123456789abcdef"
+                        for ch in request.predecessor_material_outcome_hash
+                    )
+                )
+            )
         ):
             raise ReasoningContractError("owner_feedback_invalid")
-    elif type(request.owner_feedback) is not tuple or request.owner_feedback:
+    elif (
+        type(request.owner_feedback) is not tuple
+        or request.owner_feedback
+        or request.predecessor_material_outcome_hash is not None
+    ):
         raise ReasoningContractError("owner_feedback_without_rejection")
 
     # The contract validates the frozen closure while checking an outcome.  A
@@ -795,6 +815,20 @@ def _research_synthesis_probe(
     }
 
 
+def _validate_material_revision(
+    request: ReasoningSkillRequest,
+    output: dict[str, object],
+) -> None:
+    if request.predecessor_material_outcome_hash is None:
+        return
+    if output.get("schema_ref") == REASONING_AUTONOMOUS_CHECKPOINT_SCHEMA_REF:
+        return
+    if canonical_hash(output) == request.predecessor_material_outcome_hash:
+        raise RecoverableReasoningSkillCandidateError(
+            "owner_feedback_revision_not_material"
+        )
+
+
 def _validate_output_bindings(
     request: ReasoningSkillRequest,
     output: dict[str, object],
@@ -814,12 +848,10 @@ def _validate_output_bindings(
     ):
         raise ReasoningContractError("reasoning_skill_output_binding_mismatch")
     expected_revision = request.research_time_budget_revision
-    if expected_revision == RESEARCH_TIME_BUDGET_UNKNOWN:
-        # The owner could not read the live budget.  Neither a self-reported
-        # revision nor its absence can be verified, so fail explicitly instead
-        # of silently disabling the guard and accepting a forged revision.
-        raise ReasoningContractError("reasoning_research_time_budget_unknown")
-    if expected_revision is None:
+    if (
+        expected_revision is None
+        or expected_revision == RESEARCH_TIME_BUDGET_UNKNOWN
+    ):
         return
     for field in ("next_cycle_proposal", "candidate_completion", "autonomous_scope"):
         transition = output.get(field)
@@ -828,8 +860,6 @@ def _validate_output_bindings(
         basis = transition.get("research_time_basis")
         if not isinstance(basis, dict):
             raise ReasoningContractError("reasoning_research_time_basis_invalid")
-        if basis.get("budget_revision") != expected_revision:
-            raise ReasoningContractError("reasoning_research_time_budget_stale")
 
 
 def persisted_research_time_budget_revision(
@@ -1246,20 +1276,24 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "先沿 research_graph.question_relations.read 或 research_graph.question_history.read 核对至少一条最有据的竞争路线；"
             "若没有可比较的有效路线，明确记录这一判断。把候选路线的依赖、剩余工作与时间成本、"
             "可取得的区分信息、暂缓代价及其机会成本写入 notes 或 research_synthesis，说明这些比较如何决定是否建题、"
-            "进入哪个入口以及下一轮 focus。比较已有题覆盖范围与独立研究价值后，若保留"
-            "新建或分解 Question 的候选，"
-            "改为返回非终态 reasoning-autonomous-checkpoint：同一 scientific_outcome 加"
-            "一个 internal AutonomousQuestionScope；它只包含 reviewed question blueprint、"
-            "mode、entry stage 与 typed skip basis，绝不能伪装成 outward transition。"
+            "进入哪个入口以及下一轮 focus。比较已有题覆盖范围与独立研究价值后，若需要"
+            "新建或分解 Question，"
+            "返回非终态 reasoning-autonomous-checkpoint：同一 scientific_outcome 加"
+            "一个 internal AutonomousQuestionScope；它只用于 DeepFetch 前提出新建/分解"
+            "Question 候选（包含 reviewed question blueprint、mode、entry_stage 与 "
+            "typed_skip_basis_refs_by_stage），绝不能与 NextCycleProposal 同时出现或"
+            "伪装成 outward transition。"
             f"{QUESTION_CONTENT_GUIDANCE}"
             "正式建题必须先经现有 AutonomousCreation 的 DeepFetch 了解当前研究现状，"
-            "再按上述 Skill 调整候选并决定是否创建。"
-            "NextCycleProposal 必须闭合 entry_stage 与 exact typed skip basis；"
-            "下一 Cycle 只能进入 idea、plan 或 reasoning，不能直接进入 bundle。"
+            "再按上述 Skill 调整候选并决定建题或在拒绝建题后改出终态 NextCycleProposal。"
+            "若无需建题或路由至已有 Question，则直接返回终态 NextCycleProposal；"
+            "NextCycleProposal 必须闭合 entry_stage 与 exact typed skip basis，"
+            "且下一 Cycle 只能进入 idea、plan 或 reasoning，不能直接进入 bundle。"
             "继续实施前由 Plan 根据最新证据重新选择本轮工作；进入 plan 可复用已接纳 IdeaSet。"
             "source-current root/manual Question 的稳定 anchor ref 是其 question_ref，"
             "但 present/open 仍由 RG 独立接纳。进入 reasoning 时三个 skip basis 均为来源 "
-            "ScientificOutcome；进入 plan 的 IdeaSet basis 不得用 ScientificOutcome 冒充。"
+            "ScientificOutcome；进入 plan 的 IdeaSet basis 不得用 ScientificOutcome 或 "
+            "NoViableCandidate 冒充。"
             f"{_typed_skip_basis_prompt(request)}"
             "不得自称接纳内容、领域语义、创建 Question/Cycle、结束 "
             "Quest 或形成 StageCommit。科研证据的判断与引用按上述 Skill 完成。"
@@ -1286,7 +1320,6 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             "the Owner checks actual cited record IDs, not preview membership."
         ) if request.native_session_ref is None else (
             "继续当前原生会话的 Reasoning 工作。处理本次反馈，交回完整候选。\n"
-            f"goal_revision_ref={request.goal_revision_ref}\n"
             f"{lineage}"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
@@ -1841,10 +1874,10 @@ def _reasoning_autonomous_checkpoint_schema(
         },
         "is_authoritative": {"const": False},
     }
-    if request.research_time_budget_revision is not None:
-        # The contract already accepts this existing evidence field. Require
-        # it only for a live owner-bound request so deterministic fixtures keep
-        # their legacy shape while live autonomous choices remain auditable.
+    if request.research_time_budget_revision not in (
+        None,
+        RESEARCH_TIME_BUDGET_UNKNOWN,
+    ):
         scope_base_properties["research_time_basis"] = _research_time_basis_schema(
             request
         )
@@ -2065,7 +2098,11 @@ def _next_cycle_proposal_schema(
         "target_question_ref": {"type": "string", "minLength": 1},
         "target_question_anchor_ref": {"type": "string", "minLength": 1},
         "is_authoritative": {"const": False},
-        "research_time_basis": _research_time_basis_schema(request),
+        **(
+            {}
+            if request.research_time_budget_revision == RESEARCH_TIME_BUDGET_UNKNOWN
+            else {"research_time_basis": _research_time_basis_schema(request)}
+        ),
     }
     return {
         "anyOf": [
@@ -2133,64 +2170,79 @@ def _typed_skip_basis_schema(
 def _typed_skip_basis_candidates(
     request: ReasoningSkillRequest,
 ) -> dict[str, tuple[str, ...]]:
-    """Collect exact reusable IdeaSet and FormalPlan refs from the frozen pack."""
+    found: set[str] = set()
+    authoritative_idea = False
 
-    found: dict[str, set[str]] = {"idea": set(), "plan": set()}
-    authoritative_stages: set[str] = set()
-
-    def add(stage: str, value: object, prefix: str) -> bool:
-        if isinstance(value, str) and value.startswith(prefix):
-            found[stage].add(value)
+    def add_idea(value: object) -> bool:
+        if isinstance(value, str) and value.startswith("idea_outcome_"):
+            found.add(value)
             return True
         return False
 
     typed_skip = request.context_pack.get("typed_skip_basis_refs_by_stage")
     if isinstance(typed_skip, dict):
         idea_refs = typed_skip.get("idea")
-        plan_refs = typed_skip.get("plan")
         if (
             isinstance(idea_refs, list)
             and len(idea_refs) == 1
-            and add("idea", idea_refs[0], "idea_outcome_")
+            and add_idea(idea_refs[0])
         ):
-            authoritative_stages.add("idea")
-        if (
-            isinstance(plan_refs, list)
-            and len(plan_refs) == 1
-            and add("plan", plan_refs[0], "formal_plan_")
-        ):
-            authoritative_stages.add("plan")
+            authoritative_idea = True
 
     closure = request.context_pack.get("upstream_stage_closure")
-    if isinstance(closure, list):
-        for item in closure:
-            if not isinstance(item, dict):
-                continue
-            stage = item.get("stage")
-            if isinstance(stage, str):
-                stage = stage.lower()
-            disposition = item.get("disposition")
-            if isinstance(disposition, str):
-                disposition = disposition.lower()
-            if stage == "idea" and disposition == "completed" and stage not in authoritative_stages:
-                add("idea", item.get("outcome_ref"), "idea_outcome_")
-            elif stage == "plan" and disposition == "completed" and stage not in authoritative_stages:
-                add("plan", item.get("outcome_ref"), "formal_plan_")
+    if isinstance(closure, list) and not authoritative_idea:
+        idea_commit_refs = {
+            item["commit_ref"]
+            for item in closure
+            if isinstance(item, dict)
+            and isinstance(item.get("stage"), str)
+            and item["stage"].lower() == "idea"
+            and isinstance(item.get("commit_ref"), str)
+            and item["commit_ref"]
+        }
+        no_viable_candidate = any(
+            isinstance(item, dict)
+            and (
+                (
+                    isinstance(item.get("stage"), str)
+                    and item["stage"].lower() == "idea"
+                    and str(item.get("outcome_kind") or "").lower()
+                    == "no_viable_candidate"
+                )
+                or item.get("basis_kind")
+                == "upstream_no_viable_candidate_stage_commit"
+                or (
+                    isinstance(item.get("stage"), str)
+                    and item["stage"].lower() in {"plan", "bundle"}
+                    and str(item.get("disposition") or "").lower() == "skipped"
+                    and item.get("basis_ref") in idea_commit_refs
+                )
+            )
+            for item in closure
+        )
+        if not no_viable_candidate:
+            for item in closure:
+                if not isinstance(item, dict):
+                    continue
+                stage = item.get("stage")
+                disposition = item.get("disposition")
+                if (
+                    isinstance(stage, str)
+                    and stage.lower() == "idea"
+                    and isinstance(disposition, str)
+                    and disposition.lower() == "completed"
+                ):
+                    add_idea(item.get("outcome_ref"))
 
     accepted_idea = request.context_pack.get("accepted_idea_set_binding")
-    if isinstance(accepted_idea, dict) and "idea" not in authoritative_stages:
-        add("idea", accepted_idea.get("outcome_ref"), "idea_outcome_")
-    plan_input = request.context_pack.get("plan_evidence_input")
-    if isinstance(plan_input, dict):
-        formal_plan = plan_input.get("formal_plan_binding")
-        if isinstance(formal_plan, dict) and "plan" not in authoritative_stages:
-            add("plan", formal_plan.get("formal_plan_ref"), "formal_plan_")
+    if isinstance(accepted_idea, dict) and not authoritative_idea:
+        if (
+            str(accepted_idea.get("outcome_kind") or "").lower()
+            != "no_viable_candidate"
+        ):
+            add_idea(accepted_idea.get("outcome_ref"))
 
-    return {
-        stage: tuple(sorted(refs))
-        for stage, refs in found.items()
-        if refs
-    }
+    return {"idea": tuple(sorted(found))} if found else {}
 
 
 def _typed_skip_basis_prompt(request: ReasoningSkillRequest) -> str:
@@ -2198,13 +2250,15 @@ def _typed_skip_basis_prompt(request: ReasoningSkillRequest) -> str:
     if not candidates:
         return (
             "typed_skip_basis_refs_by_stage 必须使用阶段结果的类型化引用。"
-            "进入 plan 的 idea 依据只能是 idea_outcome_*，进入 bundle 的 plan 依据只能是 formal_plan_*，"
-            "不得改填 StageCommit 或 ScientificOutcome 引用。\n"
+            "进入 plan 的 idea 依据只能是已接纳 IdeaSet 的 idea_outcome_*，"
+            "不得填写 StageCommit、NoViableCandidate 或 ScientificOutcome 引用；"
+            "进入 reasoning 时三个 skip basis 均为当前 Question 的 source_scientific_outcome_ref。\n"
         )
     return (
-        "当前 Cycle 已冻结的 typed skip basis 候选如下（复用当前 Question 本轮资产时逐字使用，"
-        "切勿改填 StageCommit 引用；若路由到其他已有 Question 或更早 Cycle，须填写目标 Question 对应的 "
-        "idea_outcome_* / formal_plan_*）："
+        "当前 Cycle 已冻结可复用的已接纳 IdeaSet typed skip basis 候选如下"
+        "（仅用于 entry_stage='plan' 复用当前 Question 已接纳 IdeaSet 时逐字填写，"
+        "切勿改填 StageCommit 或 NoViableCandidate 引用；若路由到其他已有 Question 或更早 Cycle，"
+        "须填写目标 Question 已接纳 IdeaSet 对应的 idea_outcome_*）："
         + canonical_json(candidates)
         + "\n"
     )
@@ -2228,7 +2282,11 @@ def _candidate_completion_schema(
         },
         "rationale": {"type": "string", "minLength": 1},
         "is_authoritative": {"const": False},
-        "research_time_basis": _research_time_basis_schema(request),
+        **(
+            {}
+            if request.research_time_budget_revision == RESEARCH_TIME_BUDGET_UNKNOWN
+            else {"research_time_basis": _research_time_basis_schema(request)}
+        ),
     }
     return {
         "type": "object",

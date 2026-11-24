@@ -8472,6 +8472,27 @@ class SQLiteResearchMemory(AssetLifecycleOwnerMixin, HumanRequestOwnerMixin):
                 ):
                     raise OwnerConflict("reasoning_content_receipt_invalid")
             else:
+                prior_outcome_rows = connection.execute(
+                    text(
+                        "SELECT request_ref, scientific_candidate_content_ref, "
+                        "outcome_hash FROM rm_reasoning_contents WHERE "
+                        "scientific_outcome_ref = :scientific_outcome_ref"
+                    ),
+                    {"scientific_outcome_ref": scientific_outcome_ref},
+                ).all()
+                for prior_outcome in prior_outcome_rows:
+                    if (
+                        prior_outcome.request_ref != request_ref
+                        or prior_outcome.scientific_candidate_content_ref
+                        != scientific_candidate_content_ref
+                        or (
+                            scientific_candidate_content_ref is not None
+                            and prior_outcome.outcome_hash != outcome_hash
+                        )
+                    ):
+                        raise OwnerConflict(
+                            "reasoning_scientific_outcome_ref_conflict"
+                        )
                 assert_scientific_asset_sources_usable(connection, payload)
                 content_ref = new_ref("reasoning_content")
                 receipt_ref = new_ref("rm_reasoning_content_receipt")

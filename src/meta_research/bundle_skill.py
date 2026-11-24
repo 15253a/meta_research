@@ -1063,6 +1063,101 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                                 if len(hashes) == 1 and hashes.issubset(shown[field])}
         return delivered
 
+    def _quest_goal_already_delivered(
+        self,
+        request: BundleDispatchRequest | BundleTargetBatchRequest,
+        operation_name: str,
+    ) -> bool:
+        from meta_research.sealed_provider_operations import completed_native_inputs
+
+        if (
+            request.quest_goal_revision is None
+            or not request.native_session_ref
+            or request.native_replacement_context is not None
+            or not (self._workspace / "provider-operations").is_dir()
+        ):
+            return False
+        directory = (
+            self._workspace
+            / "provider-operations"
+            / canonical_hash({"job_ref": request.job_ref})
+            / operation_name
+        )
+        _, key = self._transport_key()
+        identity = _rolling_operation_identity(request)
+        expected_goal_line = f"冻结 Quest Goal={canonical_json(request.quest_goal_revision)}"
+        for _, business, prompt in completed_native_inputs(
+            self._workspace,
+            request.native_session_ref,
+            key=key,
+            exclude_directory=directory,
+        ):
+            if not isinstance(business, dict):
+                continue
+            kind = business.get("kind")
+            if kind in {"bundle_dispatch", "bundle_target_batch"}:
+                prior = business.get("identity", {})
+                if not isinstance(prior, dict) or any(
+                    prior.get(name) != identity.get(name)
+                    for name in (
+                        "stage_request_ref",
+                        "run_ref",
+                        "root_session_ref",
+                        "graph_ref",
+                    )
+                ):
+                    continue
+                if expected_goal_line in prompt.splitlines():
+                    return True
+            elif kind == "bundle_stage":
+                prior_req = business.get("request", {})
+                if not isinstance(prior_req, dict) or any(
+                    prior_req.get(name) != getattr(request, name)
+                    for name in ("stage_request_ref", "run_ref", "root_session_ref")
+                ):
+                    continue
+                for line in prompt.splitlines():
+                    if not line.startswith("provider_context_view="):
+                        continue
+                    try:
+                        view = json.loads(line[len("provider_context_view=") :])
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(view, dict):
+                        continue
+                    sections = view.get("sections")
+                    if (
+                        isinstance(sections, dict)
+                        and sections.get("quest_goal_revision")
+                        == request.quest_goal_revision
+                    ):
+                        return True
+        return False
+
+    def _rolling_goal_prompt_section(
+        self,
+        request: BundleDispatchRequest | BundleTargetBatchRequest,
+        operation_name: str,
+        *,
+        absent_guidance: str,
+    ) -> str:
+        guidance = ""
+        if request.native_session_ref is None:
+            guidance = (
+                "当前 Quest Goal 是本请求冻结的有效版本，可被新证据质疑；"
+                "不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。\n"
+                if request.quest_goal_revision is not None
+                else absent_guidance + "\n"
+            )
+        if request.quest_goal_revision is None:
+            return guidance
+        if self._quest_goal_already_delivered(request, operation_name):
+            return guidance
+        return (
+            guidance
+            + f"冻结 Quest Goal={canonical_json(request.quest_goal_revision)}\n"
+        )
+
     def _operation_output_schema(self, schema, job_ref, operation_name):
         from meta_research.bundle_output_assembly import full_prose_output_schema
         from meta_research.sealed_provider_operations import read_sealed_invocation
@@ -1388,7 +1483,6 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         ) if request.native_session_ref is None else (
             "继续原 Bundle 根，处理本次反馈并按原合同返回完整 target_plan 或 exhaustion_assessment。"
             "仅在确实缺少材料时用 research_memory.stage_context.read 定向读取原冻结正文。\n"
-            + goal_guidance + "\n"
             f"{lineage}\n{_provider_correction_prompt(request.provider_feedback)}\n"
             f"context_pack_ref={request.context_pack_ref}\n"
             f"inbox_checkpoint={canonical_json(request.inbox_checkpoint)}\n"
@@ -1584,11 +1678,10 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                     if bundle_record_hash(record, "current_targets") in delivered["current_targets"]
                     else target_reading_record(record) for record in request.frontier]
         position = _rolling_position_prompt(request)
-        goal_guidance = (
-            "当前 Quest Goal 是本请求冻结的有效版本，可被新证据质疑；"
-            "不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。"
-            if request.quest_goal_revision is not None
-            else "当前 Bundle dispatch context 未携带 Quest Goal revision。"
+        goal_section = self._rolling_goal_prompt_section(
+            request,
+            operation_name,
+            absent_guidance="当前 Bundle dispatch context 未携带 Quest Goal revision。",
         )
         prompt = (
             (position if request.native_session_ref is None else "") +
@@ -1600,12 +1693,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "本次人类协作按 human_request_status 与 human_request_command 执行；"
             "未知效果仍用原 effect_id 对账。需要下一批策略时仅在 strategy_revision_available=true "
             "选择 revise_strategy；wait 继续等待外部条件。\n"
-            + goal_guidance + "\n"
-            + (
-                f"冻结 Quest Goal={canonical_json(request.quest_goal_revision)}\n"
-                if request.quest_goal_revision is not None
-                else ""
-            )
+            + goal_section
             + f"stage_request_ref={request.stage_request_ref}\n"
             f"graph_ref={request.graph_ref}\n"
             f"generation={request.generation}\n"
@@ -1733,17 +1821,13 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             verified_delivery_baseline=baseline)
         reading_context = continue_batch_reading_context(
             reading_context, self._delivered_bundle_records(request, operation_name))
+        reading_context.pop("goal_revision_ref", None)
+        reading_context.pop("quest_goal_revision", None)
         position = _rolling_position_prompt(request)
-        goal_guidance = (
-            "当前 Quest Goal 是本请求冻结的有效版本，可被新证据质疑；"
-            "不得静默改写，正式变化只能通过 research_graph.quest_goal.evolve。"
-            if request.quest_goal_revision is not None
-            else "当前 Bundle target-batch context 未携带 Quest Goal revision。"
-        )
-        goal_value_line = (
-            f"冻结 Quest Goal={canonical_json(request.quest_goal_revision)}\n"
-            if request.quest_goal_revision is not None
-            else ""
+        goal_section = self._rolling_goal_prompt_section(
+            request,
+            operation_name,
+            absent_guidance="当前 Bundle target-batch context 未携带 Quest Goal revision。",
         )
         prompt = (
             (position if request.native_session_ref is None else "") +
@@ -1753,8 +1837,7 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             "继续当前 Bundle 根，根据本次新结果与反馈提交完整 FormalStrategyUpdate 或 replan_basis。"
             "known_current_targets 和 known_target_commit_refs 指向本会话已交付的未变正文；"
             "仅在确实缺失材料时用当前 context_pack_ref 定向补读。\n"
-            + goal_guidance + "\n"
-            + goal_value_line
+            + goal_section
             + f"{_bundle_output_assembly_prompt()}"
             "完成独立审阅与必要综合后交接，保留未解决事项，不重复已完成工作。\n"
             f"batch_context={canonical_json(reading_context)}"

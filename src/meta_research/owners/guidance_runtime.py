@@ -82,11 +82,13 @@ class GuidanceRuntimeMixin:
             if units[0].unit_ref != expected:
                 raise OwnerConflict("guidance_provider_unit_unbound")
         if name == "autonomous-resume":
-            with self._database.read() as connection:
-                checkpoint = connection.execute(text(
-                    "SELECT reasoning_checkpoint_ref FROM ar_stage_attempts WHERE attempt_ref=:attempt_ref"
-                ), {"attempt_ref": scope.attempt_ref}).scalar_one()
-            if checkpoint is None:
+            stage_run = self.query_reasoning_stage_run(run.request_ref)
+            if (
+                stage_run is None
+                or stage_run.attempt_ref != scope.attempt_ref
+                or stage_run.fence_ref != scope.fence_ref
+                or stage_run.autonomous_checkpoint is None
+            ):
                 raise OwnerConflict("guidance_provider_unit_unbound")
         return VerifiedGuidanceWork(scope.root_kind, scope.run_ref,
             verified["quest_ref"], run.request_ref)

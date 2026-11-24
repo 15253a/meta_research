@@ -534,7 +534,6 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             f"provider_context_view={stage_context_json('plan', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
         ) if request.native_session_ref is None else (
             "继续当前原生会话的 Plan 工作。处理本次反馈，交回完整候选。\n"
-            + goal_guidance + "\n"
             f"{lineage}"
             f"stage_request_ref={request.stage_request_ref}\n"
             f"context_pack_ref={request.context_pack_ref}\n"

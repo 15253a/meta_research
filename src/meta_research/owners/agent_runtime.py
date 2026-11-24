@@ -11553,28 +11553,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             operation_refs=operation_refs,
         )
         if reuse_checkpoint and old_attempt.primary_draft_json is not None:
-            old_primary = connection.execute(
-                text(
-                    "SELECT response_hash FROM ar_stage_provider_invocations WHERE "
-                    "attempt_ref = :attempt_ref AND phase = 'primary' AND status = "
-                    "'completed'"
-                ),
-                {"attempt_ref": old_attempt.attempt_ref},
-            ).first()
-            if old_primary is None:
-                raise OwnerConflict("idea_provider_invocation_invalid")
-            connection.execute(
-                text(
-                    "UPDATE ar_stage_provider_invocations SET status = 'completed', "
-                    "response_hash = :response_hash, completed_at = :completed_at "
-                    "WHERE attempt_ref = :attempt_ref AND phase = 'primary' AND "
-                    "status = 'prepared'"
-                ),
-                {
-                    "response_hash": old_primary.response_hash,
-                    "completed_at": old_attempt.primary_recorded_at,
-                    "attempt_ref": attempt_ref,
-                },
+            _copy_completed_primary_invocation(
+                connection,
+                source_attempt=old_attempt,
+                target_attempt_ref=attempt_ref,
             )
         if not preserve_native_session:
             # The logical root Session survives a foreground rebind, but a native
@@ -21287,6 +21269,22 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 next_generation = int(attempt.generation) + 1
                 successor_ref = new_ref(f"{expected_stage}_attempt")
                 successor_fence_ref = new_ref(f"{expected_stage}_fence")
+                inherited_checkpoint = (
+                    _reasoning_autonomous_checkpoint_with_completion_lineage(
+                        connection, run, attempt, session
+                    )
+                    if expected_stage == "reasoning"
+                    else None
+                )
+                carry_autonomous_creation = (
+                    inherited_checkpoint is not None
+                    and _reasoning_autonomous_checkpoint_action(
+                        connection, inherited_checkpoint.checkpoint_ref
+                    )
+                    == "create"
+                )
+                if carry_autonomous_creation and attempt.primary_draft_json is None:
+                    raise OwnerConflict("reasoning_autonomous_checkpoint_integrity_invalid")
                 connection.execute(
                     text(
                         "UPDATE ar_stage_attempts SET status = 'rejected', "
@@ -21315,10 +21313,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     text(
                         "INSERT INTO ar_stage_attempts (attempt_ref, run_ref, "
                         "generation, root_session_ref, fence_ref, "
-                        "predecessor_attempt_ref, status, created_at) VALUES "
-                        "(:attempt_ref, :run_ref, :generation, :session_ref, "
+                        "predecessor_attempt_ref, status, primary_draft_json, "
+                        "primary_draft_hash, primary_adapter_kind, "
+                        "primary_recorded_at, primary_provider_unit_ref, created_at) "
+                        "VALUES (:attempt_ref, :run_ref, :generation, :session_ref, "
                         ":fence_ref, :predecessor_attempt_ref, 'running', "
-                        ":created_at)"
+                        ":primary_draft_json, :primary_draft_hash, "
+                        ":primary_adapter_kind, :primary_recorded_at, "
+                        ":primary_provider_unit_ref, :created_at)"
                     ),
                     {
                         "attempt_ref": successor_ref,
@@ -21327,6 +21329,23 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                         "session_ref": session.session_ref,
                         "fence_ref": successor_fence_ref,
                         "predecessor_attempt_ref": attempt_ref,
+                        "primary_draft_json": (
+                            attempt.primary_draft_json if carry_autonomous_creation else None
+                        ),
+                        "primary_draft_hash": (
+                            attempt.primary_draft_hash if carry_autonomous_creation else None
+                        ),
+                        "primary_adapter_kind": (
+                            attempt.primary_adapter_kind if carry_autonomous_creation else None
+                        ),
+                        "primary_recorded_at": (
+                            attempt.primary_recorded_at if carry_autonomous_creation else None
+                        ),
+                        "primary_provider_unit_ref": (
+                            attempt.primary_provider_unit_ref
+                            if carry_autonomous_creation
+                            else None
+                        ),
                         "created_at": now,
                     },
                 )
@@ -21360,6 +21379,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     prepared_at=now,
                     stage=expected_stage,
                 )
+                if carry_autonomous_creation:
+                    _copy_completed_primary_invocation(
+                        connection,
+                        source_attempt=attempt,
+                        target_attempt_ref=successor_ref,
+                    )
                 connection.execute(
                     text(
                         "UPDATE ar_stage_runs SET status = 'running', "
@@ -23832,6 +23857,54 @@ def _reasoning_checkpoint_rejection_lineage(
     return None, None
 
 
+def _copy_completed_primary_invocation(
+    connection,
+    *,
+    source_attempt,
+    target_attempt_ref: str,
+) -> None:
+    old_primary = connection.execute(
+        text(
+            "SELECT response_hash FROM ar_stage_provider_invocations WHERE "
+            "attempt_ref = :attempt_ref AND phase = 'primary' AND status = 'completed'"
+        ),
+        {"attempt_ref": source_attempt.attempt_ref},
+    ).first()
+    if old_primary is None:
+        raise OwnerConflict("idea_provider_invocation_invalid")
+    connection.execute(
+        text(
+            "UPDATE ar_stage_provider_invocations SET status = 'completed', "
+            "response_hash = :response_hash, completed_at = :completed_at "
+            "WHERE attempt_ref = :attempt_ref AND phase = 'primary' AND "
+            "status = 'prepared'"
+        ),
+        {
+            "response_hash": old_primary.response_hash,
+            "completed_at": source_attempt.primary_recorded_at,
+            "attempt_ref": target_attempt_ref,
+        },
+    )
+
+
+def _reasoning_autonomous_checkpoint_action(
+    connection, checkpoint_ref: str
+) -> str | None:
+    row = connection.execute(
+        text(
+            "SELECT reasoning_continuations_json, reasoning_continuations_hash "
+            "FROM ar_stage_attempts WHERE reasoning_checkpoint_ref = :ref"
+        ),
+        {"ref": checkpoint_ref},
+    ).first()
+    if row is None or row.reasoning_continuations_json is None:
+        return None
+    decisions = json.loads(row.reasoning_continuations_json)
+    if canonical_hash(decisions) != row.reasoning_continuations_hash:
+        raise OwnerConflict("reasoning_continuation_integrity_invalid")
+    return None if not decisions else decisions[-1]["decision"]["action"]
+
+
 def _reasoning_autonomous_checkpoint_with_completion_lineage(
     connection,
     run,
@@ -23840,6 +23913,7 @@ def _reasoning_autonomous_checkpoint_with_completion_lineage(
 ) -> ReasoningAutonomousCheckpoint | None:
     cursor = attempt
     seen: set[str] = set()
+    crossed_domain_rejection = False
     for _generation in range(int(attempt.generation)):
         if cursor.attempt_ref in seen:
             raise OwnerConflict(
@@ -23848,7 +23922,40 @@ def _reasoning_autonomous_checkpoint_with_completion_lineage(
         seen.add(cursor.attempt_ref)
         checkpoint = _reasoning_autonomous_checkpoint(run, cursor, session)
         if checkpoint is not None:
+            if (
+                crossed_domain_rejection
+                and _reasoning_autonomous_checkpoint_action(
+                    connection, checkpoint.checkpoint_ref
+                )
+                != "create"
+            ):
+                return None
             return checkpoint
+        if cursor.predecessor_attempt_ref is not None:
+            predecessor = connection.execute(
+                text(
+                    "SELECT * FROM ar_stage_attempts WHERE attempt_ref = "
+                    ":attempt_ref AND run_ref = :run_ref"
+                ),
+                {
+                    "attempt_ref": cursor.predecessor_attempt_ref,
+                    "run_ref": run.run_ref,
+                },
+            ).first()
+            if (
+                predecessor is None
+                or predecessor.status != "rejected"
+                or predecessor.submission_ref is None
+                or cursor.root_session_ref != session.session_ref
+                or predecessor.root_session_ref != session.session_ref
+                or int(cursor.generation) != int(predecessor.generation) + 1
+            ):
+                raise OwnerConflict(
+                    "reasoning_autonomous_checkpoint_integrity_invalid"
+                )
+            crossed_domain_rejection = True
+            cursor = predecessor
+            continue
         replacement = connection.execute(
             text(
                 "SELECT * FROM ar_stage_attempt_replacements WHERE "
