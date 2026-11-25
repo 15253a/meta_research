@@ -37,7 +37,7 @@ description: 分析本轮工作，经 RG 审视整体路线与关键关系，交
 
 开展上述审视时，可以同时委派 1 个子智能体，提供当前 Question／Goal、本轮重心、关键材料及获授读取入口，请它按同样的方法独立审视工作关系、关键问题与矛盾；根 Session 同时继续自己的分析。子智能体返回判断、准确依据、适用条件和重要未查部分，根随后聚合双方认识，比较相互补充之处与实质分歧，必要时回读关键来源，保留尚未解决的不确定性，再形成整体判断与后继选择。最终取舍由根负责；这项并行研究协作与后文对完整草稿的独立审阅各按其职责进行。
 
-用 `research_graph.question_relations.read` 读取相关问题。有值得保留的横向关联或重叠时，经 `research_graph.question_relations.record` 提交同 Quest 两个精确已接纳 `question_ref` 与说明；包含关系仍用原 `parent_question_ref`。同一 `effect_id` 对应同一内容，结果不明先 reconcile；关系不表示问题已解决。
+用 `research_graph.question_relations.read` 读取相关问题。有值得保留的关系时，经 `research_graph.question_relations.record` 提交同 Quest 两个精确已接纳 `question_ref`、关系类型 `kind`（默认 `related`，可选 `overlaps`、`competes`、`depends_on`、`subquestion_of`、`refines`、`supersedes`）与说明；Tree 包含关系仍用原 `parent_question_ref`。同一 `effect_id` 对应同一内容，结果不明先 reconcile；关系不表示问题已解决。
 
 完成条件：与后继取舍有关的路线和关系已有必要理解，关键判断能回到准确依据，重要未查部分及其影响明确。全局审视不是穷尽所有方向，也不把未经比较的局部下一步直接当作整体优先项。
 

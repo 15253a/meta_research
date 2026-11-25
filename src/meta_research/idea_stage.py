@@ -827,6 +827,31 @@ class IdeaStageWorker:
         return content
 
     def _context_pack(self, current: _CurrentCycle) -> dict[str, object]:
+        guidance: list[dict[str, object]] = []
+        if self._human_collaboration is not None:
+            guidance = self._human_collaboration.query_active_guidance_bindings(
+                f"quest:{current.question.quest_ref}"
+            )
+            for binding in guidance:
+                self._human_collaboration.verify_guidance_binding(binding)
+            guidance.sort(
+                key=lambda item: (
+                    str(item["scope_ref"]),
+                    str(item["constraint_ref"]),
+                    int(cast(int, item["revision"])),
+                )
+            )
+        creation_bases = getattr(self._research_memory, "creation_bases", None)
+        basis = (
+            creation_bases.for_question(
+                current.question.question_ref, current.question.quest_ref
+            )
+            if creation_bases is not None
+            else None
+        )
+        creation_basis = (
+            None if basis is None else creation_bases.reference(basis)
+        )
         successor_query=getattr(self._advancement_engine,"query_reasoning_successor_context",None)
         successor=successor_query(current.cycle_ref) if callable(successor_query) else None
         if successor is not None:
@@ -834,28 +859,30 @@ class IdeaStageWorker:
             if successor.get("cycle_ref")!=current.cycle_ref or successor.get("target_question_ref")!=current.question.question_ref or successor.get("entry_stage")!="idea" or not isinstance(frozen,dict):
                 raise OwnerConflict("reasoning_successor_context_invalid")
             # The successor carries prior scientific inputs, while the new
-            # Stage admission must rebind the mutable Quest Goal head.
-            return {
+            # Stage admission must rebind mutable Quest Goal and active guidance
+            # heads (and re-attach creation_basis for v4 packs when present).
+            pack = {
                 key: value
                 for key, value in frozen.items()
                 if key not in {"goal_revision_ref", "quest_goal_revision"}
             }
+            if self._human_collaboration is not None:
+                pack["active_guidance_bindings"] = guidance
+            if (
+                pack.get("schema_ref") == IDEA_CONTEXT_PACK_SCHEMA_V4_REF
+                and creation_basis is not None
+            ):
+                pack["creation_basis"] = creation_basis
+            return pack
         position = self._advancement_engine.query_cycle_position(current.cycle_ref)
         page, refs = None, ()
         literature=self._research_memory.query_current_question_literature_revision(current.question.question_ref)
-        guidance=[]
-        if self._human_collaboration is not None:
-            guidance=self._human_collaboration.query_active_guidance_bindings(f"quest:{current.question.quest_ref}")
-            for binding in guidance:
-                self._human_collaboration.verify_guidance_binding(binding)
-            guidance.sort(key=lambda item:(str(item["scope_ref"]),str(item["constraint_ref"]),int(item["revision"])))
         return {"schema_ref":IDEA_CONTEXT_PACK_SCHEMA_V4_REF,"cycle_ref":current.cycle_ref,
             "accepted_question_binding":current.question.as_binding().as_dict(),
             "cycle_position": position,
             "accepted_evidence_refs":list(refs),"evidence_reference_revision":0,
             "evidence_page":page,"literature_binding":literature_reference(literature),
-            "creation_basis": (lambda basis: None if basis is None else self._research_memory.creation_bases.reference(basis))(
-                self._research_memory.creation_bases.for_question(current.question.question_ref, current.question.quest_ref)),
+            "creation_basis": creation_basis,
             "prior_accepted_bindings":[],"active_guidance_bindings":guidance}
 
 

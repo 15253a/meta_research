@@ -930,13 +930,23 @@ def creation_basis_operations(memory, runtime, collaboration):
                 scope = {}
                 exact_request_basis = memory.creation_bases.reference(basis)
             else:
-                scope = runtime.verify_root_agent_runtime_scope(root_kind=context.root_kind, run_ref=context.run_ref,
-                    attempt_ref=context.attempt_ref, root_session_ref=context.root_session_ref,
-                    fence_ref=context.fence_ref, runtime_binding_hash=context.capability_binding_hash)
-                if context.root_kind == "deepfetch":
-                    run = runtime.query_deepfetch_run_by_ref(context.run_ref)
-                    request = collaboration.query_deepfetch_request(run.request_ref)
-                    exact_request_basis = request.scope.get("creation_basis")
+                if arguments.get("source_quest_ref") is not None:
+                    from meta_research.research_content import _reading_quest
+                    quest_ref = _reading_quest(
+                        runtime,
+                        context,
+                        source_quest_ref=arguments["source_quest_ref"],
+                        human_collaboration=collaboration,
+                    )
+                    scope = {"quest_ref": quest_ref}
+                else:
+                    scope = runtime.verify_root_agent_runtime_scope(root_kind=context.root_kind, run_ref=context.run_ref,
+                        attempt_ref=context.attempt_ref, root_session_ref=context.root_session_ref,
+                        fence_ref=context.fence_ref, runtime_binding_hash=context.capability_binding_hash)
+                    if context.root_kind == "deepfetch":
+                        run = runtime.query_deepfetch_run_by_ref(context.run_ref)
+                        request = collaboration.query_deepfetch_request(run.request_ref)
+                        exact_request_basis = request.scope.get("creation_basis")
             if exact_request_basis is not None:
                 if exact_request_basis != memory.creation_bases.reference(basis):
                     raise OwnerConflict("creation_basis_unbound")
@@ -985,8 +995,9 @@ def creation_basis_operations(memory, runtime, collaboration):
         except KeyError as error:
             raise SemanticMcpError("creation_basis_unbound") from error
     return (SemanticOperation(semantic_operation_id="research_memory.creation_basis.read", owning_module="research_memory",
-        description="Read the exact authorized existing-work basis, source or prior literature. Applicability distinguishes retained claims, changed scope and unresolved creation limits. Protected reassessment can read only its exact historical predecessor. DeepFetch can read its bound basis and exact prior snapshots with view=literature and snapshot_ref; reuse never creates a new run or snapshot binding. Unselected or linked historical bytes may be unavailable. Imported work retains external provenance.",
+        description="Read the exact authorized existing-work basis, source or prior literature. Companion may pass source_quest_ref for another currently HC-authorized Quest. Applicability distinguishes retained claims, changed scope and unresolved creation limits. Protected reassessment can read only its exact historical predecessor. DeepFetch can read its bound basis and exact prior snapshots with view=literature and snapshot_ref; reuse never creates a new run or snapshot binding. Unselected or linked historical bytes may be unavailable. Imported work retains external provenance.",
         input_schema={"type": "object", "additionalProperties": False, "properties": {
+            "source_quest_ref": {"type": "string", "minLength": 1, "maxLength": 256},
             "basis_ref": {"type": "string", "minLength": 1}, "expected_basis_hash": {"type": "string", "minLength": 64, "maxLength": 64},
             "view": {"type": "string", "enum": ["understanding", "source", "literature"]}, "material_key": {"type": "string"},
             "snapshot_ref": {"type": "string", "minLength": 1}, "entry_path": {"type": "string", "minLength": 1},

@@ -84,7 +84,7 @@ def test_every_root_launch_pairs_six_discovery_entries_with_actual_tools(root_ki
         "research_graph.baselines.page",
         "research_graph.datasets.page",
         "research_graph.environments.page",
-        "research_memory.literature.page",
+        "research_graph.literature.page",
         "human_request.read",
         "research_memory.content.read",
     ):

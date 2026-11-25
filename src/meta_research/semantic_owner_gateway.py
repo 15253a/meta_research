@@ -333,7 +333,7 @@ def create_semantic_owner_gateway(
         ),
     ]
     if human_collaboration is not None:
-        from meta_research.human_research_context import human_research_context_operation
+        from meta_research.human_research_context import human_research_context_operations
         from meta_research.human_guidance_operations import human_guidance_operations
         from meta_research.quest_goal_operations import quest_goal_operations
         operations.extend(human_guidance_operations(human_collaboration))
@@ -341,7 +341,7 @@ def create_semantic_owner_gateway(
             research_graph=research_graph,
             human_collaboration=human_collaboration,
         ))
-        operations.append(human_research_context_operation(
+        operations.extend(human_research_context_operations(
             agent_runtime=agent_runtime, human_collaboration=human_collaboration))
     from meta_research.question_relations import (
         question_history_operations,
@@ -350,7 +350,8 @@ def create_semantic_owner_gateway(
     operations.extend(question_relation_operations(
         research_graph=research_graph, agent_runtime=agent_runtime, human_collaboration=human_collaboration))
     operations.append(question_history_operations(
-        research_graph=research_graph, agent_runtime=agent_runtime, human_collaboration=human_collaboration))
+        research_graph=research_graph, agent_runtime=agent_runtime,
+        human_collaboration=human_collaboration, research_memory=research_memory))
     if advancement_engine is not None:
         if research_memory is None:
             raise ValueError("formal semantic catalog requires research memory")
@@ -706,8 +707,8 @@ def _dataset_operations(research_graph, agent_runtime, human_collaboration=None)
                    ["source_dataset_version_ref", "derived_dataset_version_ref", "question_ref", "processing"]),
     }
     descriptions = {
-        "register": "登记可复用的 Dataset 语义身份；semantic_key 由系统统一识别，当前调用的发现与采用范围仍是本 Quest。先检索并复用已有 semantic_key；name、meaning、metadata 和 notes 描述研究含义，实际内容沿 RM 资产绑定保存。",
-        "register_version": "登记不可变 DatasetVersion，绑定当前 Quest 已正式接纳的精确 RM AssetVersion。统一使用 selections，每项含原 asset_binding（asset_ref、version_ref、content_hash、manifest_hash、receipt 五字段）和规范相对 path；null 表示整个父资产。返回的 asset_bindings 自动推导，不作为登记参数。可选择同父的多个文件或目录，父 receipt/hash 不变。返回的 selection_readers 给出准确 content.read 参数和 selection_ref；Target 的 direct_accepted_input_asset_refs 可使用 selection_ref。使用 1–256 个选择；meaning 描述采集、解释和版本含义，随后用 datasets.reference 关联当前 Question。",
+        "register": "登记当前 Quest 可复用的 Dataset 语义身份；相同内容自动复用，同一 semantic_key 允许不同 Quest 或不同快照分别登记而不互相冲突。name、meaning、metadata 和 notes 描述研究含义，实际内容沿 RM 资产绑定保存，登记后本 Quest 立即可发现并读取。",
+        "register_version": "登记不可变 DatasetVersion，绑定当前 Quest 已正式接纳的精确 RM AssetVersion。统一使用 selections，每项含原 asset_binding（asset_ref、version_ref、content_hash、manifest_hash、receipt 五字段）和规范相对 path；null 表示整个父资产。返回的 asset_bindings 自动推导，不作为登记参数。可选择同父的多个文件或目录，父 receipt/hash 不变。返回的 selection_readers 给出准确 content.read 参数和 selection_ref；Target 的 direct_accepted_input_asset_refs 可使用 selection_ref。使用 1–256 个选择；meaning 描述采集、解释和版本含义，登记后本 Quest 立即可发现，随后可用 datasets.reference 关联当前 Question。",
         "reference": "记录本 Quest 的 Question 对精确 DatasetVersion 的使用；该版本的资产须在当前 Quest 的已接纳范围内，可复用身份本身不授予跨 Quest 访问或采用权限。可用 research_ref 关联当前 Quest 已有的 Baseline／Variant／VariantRun／Evaluation／EvaluationAttempt／Target／TargetCommit，以 purpose 和 notes 说明用途。关联表示研究关系，归属、生产、结果与执行授权各按对应 Owner 事实核验。",
         "derive": "Record one exact source DatasetVersion -> retained derived DatasetVersion, for example collection -> cleaned, annotated, combined or split data. Both versions must already bind accepted RM assets; this copies no data. Use multiple edges for multiple sources. Describe processing and provenance under the current Quest's Question. Optional research_ref identifies existing related research, within the current Quest; it is not proof of production or independent verification. Choose useful lineage granularity yourself; registering every file, transient intermediate or processing step is not required. Self-links and provenance cycles are invalid.",
     }
@@ -736,9 +737,10 @@ def _dataset_operations(research_graph, agent_runtime, human_collaboration=None)
     result.extend((
         SemanticOperation(
             semantic_operation_id="research_graph.datasets.page", owning_module="research_graph",
-            description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 分页发现当前 Quest 使用的 Dataset。每次选择一种模式：query 搜索语义身份、dataset_ref 列精确版本、question_ref 列研究用途，或 dataset_version_ref 列派生关系；各模式分别调用。direction 仅用于派生模式：sources 查该版本的输入，derived 查下游数据，默认 both。以 next_offset/query_revision 续页，保持查询与limit；research_query_changed 后从0重开，缺修订返回 research_query_revision_required。result_state/scan_complete 区分空结果与扫描结束。保留 notes 和 metadata；发现记录仍须经正式证据和执行输入绑定才能采用。",
+            description="Companion may select another HC-authorized source_quest_ref for reading; carry that selector when following returned readers. 分页发现当前 Quest 登记或使用的 Dataset。每次选择一种模式：query 搜索语义身份、semantic_key 按键列快照、dataset_ref 列精确版本、question_ref 列研究用途，或 dataset_version_ref 列派生关系；各模式分别调用。direction 仅用于派生模式：sources 查该版本的输入，derived 查下游数据，默认 both。以 next_offset/query_revision 续页，保持查询与limit；research_query_changed 后从0重开，缺修订返回 research_query_revision_required。result_state/scan_complete 区分空结果与扫描结束。保留 notes 和 metadata；发现记录仍须经正式证据和执行输入绑定才能采用。",
             input_schema={"type": "object", "properties": {"source_quest_ref": _string(max_length=256),
-                "query": {"type": "string", "maxLength": 1024}, "dataset_ref": _string(max_length=1024),
+                "query": {"type": "string", "maxLength": 1024}, "semantic_key": _string(max_length=1024),
+                "dataset_ref": _string(max_length=1024),
                 "question_ref": _string(max_length=1024), "dataset_version_ref": _string(max_length=1024),
                 "direction": {"type": "string", "enum": ["sources", "derived", "both"]},
                 "query_revision": {"type":"string","pattern":"^[0-9a-f]{64}$"},
@@ -795,25 +797,30 @@ def _dataset_effect(research_graph, agent_runtime, context, arguments, action, *
         except OwnerConflict as error:
             raise SemanticMcpError(error.code, error.details) from error
         return {"status": "not_found" if result is None else "accepted", "result": result}
+    scope = _dataset_scope(agent_runtime, context)
     payload = {key: value for key, value in arguments.items() if key != "effect_id"}
+    if action in {"register", "register_version"}:
+        payload["quest_ref"] = scope["quest_ref"]
     def effect_scope():
         # RG calls this trusted closure inside its fenced writer transaction.
-        scope = _dataset_scope(agent_runtime, context)
+        current = _dataset_scope(agent_runtime, context)
+        if current.get("quest_ref") != scope.get("quest_ref"):
+            raise SemanticMcpError("dataset_quest_scope_invalid")
         if action == "register_version":
             from meta_research.resource_selections import resource_selections
             _, parents = resource_selections(payload["selections"])
             for binding in parents:
-                research_graph.verify_asset_quest_scope(binding.version_ref, quest_ref=scope["quest_ref"])
+                research_graph.verify_asset_quest_scope(binding.version_ref, quest_ref=current["quest_ref"])
         if action in {"reference", "derive"}:
             question = research_graph.query_question_history_by_ref(payload["question_ref"])
-            if question is None or question.quest_ref != scope.get("quest_ref"):
+            if question is None or question.quest_ref != current.get("quest_ref"):
                 raise SemanticMcpError("dataset_question_scope_invalid")
             if payload.get("research_ref") is not None:
                 research_graph.verify_dataset_research_ref_scope(
-                    payload["research_ref"], quest_ref=scope["quest_ref"])
+                    payload["research_ref"], quest_ref=current["quest_ref"])
             fields = ("dataset_version_ref",) if action == "reference" else ("source_dataset_version_ref", "derived_dataset_version_ref")
             for field in fields:
-                research_graph.verify_dataset_version_quest_scope(payload[field], quest_ref=scope["quest_ref"])
+                research_graph.verify_dataset_version_quest_scope(payload[field], quest_ref=current["quest_ref"])
     handler = {"register": research_graph.register_dataset,
                "register_version": research_graph.register_dataset_version,
                "reference": research_graph.reference_dataset,

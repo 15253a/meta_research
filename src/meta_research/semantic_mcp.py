@@ -63,11 +63,11 @@ ROOT_AGENT_ENVIRONMENT_OPERATION_IDS = (
     "research_graph.environments.reference.reconcile",
 )
 ROOT_AGENT_LITERATURE_OPERATION_IDS = (
-    "research_memory.literature.register",
-    "research_memory.literature.register.reconcile",
-    "research_memory.literature.reference",
-    "research_memory.literature.reference.reconcile",
-    "research_memory.literature.read",
+    "research_graph.literature.register",
+    "research_graph.literature.register.reconcile",
+    "research_graph.literature.reference",
+    "research_graph.literature.reference.reconcile",
+    "research_graph.literature.read",
 )
 TOOL_DISCOVERY_OPERATION_IDS = (
     "tools.catalog.page",
@@ -84,10 +84,14 @@ ROOT_AGENT_COMMON_OPERATION_IDS = (
     "research_memory.assets.retire",
     "research_memory.assets.retire.reconcile",
     "research_graph.questions.page",
-    "research_memory.literature.page",
+    "research_graph.literature.page",
     "research_memory.content.read",
     "research_memory.creation_basis.read",
     "human_request.read",
+    "human_request.responses.page",
+    "human_collaboration.inputs.page",
+    "human_collaboration.guidance.page",
+    "human_collaboration.guidance.treatments.page",
     "research_graph.baselines.page",
     "research_graph.baselines.read",
     "research_graph.target_formal_results.read",

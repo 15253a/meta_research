@@ -433,7 +433,7 @@ def test_every_native_session_can_page_the_complete_live_catalog(root_kind):
 
 def test_live_bundle_channel_gates_other_role_effect_and_reconcile():
     gateway, _graph, _memory, _runtime = _gateway()
-    connection = _issue(gateway, BUNDLE_ROOT_SEMANTIC_OPERATION_IDS)
+    connection = _issue(gateway, TARGET_ROOT_SEMANTIC_OPERATION_IDS, root_kind="target")
     for operation_id in (
         "research_graph.question_relations.record",
         "research_graph.question_relations.record.reconcile",
@@ -612,12 +612,16 @@ def test_formal_catalog_closes_commands_and_preserves_dynamic_research_content()
         "research_workspace.materials.copy.reconcile",
         "research_workspace.materials.feedback",
         "research_workspace.materials.feedback.reconcile",
-        "research_memory.literature.page",
+        "research_graph.literature.page",
         "research_graph.questions.page",
         "research_graph.question_history.read",
         "research_graph.question_relations.read",
         "research_graph.question_relations.record",
         "research_graph.question_relations.record.reconcile",
+        "human_request.responses.page",
+        "human_collaboration.inputs.page",
+        "human_collaboration.guidance.page",
+        "human_collaboration.guidance.treatments.page",
         "research_graph.artifact_roles.adjust",
         "research_graph.artifact_roles.adjust.reconcile",
         "agent_runtime.target_run.progress",
@@ -632,7 +636,7 @@ def test_formal_catalog_closes_commands_and_preserves_dynamic_research_content()
             "register_version.reconcile", "reference", "reference.reconcile",
             "derive", "derive.reconcile",
         )),
-        *("research_memory.literature." + action for action in (
+        *("research_graph.literature." + action for action in (
             "read", "register", "register.reconcile", "reference", "reference.reconcile",
         )),
         *("research_graph.environments." + action for action in (
@@ -641,8 +645,8 @@ def test_formal_catalog_closes_commands_and_preserves_dynamic_research_content()
         )),
     }
     opaque_inputs = {
-        "research_memory.literature.register": (("metadata",), ("asset_bindings", "items")),
-        "research_memory.literature.reference": (("reading_bindings", "items"),),
+        "research_graph.literature.register": (("metadata",), ("asset_bindings", "items")),
+        "research_graph.literature.reference": (("reading_bindings", "items"),),
         "research_graph.datasets.register": (("metadata",),),
         "research_graph.datasets.register_version": (
             ("metadata",), ("asset_bindings", "items"),

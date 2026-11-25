@@ -27,8 +27,8 @@ _FACTS = {
     "derive": ("rg_dataset_derivations", "dataset_derivation_ref", DATASET_DERIVATION_SCHEMA),
 }
 _INDEXED_FIELDS = {
-    "register": ("semantic_key",),
-    "register_version": ("dataset_ref", "version_label"),
+    "register": ("semantic_key", "origin_quest_ref"),
+    "register_version": ("dataset_ref", "version_label", "origin_quest_ref"),
     "reference": ("dataset_version_ref", "question_ref"),
     "derive": ("source_dataset_version_ref", "derived_dataset_version_ref", "question_ref"),
 }
@@ -84,22 +84,25 @@ class ResearchDatasetOwnerInterface(Protocol):
 
 
 class ResearchDatasetOwnerMixin:
-    def register_dataset(self, *, semantic_key, name, meaning, metadata=None, notes="", idempotency_key, effect_scope=None):
+    def register_dataset(self, *, semantic_key, name, meaning, metadata=None, notes="", quest_ref=None, idempotency_key, effect_scope=None):
+        if quest_ref is not None:
+            dataset_text(quest_ref, "quest_ref")
         payload = {
             "semantic_key": dataset_text(semantic_key, "semantic_key"),
             "name": dataset_text(name, "name"),
             "meaning": dataset_text(meaning, "meaning"),
             "metadata": dataset_metadata(metadata),
             "notes": dataset_text(notes, "notes", optional=True),
+            "origin_quest_ref": quest_ref,
         }
         return self._accept_dataset_fact("register", payload, idempotency_key,
-            {"semantic_key": payload["semantic_key"]}, effect_scope=effect_scope)
+            {"payload_hash": canonical_hash(payload)}, effect_scope=effect_scope)
 
     def register_dataset_version(self, *, dataset_ref, version_label, meaning,
-                                 selections, metadata=None, notes="", idempotency_key, effect_scope=None):
+                                 selections, metadata=None, notes="", quest_ref=None, idempotency_key, effect_scope=None):
         dataset_text(dataset_ref, "ref")
-        if self.query_dataset(dataset_ref) is None:
-            raise OwnerConflict("dataset_not_found")
+        if quest_ref is not None:
+            dataset_text(quest_ref, "quest_ref")
         from meta_research.resource_selections import resource_selections
         selected, bindings = resource_selections(selections)
         if not selected:
@@ -112,6 +115,7 @@ class ResearchDatasetOwnerMixin:
             "selections": [item.as_dict() for item in selected],
             "metadata": dataset_metadata(metadata),
             "notes": dataset_text(notes, "notes", optional=True),
+            "origin_quest_ref": quest_ref,
         }
         def verify_current():
             from meta_research.resource_selections import verify_resource_selections
@@ -229,11 +233,14 @@ class ResearchDatasetOwnerMixin:
     def _dataset_scope_clause(operation, table):
         if operation in {"reference", "derive"}:
             return f"EXISTS (SELECT 1 FROM rg_question_lifecycle q WHERE q.question_ref={table}.question_ref AND q.quest_ref=:quest_scope)"
-        key = (f"v.dataset_ref={table}.dataset_ref" if operation == "register" else
-               f"v.dataset_version_ref={table}.dataset_version_ref")
-        return ("EXISTS (SELECT 1 FROM rg_dataset_versions v JOIN rg_dataset_references r "
-                "ON r.dataset_version_ref=v.dataset_version_ref JOIN rg_question_lifecycle q "
-                f"ON q.question_ref=r.question_ref WHERE {key} AND q.quest_ref=:quest_scope)")
+        if operation == "register":
+            return (f"({table}.origin_quest_ref=:quest_scope OR EXISTS ("
+                    "SELECT 1 FROM rg_dataset_versions v JOIN rg_dataset_references r "
+                    "ON r.dataset_version_ref=v.dataset_version_ref JOIN rg_question_lifecycle q "
+                    f"ON q.question_ref=r.question_ref WHERE v.dataset_ref={table}.dataset_ref AND q.quest_ref=:quest_scope))")
+        return (f"({table}.origin_quest_ref=:quest_scope OR EXISTS ("
+                "SELECT 1 FROM rg_dataset_references r JOIN rg_question_lifecycle q "
+                f"ON q.question_ref=r.question_ref WHERE r.dataset_version_ref={table}.dataset_version_ref AND q.quest_ref=:quest_scope))")
 
     def reconcile_dataset_operation(self, *, operation, idempotency_key):
         if operation not in _FACTS:
@@ -251,21 +258,25 @@ class ResearchDatasetOwnerMixin:
             raise OwnerConflict("dataset_command_invalid")
         return result
 
-    def query_datasets(self, *, query="", dataset_ref=None, question_ref=None,
+    def query_datasets(self, *, query="", semantic_key=None, dataset_ref=None, question_ref=None,
                        dataset_version_ref=None, direction="both", offset=0, limit=50, quest_ref=None, query_revision=None):
         """Page identities, versions, Question usage, or exact version lineage."""
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise OwnerConflict("dataset_page_invalid")
         dataset_text(query, "query", optional=True)
-        if (sum(value is not None for value in (dataset_ref, question_ref, dataset_version_ref)) > 1
-                or query and any(value is not None for value in (dataset_ref, question_ref, dataset_version_ref))
+        filters = (semantic_key, dataset_ref, question_ref, dataset_version_ref)
+        if (sum(value is not None for value in filters) > 1
+                or query and any(value is not None for value in filters)
                 or direction not in {"sources", "derived", "both"}
                 or dataset_version_ref is None and direction != "both"):
             raise OwnerConflict("dataset_page_filter_invalid", {
-                "message": "Use query alone or one of dataset_ref, question_ref, dataset_version_ref. direction=sources/derived requires dataset_version_ref.",
+                "message": "Use query alone or one of semantic_key, dataset_ref, question_ref, dataset_version_ref. direction=sources/derived requires dataset_version_ref.",
                 "correction": "Keep one filter; use direction=both unless reading version lineage."})
         operation, clauses, params = "register", [], {"offset": offset, "limit": limit}
-        if dataset_ref is not None:
+        if semantic_key is not None:
+            dataset_text(semantic_key, "semantic_key")
+            clauses, params["filter"] = ["semantic_key = :filter"], semantic_key
+        elif dataset_ref is not None:
             dataset_text(dataset_ref, "ref")
             operation, clauses, params["filter"] = "register_version", ["dataset_ref = :filter"], dataset_ref
         elif question_ref is not None:
@@ -301,7 +312,7 @@ class ResearchDatasetOwnerMixin:
         with self._database.read_snapshot() as connection:
             from meta_research.research_pagination import bind_page, page_state
             identities = connection.execute(text(f"SELECT {key},payload_hash FROM {table}{where} ORDER BY {key}"), params).all()
-            revision = bind_page({"entry":"datasets","quest_ref":quest_ref,"query":query,
+            revision = bind_page({"entry":"datasets","quest_ref":quest_ref,"query":query,"semantic_key":semantic_key,
                 "dataset_ref":dataset_ref,"question_ref":question_ref,"dataset_version_ref":dataset_version_ref,
                 "direction":direction,"limit":limit},[list(row) for row in identities],offset=offset,query_revision=query_revision)
             total = len(identities)
@@ -354,6 +365,28 @@ class ResearchDatasetOwnerMixin:
                 if not callable(effect_scope):
                     raise OwnerConflict("dataset_effect_scope_invalid")
                 effect_scope()
+            if operation in {"register", "register_version"} and payload.get("origin_quest_ref") is not None:
+                origin_quest = payload["origin_quest_ref"]
+                quest_exists = connection.execute(
+                    text("SELECT 1 FROM rg_quests WHERE quest_ref = :ref"),
+                    {"ref": origin_quest},
+                ).first()
+                if quest_exists is None:
+                    raise OwnerConflict("dataset_quest_not_found")
+                if operation == "register_version":
+                    for binding in payload["asset_bindings"]:
+                        self.verify_asset_quest_scope(binding["version_ref"], quest_ref=origin_quest)
+            if operation == "register_version":
+                dataset = self.query_dataset(payload["dataset_ref"])
+                if dataset is None:
+                    raise OwnerConflict("dataset_not_found")
+                origin_quest = payload.get("origin_quest_ref")
+                if (
+                    origin_quest is not None
+                    and dataset.get("origin_quest_ref") is not None
+                    and self.query_dataset(payload["dataset_ref"], quest_ref=origin_quest) is None
+                ):
+                    raise OwnerConflict("dataset_quest_scope_invalid")
             if operation in {"reference", "derive"}:
                 # Direct Owner callers and idempotent replays receive the same
                 # lineage check as the bound gateway, under this writer fence.
@@ -424,7 +457,10 @@ class ResearchDatasetOwnerMixin:
             if not isinstance(payload, dict) or canonical_hash(payload) != row.payload_hash or row.receipt_hash != _receipt_hash(schema, mapping[key], row.payload_hash, row.receipt_ref, row.accepted_at):
                 raise ValueError
             indexed = _INDEXED_FIELDS[operation]
-            if any(payload[field] != mapping[field] for field in indexed):
+            if any(
+                (payload.get(field) if field == "origin_quest_ref" else payload[field]) != mapping[field]
+                for field in indexed
+            ):
                 raise ValueError
             if operation == "register_version" and not isinstance(payload["selections"], list):
                 raise ValueError
@@ -454,6 +490,8 @@ class ResearchDatasetOwnerMixin:
         result = {"schema_ref": schema, key: mapping[key], **payload, "payload_hash": row.payload_hash,
                   "accepted_at": row.accepted_at,
                   "receipt": _receipt(schema, mapping[key], row.payload_hash, row.receipt_ref, row.accepted_at)}
+        if operation in {"register", "register_version"} and "origin_quest_ref" not in result:
+            result["origin_quest_ref"] = mapping["origin_quest_ref"]
         if operation == "register_version":
             from meta_research.resource_selections import selection_readers
             result.update(selection_readers(payload, mapping[key]))

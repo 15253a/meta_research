@@ -146,6 +146,39 @@ def _read_content(graph, memory, *, quest_ref, source_ref, version_ref, entry_pa
         return {**value,
                 "source_ref": source_ref, "version_ref": version_ref,
                 "source_binding": leaf}
+    if source_ref.startswith(("literature_", "literature_reference_")):
+        lit = graph.query_literature(source_ref, quest_ref=quest_ref)
+        if lit is None:
+            raise OwnerConflict("content_source_unbound")
+        if version_ref != lit["payload_hash"]:
+            raise OwnerConflict("content_version_unbound")
+        return {**exact_page(lit), "source_ref": source_ref, "version_ref": version_ref}
+    if source_ref.startswith("creation_basis_"):
+        with memory._database.read_snapshot() as connection:
+            visible = connection.execute(text(
+                "SELECT 1 FROM rm_question_creation_bases WHERE quest_ref=:quest AND basis_ref=:basis"
+            ), {"quest": quest_ref, "basis": source_ref}).first()
+        if visible is None:
+            raise OwnerConflict("content_source_unbound")
+        try:
+            basis = memory.creation_bases.query(source_ref, version_ref)
+        except OwnerConflict as error:
+            if error.code == "creation_basis_hash_invalid":
+                raise OwnerConflict("content_version_unbound") from error
+            if error.code == "creation_basis_missing":
+                raise OwnerConflict("content_source_unbound") from error
+            raise
+        value = {
+            "understanding": memory.creation_bases.understanding_view(basis),
+            "sources": memory.creation_bases.source_views(basis),
+            "corrections": basis["corrections"],
+            "search_assessment": basis["search_assessment"],
+            "literature_snapshot": basis["literature_snapshot"],
+            "predecessor": basis["predecessor"],
+            "applicability": basis.get("applicability"),
+            "inherited_literature": basis.get("inherited_literature", []),
+        }
+        return {**exact_page(value), "source_ref": source_ref, "version_ref": version_ref}
     if source_ref.startswith("human_input_"):
         from meta_research.human_research_input import read_research_input, research_input_leaf
         value=read_research_input(memory._database,source_ref,quest_ref=quest_ref)
@@ -362,12 +395,21 @@ def discover_questions(graph, memory, *, quest_ref, query="", offset=0, limit=12
             ORDER BY l.updated_at DESC,l.question_ref LIMIT :limit OFFSET :offset"""),
             {"quest":quest_ref,"query":query,"limit":limit+1,"offset":offset}).all()
         items=[]
+        from meta_research.question_relations import question_creation_basis_descriptor
         for row in rows[:limit]:
             q=graph.query_question_history_by_ref(row.question_ref)
             if q is None or q.quest_ref!=quest_ref:raise OwnerConflict("question_source_invalid")
             body=memory.read_question_content(q.content_ref,q.content_hash)
+            relation_count=c.execute(text(
+                "SELECT count(*) FROM rg_question_relations WHERE quest_ref=:quest "
+                "AND (left_question_ref=:question OR right_question_ref=:question)"),
+                {"quest":quest_ref,"question":q.question_ref}).scalar_one()
+            creation_basis=question_creation_basis_descriptor(
+                graph, memory, quest_ref=quest_ref, question_ref=q.question_ref,
+                source_quest_ref=source_quest_ref)
             items.append({"question_ref":q.question_ref,"name":body.get("title",q.question_ref),
                 "summary":body.get("unknown_statement","")[:1200],"status":row.status,
+                "relation_count":relation_count,"creation_basis":creation_basis,
                 "reader":_reader({"source_ref":q.question_ref,"version_ref":q.content_ref}, source_quest_ref),
                 "history_reader":_reader({"operation":"research_graph.question_history.read","question_ref":q.question_ref,"offset":0,"limit":12}, source_quest_ref)})
     next_offset = offset + limit if len(rows) > limit else None
@@ -375,9 +417,30 @@ def discover_questions(graph, memory, *, quest_ref, query="", offset=0, limit=12
             **page_state(items,next_offset,offset=offset,query=query)}
 
 
+def _normalize_literature_record_ref(record_ref: str) -> str:
+    value = str(record_ref).strip()
+    if value.lower().startswith("doi:"):
+        return "doi:" + value[4:].strip().lower()
+    return value
+
+
+def _deepfetch_paper_for_record(snapshot: dict, record_ref: str) -> dict:
+    canonical = _normalize_literature_record_ref(record_ref)
+    for paper in snapshot.get("papers") or ():
+        doi = str(paper.get("doi") or "").strip().lower()
+        url = str(paper.get("url") or "").strip()
+        if doi and f"doi:{doi}" == canonical:
+            return paper
+        if url and f"url:{canonical_hash(url)[:32]}" == record_ref:
+            return paper
+    return {}
+
+
 def discover_literature(graph, memory, *, quest_ref, query="", offset=0, limit=12, record_ref=None, query_revision=None, source_quest_ref=None):
-    if type(offset)is not int or offset<0 or type(limit)is not int or not 1<=limit<=100:
+    if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
         raise OwnerConflict("research_library_page_invalid")
+    normalized_filter = None if record_ref is None else _normalize_literature_record_ref(record_ref)
+    query_cf = query.casefold() if query else ""
     with memory._database.read_snapshot() as c:
         revisions = c.execute(text("SELECT revision_ref,revision_number FROM rm_question_literature_revisions "
             "WHERE quest_ref=:quest ORDER BY revision_ref"), {"quest": quest_ref}).all()
@@ -386,82 +449,194 @@ def discover_literature(graph, memory, *, quest_ref, query="", offset=0, limit=1
             judgment_revisions.extend(list(row) for row in c.execute(text(
                 f"SELECT a.content_ref,a.payload_hash FROM {table} a "
                 "JOIN ae_stage_run_requests r ON r.request_ref=a.request_ref "
-                "WHERE r.quest_ref=:quest ORDER BY a.content_ref"), {"quest":quest_ref}).all())
-        ordinary_revisions = c.execute(text("SELECT ref,payload_hash FROM rg_literature_facts WHERE quest_ref=:quest ORDER BY ref"), {"quest":quest_ref}).all()
+                "WHERE r.quest_ref=:quest ORDER BY a.content_ref"), {"quest": quest_ref}).all())
+        ordinary_revisions = c.execute(text("SELECT ref,payload_hash FROM rg_literature_facts WHERE quest_ref=:quest ORDER BY ref"), {"quest": quest_ref}).all()
         query_revision_token = bind_page({"entry":"literature","quest_ref":quest_ref,"query":query,
-            "record_ref":record_ref,"limit":limit},[list(row) for row in revisions]+judgment_revisions+[list(row) for row in ordinary_revisions],
-            offset=offset,query_revision=query_revision)
-        rows=c.execute(text("""SELECT * FROM (
-            SELECT r.revision_ref,r.question_ref,json_extract(e.value,'$.ref') AS record_ref,
-                   r.accepted_at, NULL AS literature_ref
-            FROM rm_question_literature_revisions r,json_each(r.records_json) e
-            WHERE r.quest_ref=:quest AND (:record IS NULL OR json_extract(e.value,'$.ref')=:record)
-            AND r.revision_number=(SELECT max(x.revision_number) FROM rm_question_literature_revisions x WHERE x.question_ref=r.question_ref)
-            UNION ALL
-            SELECT ref,NULL,json_extract(payload_json,'$.record_ref'),accepted_at,ref
-            FROM rg_literature_facts WHERE quest_ref=:quest AND kind='register'
-            AND (:record IS NULL OR json_extract(payload_json,'$.record_ref')=:record))
-            ORDER BY accepted_at DESC,revision_ref,record_ref LIMIT :limit OFFSET :offset"""),
-            {"quest":quest_ref,"record":record_ref,"limit":limit+1,"offset":offset}).all()
-        items=[]
-        for row in rows[:limit]:
-            if row.literature_ref is not None:
-                paper = graph.query_literature(row.literature_ref, quest_ref=quest_ref)
-                matches = not query or query.casefold() in json.dumps(paper,ensure_ascii=False).casefold()
-                uses = c.execute(text("SELECT ref FROM rg_literature_facts WHERE quest_ref=:quest AND kind='reference' "
-                    "AND json_extract(payload_json,'$.literature_ref')=:ref ORDER BY accepted_at,ref"),
-                    {"quest":quest_ref,"ref":row.literature_ref}).scalars().all()
-                judgments = []
-                for ref in uses:
-                    usage = graph.query_literature(ref, quest_ref=quest_ref)
-                    if query and not matches:
-                        matches = any(query.casefold() in str(usage.get(field) or "").casefold()
-                            for field in ("question_ref", "research_ref", "purpose", "reading_summary"))
-                    readers = [_reader({"source_ref":b["version_ref"],"version_ref":b["version_ref"]}, source_quest_ref) for b in usage["reading_bindings"]]
-                    target = graph.literature_reading_target(usage["research_ref"])
-                    if readers and target is not None:
-                        from meta_research.research_notes import query_target_research_notes
-                        for reader in readers:
-                            note = query_target_research_notes(memory._database,memory,target,version_ref=reader["version_ref"])[0]
-                            if note["entry_path"] is not None:
-                                reader["entry_path"] = note["entry_path"]
-                    judgments.append({"reference_ref":ref,"question_ref":usage["question_ref"],
-                        "research_ref":usage["research_ref"],"purpose":usage["purpose"][:1200],"summary":usage["reading_summary"][:1200],
-                        "reader":_reader({"operation":"research_memory.literature.read","literature_ref":ref}, source_quest_ref),
-                        "readers":readers})
-                if not matches:
-                    continue
-                items.append({"record_ref":paper["record_ref"],"literature_ref":paper["ref"],"name":paper["title"],
-                    "source":paper["source"][:1200],"fulltext_status":paper["fulltext_status"],
-                    "reader":_reader({"operation":"research_memory.literature.read","literature_ref":paper["ref"]}, source_quest_ref),
-                    "readers":[_reader({"source_ref":b["version_ref"],"version_ref":b["version_ref"]}, source_quest_ref) for b in paper["asset_bindings"]],
-                    "judgments":judgments})
+            "record_ref":record_ref,"limit":limit}, [list(row) for row in revisions] + judgment_revisions + [list(row) for row in ordinary_revisions],
+            offset=offset, query_revision=query_revision)
+
+        df_rows = c.execute(text("""
+            SELECT r.revision_ref, r.question_ref,
+                   json_extract(e.value,'$.ref') AS record_ref, r.accepted_at
+            FROM rm_question_literature_revisions r, json_each(r.records_json) e
+            WHERE r.quest_ref=:quest
+              AND r.revision_number=(SELECT max(x.revision_number) FROM rm_question_literature_revisions x WHERE x.question_ref=r.question_ref)
+            ORDER BY r.accepted_at DESC, r.revision_ref, record_ref"""),
+            {"quest": quest_ref}).all()
+        manual_reg_rows = c.execute(text(
+            "SELECT ref, payload_json, accepted_at FROM rg_literature_facts "
+            "WHERE quest_ref=:quest AND kind='register' ORDER BY accepted_at DESC, ref"),
+            {"quest": quest_ref}).all()
+        manual_ref_rows = c.execute(text(
+            "SELECT ref, json_extract(payload_json,'$.literature_ref') AS literature_ref, payload_json, accepted_at "
+            "FROM rg_literature_facts WHERE quest_ref=:quest AND kind='reference' ORDER BY accepted_at, ref"),
+            {"quest": quest_ref}).all()
+
+        refs_by_lit = {}
+        for row in manual_ref_rows:
+            refs_by_lit.setdefault(row.literature_ref, []).append(row)
+
+        snapshots = {}
+        def get_snapshot(snapshot_ref):
+            if snapshot_ref not in snapshots:
+                snapshots[snapshot_ref] = memory.read_literature_snapshot_metadata(snapshot_ref)
+            return snapshots[snapshot_ref]
+
+        groups = {}
+        def get_group(canonical):
+            group = groups.get(canonical)
+            if group is None:
+                group = {"canonical": canonical, "deepfetch": [], "manual": [], "max_accepted_at": 0.0}
+                groups[canonical] = group
+            return group
+
+        for row in df_rows:
+            canonical = _normalize_literature_record_ref(row.record_ref)
+            if normalized_filter is not None and canonical != normalized_filter:
                 continue
-            revision=memory.query_question_literature_revision_ref(question_ref=row.question_ref,revision_ref=row.revision_ref)
-            if revision is None:raise OwnerConflict("literature_revision_invalid")
-            snapshot=memory.read_literature_snapshot_metadata(revision["literature_snapshot_ref"])
-            paper=next((p for p in snapshot["papers"] if row.record_ref=="doi:"+str(p.get("doi","")).strip().lower()
-                        or row.record_ref=="url:"+canonical_hash(str(p.get("url","")).strip())[:32]),{})
-            if query and query.casefold() not in json.dumps(paper,ensure_ascii=False).casefold():continue
-            judgments=[]
-            for table,method,field in _STAGE_CONTENT:
-                document_column = "plan_document_json" if table == "rm_plan_documents" else "payload_json"
-                sources=c.execute(text(f"SELECT a.content_ref,a.payload_hash,a.submission_ref,r.question_ref FROM {table} a "
-                    "JOIN ae_stage_run_requests r ON r.request_ref=a.request_ref "
-                    f"WHERE r.quest_ref=:quest AND instr(a.{document_column},:record)>0 ORDER BY a.accepted_at DESC LIMIT 12"),
-                    {"quest":quest_ref,"record":row.record_ref}).all()
-                for source in sources:
-                    accepted=getattr(memory,method)(source.submission_ref)
-                    if accepted is None:raise OwnerConflict("literature_judgment_source_invalid")
-                    value=getattr(accepted,field)
-                    judgments.append({"question_ref":source.question_ref,"summary":json.dumps(value,ensure_ascii=False)[:1200],
-                        "reader":_reader({"source_ref":source.content_ref,"version_ref":source.payload_hash}, source_quest_ref)})
-            items.append({"record_ref":row.record_ref,"question_ref":row.question_ref,"name":paper.get("title",row.record_ref),
-                "summary":str(paper.get("abstract") or paper.get("summary") or "")[:1200],
-                "reader":_reader({"source_ref":row.record_ref,"version_ref":row.revision_ref}, source_quest_ref),"judgments":judgments})
-    next_offset = offset + limit if len(rows) > limit else None
-    return {"items":items,"offset":offset,"next_offset":next_offset,"query_revision":query_revision_token,
-            **page_state(items,next_offset,offset=offset,query=query)}
+            group = get_group(canonical)
+            group["deepfetch"].append(row)
+            group["max_accepted_at"] = max(group["max_accepted_at"], float(row.accepted_at))
+
+        for row in manual_reg_rows:
+            try:
+                raw_payload = json.loads(row.payload_json)
+            except (TypeError, ValueError):
+                raw_payload = {}
+            rec = raw_payload.get("record_ref") or ""
+            canonical = _normalize_literature_record_ref(rec)
+            if normalized_filter is not None and canonical != normalized_filter:
+                continue
+            group = get_group(canonical)
+            group["manual"].append(row)
+            group["max_accepted_at"] = max(group["max_accepted_at"], float(row.accepted_at))
+
+        filtered = []
+        for group in sorted(groups.values(), key=lambda g: (-g["max_accepted_at"], g["canonical"])):
+            df_papers = []
+            for row in group["deepfetch"]:
+                revision = memory.query_question_literature_revision_ref(question_ref=row.question_ref, revision_ref=row.revision_ref)
+                if revision is None:
+                    raise OwnerConflict("literature_revision_invalid")
+                snapshot = get_snapshot(revision["literature_snapshot_ref"])
+                df_papers.append((row, _deepfetch_paper_for_record(snapshot, row.record_ref)))
+            if query_cf:
+                matched = query_cf in group["canonical"].casefold()
+                if not matched:
+                    matched = any(query_cf in row.payload_json.casefold() for row in group["manual"])
+                if not matched:
+                    matched = any(
+                        query_cf in ref_row.payload_json.casefold()
+                        for reg in group["manual"]
+                        for ref_row in refs_by_lit.get(reg.ref, ())
+                    )
+                if not matched:
+                    matched = any(
+                        query_cf in row.record_ref.casefold()
+                        or query_cf in json.dumps(paper, ensure_ascii=False).casefold()
+                        for row, paper in df_papers
+                    )
+                if not matched:
+                    continue
+            group["df_papers"] = df_papers
+            filtered.append(group)
+
+        items = []
+        for group in filtered[offset:offset + limit]:
+            judgments = []
+            if group["manual"]:
+                verified_regs = [graph.query_literature(row.ref, quest_ref=quest_ref) for row in group["manual"]]
+                preferred = next((reg for reg in verified_regs if reg["fulltext_status"] == "obtained"), verified_regs[0])
+                readers = []
+                seen_versions = set()
+                for reg in verified_regs:
+                    for b in reg["asset_bindings"]:
+                        if b["version_ref"] not in seen_versions:
+                            seen_versions.add(b["version_ref"])
+                            readers.append(_reader({"source_ref": b["version_ref"], "version_ref": b["version_ref"]}, source_quest_ref))
+                for reg in verified_regs:
+                    for ref_row in refs_by_lit.get(reg["ref"], ()):
+                        usage = graph.query_literature(ref_row.ref, quest_ref=quest_ref)
+                        j_readers = [_reader({"source_ref": b["version_ref"], "version_ref": b["version_ref"]}, source_quest_ref) for b in usage["reading_bindings"]]
+                        target = graph.literature_reading_target(usage["research_ref"])
+                        if j_readers and target is not None:
+                            from meta_research.research_notes import query_target_research_notes
+                            for reader in j_readers:
+                                note = query_target_research_notes(memory._database, memory, target, version_ref=reader["version_ref"])[0]
+                                if note["entry_path"] is not None:
+                                    reader["entry_path"] = note["entry_path"]
+                        judgments.append({
+                            "reference_ref": ref_row.ref,
+                            "payload_hash": usage["payload_hash"],
+                            "question_ref": usage["question_ref"],
+                            "research_ref": usage["research_ref"],
+                            "purpose": usage["purpose"][:1200],
+                            "summary": usage["reading_summary"][:1200],
+                            "reader": _reader({"operation": "research_graph.literature.read", "literature_ref": ref_row.ref}, source_quest_ref),
+                            "readers": j_readers,
+                        })
+                item = {
+                    "record_ref": preferred["record_ref"],
+                    "literature_ref": preferred["ref"],
+                    "literature_payload_hash": preferred["payload_hash"],
+                    "name": preferred["title"],
+                    "source": preferred["source"][:1200],
+                    "fulltext_status": preferred["fulltext_status"],
+                    "reader": _reader({"operation": "research_graph.literature.read", "literature_ref": preferred["ref"]}, source_quest_ref),
+                    "readers": readers,
+                    "judgments": judgments,
+                }
+            else:
+                item = None
+
+            if group["df_papers"]:
+                primary_df, primary_paper = group["df_papers"][0]
+                question_refs = list(dict.fromkeys(row.question_ref for row, _ in group["df_papers"]))
+                seen_stage = set()
+                df_records = list(dict.fromkeys(row.record_ref for row, _ in group["df_papers"]))
+                for table, method, field in _STAGE_CONTENT:
+                    document_column = "plan_document_json" if table == "rm_plan_documents" else "payload_json"
+                    for rec in df_records:
+                        sources = c.execute(text(f"SELECT a.content_ref,a.payload_hash,a.submission_ref,r.question_ref FROM {table} a "
+                            "JOIN ae_stage_run_requests r ON r.request_ref=a.request_ref "
+                            f"WHERE r.quest_ref=:quest AND instr(lower(a.{document_column}),lower(:record))>0 ORDER BY a.accepted_at DESC LIMIT 12"),
+                            {"quest": quest_ref, "record": rec}).all()
+                        for source in sources:
+                            key = (source.content_ref, source.payload_hash)
+                            if key in seen_stage:
+                                continue
+                            seen_stage.add(key)
+                            accepted = getattr(memory, method)(source.submission_ref)
+                            if accepted is None:
+                                raise OwnerConflict("literature_judgment_source_invalid")
+                            value = getattr(accepted, field)
+                            judgments.append({
+                                "question_ref": source.question_ref,
+                                "summary": json.dumps(value, ensure_ascii=False)[:1200],
+                                "reader": _reader({"source_ref": source.content_ref, "version_ref": source.payload_hash}, source_quest_ref),
+                            })
+                df_abstract = str(primary_paper.get("abstract") or primary_paper.get("summary") or "")[:1200]
+                df_reader = _reader({"source_ref": primary_df.record_ref, "version_ref": primary_df.revision_ref}, source_quest_ref)
+                if item is None:
+                    item = {
+                        "record_ref": primary_df.record_ref,
+                        "question_ref": primary_df.question_ref,
+                        "question_refs": question_refs,
+                        "name": primary_paper.get("title", primary_df.record_ref),
+                        "summary": df_abstract,
+                        "reader": df_reader,
+                        "judgments": judgments,
+                    }
+                else:
+                    item["question_ref"] = primary_df.question_ref
+                    item["question_refs"] = question_refs
+                    item["deepfetch_reader"] = df_reader
+                    if df_abstract:
+                        item["summary"] = df_abstract
+            items.append(item)
+    next_offset = offset + limit if offset + limit < len(filtered) else None
+    return {"items": items, "offset": offset, "next_offset": next_offset, "query_revision": query_revision_token,
+            **page_state(items, next_offset, offset=offset, query=query)}
 
 
 def research_content_operations(*, research_graph, research_memory, agent_runtime, human_collaboration=None,
@@ -524,7 +699,7 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
         description="Read an exact authorized source using its returned source_ref/version_ref. Before Quest creation, DeepFetch may read only its current HC request's accepted input versions using the supplied version/version reader. Companion may explicitly select source_quest_ref outside the page selection when current HC authority grants it; other roots retain their current Quest scope. For source-specific pagination and errors, read this operation's tools.contracts.read contract. Reading is reference access; execution inputs remain explicitly bound by their Owner.",
         return_description="Serialized JSON uses UTF-8 byte offsets and ends at next_offset=null; complete only means one page contains the entire source. Exact guidance and human response pages also expose upload_readers for their retained attachments; follow each reader's source_ref/version_ref/entry_path. Uploaded attachments and asset files use byte offsets (binary is base64) and end at complete=true. Asset directory pages use entry offsets and end at next_offset=null. Assets stream from managed or linked_local custody without making an export. A hash names complete digital content, not a physical resource or its verified condition. Preserve returned exact source bindings and readers.",
         error_descriptions={
-            "content_version_unbound": "This source/version is not bound here. Reopen research_graph.questions.page, research_memory.literature.page or research_memory.assets.page; copy its exact reader arguments, including source_quest_ref. Other content may exist.",
+            "content_version_unbound": "This source/version is not bound here. Reopen research_graph.questions.page, research_graph.literature.page or research_memory.assets.page; copy its exact reader arguments, including source_quest_ref. Other content may exist.",
             "content_source_unbound": "The source_ref has no readable binding here. For an AssetVersion original, copy its exact reader or use asset_binding.version_ref as both source_ref and version_ref; asset_ref identifies the logical asset, not its readable content. For other source kinds rediscover the exact reader. Changing arguments cannot grant access.",
             "content_quest_not_authorized": "The requested Quest is not currently authorized for this Companion read; page visibility grants no permission.",
             "content_receipt_invalid": "The stored stage source does not match its accepted receipt; do not substitute latest content.",
@@ -541,7 +716,7 @@ def research_content_operations(*, research_graph, research_memory, agent_runtim
             "offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":65536}},
             "required":["source_ref","version_ref"],"additionalProperties":False},
         output_schema={"type":"object"},handler=invoke)]
-    for name,reader in (("research_graph.questions.page",discover_questions),("research_memory.literature.page",discover_literature)):
+    for name,reader in (("research_graph.questions.page",discover_questions),("research_graph.literature.page",discover_literature)):
         def discover(context,arguments,reader=reader):
             try:
                 arguments = dict(arguments)

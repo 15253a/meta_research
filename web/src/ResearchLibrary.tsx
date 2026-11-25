@@ -58,10 +58,7 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
   const [inputError, setInputError] = useState<string | null>(null);
   const history = offsets[entry] ?? [0];
   const offset = history[history.length - 1];
-  const pageNext = page?.next_offset ?? page?.items.reduce<number | null>((next, item) => {
-    const candidates = [item.next_run_offset, item.next_evaluation_offset].filter((value): value is number => typeof value === "number");
-    return candidates.length ? Math.min(next ?? Infinity, ...candidates) : next;
-  }, null) ?? null;
+  const pageNext = page?.next_offset ?? null;
   const query = queries[entry] ?? "";
   const scope = scopes[entry] ?? [];
   const filters = scope[scope.length - 1]?.filters;
@@ -133,10 +130,10 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
       const part = text(value.text) || text(value.content);
       setBody(prior => next === 0 ? part : prior + part);
       setBodyNext(value.complete === true ? null : value.next_offset ?? null);
-      setBodyMeta(prior => value.kind === "directory" && next > 0
-        ? { ...value, entries: [...(Array.isArray(prior?.entries) ? prior.entries : []), ...(Array.isArray(value.entries) ? value.entries : [])] }
+      setBodyMeta(prior => (value.kind === "directory" || value.kind === "selections") && next > 0
+        ? { ...value, items: [...(Array.isArray(prior?.items) ? prior.items : []), ...(Array.isArray(value.items) ? value.items : [])], entries: [...(Array.isArray(prior?.entries) ? prior.entries : []), ...(Array.isArray(value.entries) ? value.entries : [])] }
         : value);
-      if (!part && value.kind !== "directory" && value.complete !== true) setBodyError(text(value.status) || "content_unavailable");
+      if (!part && value.kind !== "directory" && value.kind !== "selections" && value.complete !== true) setBodyError(text(value.status) || "content_unavailable");
     } catch (caught) {
       if (!controller.signal.aborted) setBodyError(String(caught instanceof Error ? caught.message : caught));
     } finally { if (!controller.signal.aborted) setBodyBusy(false); }
@@ -181,6 +178,7 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
         <div className="library-results" aria-busy={busy}>
           {busy ? <p role="status">{t("正在查找材料…", "Finding material…")}</p> : null}
           {error ? <div role="alert"><p>{t("暂时无法读取此入口。请重新查找。", "This entry could not be loaded. Please restart the search.")}</p><button onClick={() => { setOffsets(value => ({ ...value, [entry]: [0] })); setRevision(value => value + 1); }}>{t("重新查找", "Restart search")}</button><details><summary>{t("技术详情", "Technical details")}</summary><code>{error}</code></details></div> : null}
+          {entry === "questions" && page?.creation_basis_reader?.source_ref ? <p><button type="button" onClick={() => void read(page.creation_basis_reader!, t("问题创建依据", "Question creation basis"))}>{t("阅读问题创建依据", "Read question creation basis")}</button></p> : null}
           {page && page.items.length === 0 ? <p>{page.result_state === "page_pending" ? t("还有记录尚未查完，请继续翻页。", "More records remain to be checked. Continue to the next page.") : page.result_state === "no_records" ? t("此入口尚无已保存记录。", "No saved records in this entry yet.") : page.result_state === "exhausted" ? t("已读完此范围的记录。", "All records in this scope have been read.") : t("没有找到匹配材料。试试其他线索或入口。", "No matching material. Try another clue or entry.")}</p> : null}
           {page?.items.map((item, index) => {
             const isEnvironmentReference = entry === "environments" && Boolean(item.environment_reference_ref);
@@ -190,6 +188,8 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
             return <article className="library-card" key={text(item.ref) || text(item.question_ref) || text(item.record_ref) || String(index)}>
               <h4>{name}</h4>
               {entry === "human" && (text(item.input_ref) || (text(item.ref).startsWith("research_input:") ? text(item.ref) : "")) ? <ResearchInputMaterialReferences inputRef={text(item.input_ref) || text(item.ref)} questRef={questRef} refreshRevision={refreshRevision} /> : null}
+              {entry === "questions" && item.stage ? <p className="library-muted">{humanLabel(text(item.stage), language)} · {humanLabel(text(item.disposition), language)}</p> : null}
+              {entry === "questions" && item.relation_kind ? <p className="library-muted">{humanLabel(text(item.relation_kind), language)} · {text(item.left_question_ref)} → {text(item.right_question_ref)}</p> : null}
               {text(item.summary) ? <p>{text(item.summary)}</p> : null}
               {item.treatment_ref ? <p>{t("处理结果：", "Treatment: ")}{humanLabel(text(item.disposition), language)} · {humanLabel(text(item.goal_impact), language)}</p> : null}
               {entry === "human" && item.request_ref && typeof item.response_count === "number" ? (
@@ -208,12 +208,16 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
               </> : null}
               {entry === "datasets" && item.dataset_ref && !item.dataset_version_ref ? <button onClick={() => expand(name, { dataset_ref: text(item.dataset_ref) })}>{t("查看数据版本", "View data versions")}</button> : null}
               {entry === "baselines" && item.baseline_ref && !item.variant_ref ? <button onClick={() => expand(name, { baseline_ref: text(item.baseline_ref) })}>{t("查看方法变体", "View method variants")}</button> : null}
-              {entry === "baselines" && item.variant_ref && !Array.isArray(item.runs) ? <button onClick={() => expand(name, { baseline_ref: text(item.baseline_ref), variant_ref: text(item.variant_ref) })}>{t("查看实施与评价", "View runs and evaluations")}</button> : null}
+              {entry === "baselines" && item.variant_ref && item.baseline_ref && !item.variant_run_ref && !item.evaluation_ref && !Array.isArray(item.runs) ? <button onClick={() => expand(name, { baseline_ref: text(item.baseline_ref), variant_ref: text(item.variant_ref) })}>{t("查看实施与评价", "View runs and evaluations")}</button> : null}
+              {entry === "baselines" && item.variant_run_ref && !Array.isArray(item.runs) ? <button type="button" onClick={() => expand(itemName(item, t("实施产物", "Run artifacts")), { formal_ref: text(item.variant_run_ref) })}>{t("查看实施产物", "View run artifacts")}</button> : null}
               {reader?.source_ref ? <button type="button" onClick={() => void read(reader, name)}>{entry === "environments" ? t("阅读说明或材料", "Read documentation or material") : t("阅读原文", "Read original")}</button> : isEnvironmentReference ? null : <p className="library-muted">{entry === "environments" ? t("这是资源信息，未关联数字材料。可根据位置、来源与使用条件采用。", "This is resource information without attached digital material. Refer to its location, source, and conditions for use.") : t("展开详情查看版本与关联。", "Expand details for versions and relationships.")}</p>}
               {item.history_reader?.question_ref ? <button onClick={() => expand(name, { question_ref: item.history_reader!.question_ref! })}>{t("阅读研究历史", "Read research history")}</button> : null}
-              {Array.isArray(item.readers) && item.readers.length > 1 ? <details><summary>{entry === "environments" ? t("此环境关联的所有材料", "All material for this environment") : t("此版本的所有材料", "All material in this version")}</summary>{(item.readers as ResearchContentReader[]).map((value, idx) => <button key={idx} onClick={() => void read(value, name)}>{t("读取材料", "Read material")} {idx + 1}</button>)}</details> : null}
-              {Array.isArray(item.runs) ? <section className="library-runs"><h5>{t("实际实施", "Runs")}</h5>{(item.runs as ResearchLibraryItem[]).map((run, idx) => <div key={idx}><b>{itemName(run, t("实施", "Run") + " " + (idx + 1))}</b>{text(run.summary) ? <p>{text(run.summary)}</p> : null}{run.reader?.source_ref ? <button onClick={() => void read(run.reader!, name)}>{t("阅读实施记录", "Read run")}</button> : run.reader?.ref ? <button onClick={() => expand(itemName(run, t("实施产物", "Run artifacts")), { formal_ref: run.reader!.ref! })}>{t("查看实施产物", "View run artifacts")}</button> : null}<details><summary>{t("实施与产物详情", "Run and artifact details")}</summary><pre>{JSON.stringify(run, null, 2)}</pre></details></div>)}</section> : null}
-              {judgments.length ? <details><summary>{t("不同问题的阅读判断", "Readings for different questions")} ({judgments.length})</summary>{judgments.map((judgment, idx) => <div key={idx}><p>{text(judgment.summary)}</p>{judgment.reader ? <button onClick={() => void read(judgment.reader!, name)}>{t("阅读完整判断", "Read full judgment")}</button> : null}</div>)}</details> : null}
+              {entry === "questions" && item.question_ref && !item.stage && !item.relation_kind ? <button type="button" onClick={() => expand(name, { question_ref: text(item.question_ref), view: "relations" })}>{typeof item.relation_count === "number" && item.relation_count > 0 ? `${t("查看问题关系", "View question relations")} (${item.relation_count})` : t("查看问题关系", "View question relations")}</button> : null}
+              {item.creation_basis_reader?.source_ref ? <button type="button" onClick={() => void read(item.creation_basis_reader!, `${name} · ${t("创建依据", "Creation basis")}`)}>{t("阅读创建依据", "Read creation basis")}</button> : null}
+              {Array.isArray(item.readers) && item.readers.length > 1 ? <details><summary>{entry === "environments" ? t("此环境关联的所有材料", "All material for this environment") : t("此版本的所有材料", "All material in this version")}</summary>{(item.readers as ResearchContentReader[]).map((value, idx) => <button key={idx} type="button" onClick={() => void read(value, value.selection_path ? `${name} · ${value.selection_path}` : name)}>{t("读取材料", "Read material")} {idx + 1}{value.selection_path ? ` (${value.selection_path})` : ""}</button>)}</details> : null}
+              {Array.isArray(item.runs) ? <section className="library-runs"><h5>{t("实际实施", "Runs")}</h5>{(item.runs as ResearchLibraryItem[]).map((run, idx) => <div key={idx}><b>{itemName(run, t("实施", "Run") + " " + (idx + 1))}</b>{text(run.summary) ? <p>{text(run.summary)}</p> : null}{run.reader?.source_ref ? <button onClick={() => void read(run.reader!, name)}>{t("阅读实施记录", "Read run")}</button> : run.reader?.ref ? <button onClick={() => expand(itemName(run, t("实施产物", "Run artifacts")), { formal_ref: run.reader!.ref! })}>{t("查看实施产物", "View run artifacts")}</button> : null}<details><summary>{t("实施与产物详情", "Run and artifact details")}</summary><pre>{JSON.stringify(run, null, 2)}</pre></details></div>)}{item.runs_next_offset != null ? <button type="button" onClick={() => expand(name, { baseline_ref: text(item.baseline_ref), variant_ref: text(item.variant_ref), relation: "runs" })}>{t("查看全部实施", "View all runs")}</button> : null}</section> : null}
+              {Array.isArray(item.evaluations) && item.evaluations.length > 0 ? <section className="library-runs"><h5>{t("研究评估", "Evaluations")}</h5>{(item.evaluations as ResearchLibraryItem[]).map((evaluation, idx) => <div key={idx}><b>{itemName(evaluation, t("评估", "Evaluation") + " " + (idx + 1))}</b>{text(evaluation.summary) ? <p>{text(evaluation.summary)}</p> : null}<details><summary>{t("评估详情", "Evaluation details")}</summary><pre>{JSON.stringify(evaluation, null, 2)}</pre></details></div>)}{item.evaluations_next_offset != null ? <button type="button" onClick={() => expand(name, { baseline_ref: text(item.baseline_ref), variant_ref: text(item.variant_ref), relation: "evaluations" })}>{t("查看全部评价", "View all evaluations")}</button> : null}</section> : null}
+              {judgments.length ? <details><summary>{t("不同问题的阅读判断", "Readings for different questions")} ({judgments.length})</summary>{judgments.map((judgment, idx) => <div key={idx}><p>{text(judgment.summary) || text(judgment.purpose)}</p>{judgment.reader?.source_ref && judgment.reader?.version_ref ? <button type="button" onClick={() => void read(judgment.reader!, name)}>{t("阅读完整判断", "Read full judgment")}</button> : null}{Array.isArray(judgment.readers) ? (judgment.readers as ResearchContentReader[]).map((noteReader, nIdx) => noteReader.source_ref && noteReader.version_ref ? <button key={nIdx} type="button" onClick={() => void read(noteReader, `${name} · ${t("阅读笔记", "Reading note")}`)}>{t("阅读笔记材料", "Read note material")}{judgment.readers && (judgment.readers as ResearchContentReader[]).length > 1 ? ` ${nIdx + 1}` : ""}</button> : null) : null}</div>)}</details> : null}
               <details><summary>{isEnvironmentReference ? t("用途与研究关联详情", "Use and research relationship details") : entry === "environments" ? t("资源与关联详情", "Resource and relationship details") : t("版本与关联详情", "Version and relationship details")}</summary><pre>{JSON.stringify(item, null, 2)}</pre></details>
             </article>;
           })}
@@ -230,8 +234,12 @@ export function ResearchLibrary({ questRef, questionRef, refreshRevision = 0 }: 
           <h4>{selected?.name ?? t("精确原文", "Exact original")}</h4>
           {!selected ? <p className="library-muted">{t("选择一份材料，阅读保留的原始内容。", "Choose material to read its preserved content.")}</p> : <>
             {bodyMeta?.kind === "directory" ? <div><p>{t("这是一个资料目录，选择文件读取原文。", "This material is a directory. Choose a file to read.")}</p>{(Array.isArray(bodyMeta.entries) ? bodyMeta.entries as { path: string; size?: number }[] : []).map(value => <p key={value.path}><button onClick={() => void read({ ...selected.reader, entry_path: value.path }, value.path)}>{value.path}</button></p>)}</div> : null}
+            {bodyMeta?.kind === "selections" ? <div><p>{t("此版本包含多个材料范围，选择一个范围读取原文。", "This version contains multiple selected scopes. Choose one to read.")}</p>{(Array.isArray(bodyMeta.items) ? bodyMeta.items as { selection_ref?: string; selection?: { path?: string | null }; reader?: ResearchContentReader }[] : []).map((entry, idx) => {
+              const scopeLabel = entry.selection?.path || t("整个资产", "Entire asset");
+              return entry.reader?.source_ref ? <p key={entry.selection_ref || `${scopeLabel}-${idx}`}><button type="button" onClick={() => void read(entry.reader!, `${selected.name} · ${scopeLabel}`)}>{scopeLabel}</button></p> : null;
+            })}</div> : null}
             {bodyMeta?.encoding === "base64" ? <p>{t("这是二进制材料，可下载精确版本查看。", "This is binary material. Download the exact version to inspect it.")}<br /><a href={`/api/v1/research-assets/${encodeURIComponent(selected.reader.version_ref ?? "")}/content`}>{t("下载原件", "Download original")}</a></p> : body ? <ReadableOriginal body={body} language={language} onTreatments={(constraintRef, versionRef) => expand(selected.name, { constraint_ref: constraintRef, version_ref: versionRef })} /> : null}
-            {!body && bodyMeta?.complete === true && bodyMeta?.kind !== "directory" ? <p>{t("此原文为空。", "This original is empty.")}</p> : null}
+            {!body && bodyMeta?.complete === true && bodyMeta?.kind !== "directory" && bodyMeta?.kind !== "selections" ? <p>{t("此原文为空。", "This original is empty.")}</p> : null}
             {bodyBusy ? <p role="status">{t("正在读取…", "Reading…")}</p> : null}
             {bodyError ? <div role="alert"><p>{bodyError === "content_drifted" ? t("读取期间记录已变化。请从头重读，避免混合不同版本。", "This record changed while reading. Restart to avoid mixing versions.") : t("原文暂时不可读。已读内容保留，可重试。", "The original is temporarily unavailable. Previously read content is retained.")}</p><button onClick={() => void read(selected.reader, selected.name, bodyNext ?? 0)}>{t("重试读取", "Retry reading")}</button><details><summary>{t("技术详情", "Technical details")}</summary><code>{bodyError}</code></details></div> : null}
             {bodyNext != null ? <button disabled={bodyBusy} onClick={() => void read(selected.reader, selected.name, bodyNext)}>{t("继续读取", "Read more")}</button> : null}
@@ -256,6 +264,11 @@ function humanLabel(value: string, language: "zh" | "en"): string {
     idea: ["研究构想", "Research ideas"], plan: ["研究计划", "Research planning"],
     bundle: ["研究组织", "Research coordination"], reasoning: ["研究综合", "Research synthesis"],
     companion: ["研究助手", "Research assistant"],
+    completed: ["已完成", "Completed"], skipped: ["已跳过", "Skipped"],
+    requested: ["已请求（进行中）", "Requested (in progress)"],
+    related: ["相关", "Related"], overlaps: ["重叠", "Overlaps"], competes: ["竞争", "Competes"],
+    depends_on: ["前置依赖", "Depends on"], subquestion_of: ["子问题", "Subquestion of"],
+    refines: ["细化", "Refines"], supersedes: ["替代", "Supersedes"],
   };
   return labels[value]?.[language === "zh" ? 0 : 1] ?? value;
 }
@@ -275,6 +288,9 @@ function ReadableOriginal({ body, language, onTreatments }: { body: string; lang
     : isTreatment && ["understanding", "reasons", "changes", "continuing_work", "goal_impact"].some(key => !text(record[key]));
   const fields: [string, string, string][] = [
     ["title","标题","Title"],["name","名称","Name"],["text","原文","Original"],["summary","摘要","Summary"],
+    ["purpose","研究用途","Purpose"],["reading_summary","阅读摘要","Reading summary"],
+    ["source","来源","Source"],["fulltext_status","全文状态","Full-text status"],
+    ["record_ref","文献标识","Record ref"],["notes","备注","Notes"],
     ["note","说明","Note"],["body","正文","Body"],["markdown","正文","Body"],
     ["unknown_statement","研究问题","Research question"],["answer_shape","预期回答","Expected answer"],
     ["applicability_scope","适用范围","Scope"],["background_context","背景","Background"],

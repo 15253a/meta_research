@@ -19,7 +19,7 @@ def test_literature_owner_details_survive_and_original_channel_can_continue(tmp_
             root_kind='idea', phase='primary'))
 
         def call(operation, **arguments):
-            return _call(runtime, channel, 'research_memory.literature.' + operation, **arguments)
+            return _call(runtime, channel, 'research_graph.literature.' + operation, **arguments)
         registered = call('register', effect_id='paper', record_ref='doi:10.1000/diagnostic',
                           title='Available abstract', source='Publisher abstract', fulltext_status='missing')
         assert not registered['isError'], registered

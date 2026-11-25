@@ -2110,7 +2110,11 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
                 "SELECT * FROM owner_human_requests WHERE quest_ref = :quest_ref"
                 " AND (:query='' OR instr(lower(obligation),lower(:query))>0 "
                 "OR instr(lower(business_purpose),lower(:query))>0 "
-                "OR instr(lower(target_assertion_json),lower(:query))>0)"
+                "OR instr(lower(target_assertion_json),lower(:query))>0 "
+                "OR EXISTS (SELECT 1 FROM hc_human_request_responses resp "
+                "WHERE resp.request_ref = owner_human_requests.request_ref "
+                "AND (instr(lower(resp.note),lower(:query))>0 "
+                "OR instr(lower(resp.facts_json),lower(:query))>0)))"
                 + clause + " ORDER BY created_at DESC, request_ref DESC LIMIT :limit"
             ), parameters).all()
             items = []

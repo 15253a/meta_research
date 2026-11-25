@@ -30,13 +30,19 @@ def _primary_paths(name: str, owner: str) -> tuple[tuple[str, str], ...]:
         return (("WF", "Research time and work planning"), ("HC", "Research time extensions"))
     if name.startswith(("human_request.", "human_guidance.", "human_collaboration.")):
         paths = [("HC", "Requests and replies" if name.startswith("human_request.") else "Guidance and feedback")]
-        if name == "human_request.read":
+        if name in {
+            "human_request.read",
+            "human_request.responses.page",
+            "human_collaboration.inputs.page",
+            "human_collaboration.guidance.page",
+            "human_collaboration.guidance.treatments.page",
+        }:
             paths.append(("RG", "Human Interact"))
         return tuple(paths)
     for prefix, topic in (("research_graph.datasets.", "Dataset"),
                           ("research_graph.environments.", "Environment"),
                           ("research_graph.baselines.", "Baseline"),
-                          ("research_memory.literature.", "Literature")):
+                          ("research_graph.literature.", "Literature")):
         if name.startswith(prefix):
             return (("RG", topic),)
     if name.startswith("research_graph."):

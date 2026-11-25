@@ -1,6 +1,7 @@
-"""Related Question facts owned by RG, with the existing Reasoning run as source."""
+"""Related Question facts owned by RG, recorded by Idea, Plan, Bundle, or Reasoning runs."""
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import asdict
 from sqlalchemy import text
@@ -18,38 +19,77 @@ QUESTION_RELATION_OPERATION_IDS = (
 
 QUESTION_HISTORY_OPERATION_ID = "research_graph.question_history.read"
 
+QUESTION_RELATION_WRITER_ROOT_KINDS = ("idea", "plan", "bundle", "reasoning")
+SYMMETRIC_QUESTION_RELATION_KINDS = frozenset({"related", "overlaps", "competes"})
+DIRECTED_QUESTION_RELATION_KINDS = frozenset({"depends_on", "subquestion_of", "refines", "supersedes"})
+QUESTION_RELATION_KINDS = (
+    "related",
+    "overlaps",
+    "competes",
+    "depends_on",
+    "subquestion_of",
+    "refines",
+    "supersedes",
+)
+
+
+def _relation_hash_payload(payload: dict[str, object], kind: str) -> dict[str, object]:
+    base = {
+        key: payload[key]
+        for key in (
+            "quest_ref",
+            "source_run_ref",
+            "source_request_ref",
+            "effect_id",
+            "left_question_ref",
+            "right_question_ref",
+            "notes",
+        )
+    }
+    if kind != "related":
+        base["kind"] = kind
+    return base
+
 
 class QuestionRelationOwnerMixin:
     def record_question_relation(self, *, quest_ref, source_run_ref, effect_id,
-                                 left_question_ref, right_question_ref, notes):
+                                 left_question_ref, right_question_ref, notes,
+                                 kind="related", source_stage=None):
         if (not isinstance(effect_id, str) or not 1 <= len(effect_id) <= 128
             or not isinstance(notes, str) or not notes.strip() or len(notes) > 8000
             or not isinstance(left_question_ref, str) or not isinstance(right_question_ref, str)):
             raise OwnerConflict("question_relation_invalid")
+        if not isinstance(kind, str) or kind not in QUESTION_RELATION_KINDS:
+            raise OwnerConflict("question_relation_invalid", {
+                "fields": ["kind"],
+                "message": f"Relation kind must be one of {', '.join(QUESTION_RELATION_KINDS)}.",
+                "correction": "Choose a supported relation kind (default 'related').",
+            })
         if left_question_ref == right_question_ref:
             raise OwnerConflict("question_relation_invalid", {
                 "fields": ["left_question_ref", "right_question_ref"],
                 "message": "The two Question references must be different.",
                 "correction": "Select two existing Questions; do not invent one for this relation.",
             })
-        left_question_ref, right_question_ref = sorted((left_question_ref, right_question_ref))
+        if kind in SYMMETRIC_QUESTION_RELATION_KINDS:
+            left_question_ref, right_question_ref = sorted((left_question_ref, right_question_ref))
         payload = {"quest_ref": quest_ref, "source_run_ref": source_run_ref,
                    "effect_id": effect_id, "left_question_ref": left_question_ref,
                    "right_question_ref": right_question_ref, "notes": notes}
         with self._database.fenced_write() as connection:
             source = connection.execute(text(
-                "SELECT r.request_ref FROM ar_stage_runs r JOIN ae_stage_run_requests q "
+                "SELECT r.request_ref, r.stage FROM ar_stage_runs r JOIN ae_stage_run_requests q "
                 "ON q.request_ref=r.request_ref WHERE r.run_ref=:source_run_ref "
-                "AND r.stage='reasoning' AND q.quest_ref=:quest_ref"
+                "AND r.stage IN ('idea', 'plan', 'bundle', 'reasoning') AND q.quest_ref=:quest_ref"
             ), payload).first()
-            if source is None:
+            if source is None or (source_stage is not None and source.stage != source_stage):
                 raise OwnerConflict("question_relation_source_invalid")
             payload["source_request_ref"] = source.request_ref
-            digest = canonical_hash(payload)
+            digest = canonical_hash(_relation_hash_payload(payload, kind))
             previous = connection.execute(text("SELECT * FROM rg_question_relations WHERE source_run_ref=:source_run_ref AND effect_id=:effect_id"), payload).first()
             if previous is not None:
                 result = _relation(previous)
-                if result["content_hash"] != digest:
+                if result["content_hash"] != digest or result["kind"] != kind:
                     raise OwnerConflict("question_relation_identity_conflict")
                 return result
             for question_ref in (left_question_ref, right_question_ref):
@@ -61,12 +101,13 @@ class QuestionRelationOwnerMixin:
                       "created_at": time.time()}
             connection.execute(text(
                 "INSERT INTO rg_question_relations (relation_ref,quest_ref,left_question_ref,right_question_ref,"
-                "source_run_ref,source_request_ref,effect_id,notes,content_hash,created_at) VALUES "
+                "source_run_ref,source_request_ref,effect_id,notes,relation_kind,content_hash,created_at) VALUES "
                 "(:relation_ref,:quest_ref,:left_question_ref,:right_question_ref,:source_run_ref,"
-                ":source_request_ref,:effect_id,:notes,:content_hash,:created_at)"), values)
+                ":source_request_ref,:effect_id,:notes,:relation_kind,:content_hash,:created_at)"),
+                {**values, "relation_kind": kind})
             self._feed.record(connection, "research_graph.question_relation_recorded",
                               {key: values[key] for key in ("relation_ref", "quest_ref", "left_question_ref", "right_question_ref", "source_run_ref")})
-        return {**values, "kind": "related"}
+        return {**values, "kind": kind}
 
     def query_question_relations(self, *, quest_ref, question_ref=None, offset=0,
                                  source_run_ref=None, effect_id=None, query_revision=None):
@@ -100,11 +141,13 @@ class QuestionRelationOwnerMixin:
 
 def _relation(row):
     value = dict(row._mapping)
-    payload = {key: value[key] for key in ("quest_ref", "source_run_ref", "source_request_ref", "effect_id",
-                                          "left_question_ref", "right_question_ref", "notes")}
+    kind = value.pop("relation_kind", "related")
+    if not isinstance(kind, str) or kind not in QUESTION_RELATION_KINDS:
+        raise OwnerConflict("question_relation_content_invalid")
+    payload = _relation_hash_payload(value, kind)
     if canonical_hash(payload) != value["content_hash"]:
         raise OwnerConflict("question_relation_content_invalid")
-    return {**value, "kind": "related"}
+    return {**value, "kind": kind}
 
 
 def _question(owner, question_ref):
@@ -118,12 +161,10 @@ def _question(owner, question_ref):
         raise
 
 
-def _read_scope(agent_runtime, context, *, expected_root_kind=None):
-    """Verify a bound Root's scope; reads admit any root, effects pass their own kind."""
-    if expected_root_kind is not None:
-        if context.root_kind != expected_root_kind:
-            raise OwnerConflict("question_relation_scope_invalid")
-    elif context.root_kind not in ROOT_AGENT_KINDS:
+def _read_scope(agent_runtime, context, *, allowed_root_kinds=None):
+    """Verify a bound Root's scope; reads admit any root, effects pass stage roots."""
+    allowed = ROOT_AGENT_KINDS if allowed_root_kinds is None else allowed_root_kinds
+    if context.root_kind not in allowed:
         raise OwnerConflict("question_relation_scope_invalid")
     scope = agent_runtime.verify_root_agent_runtime_scope(
         root_kind=context.root_kind, run_ref=context.run_ref,
@@ -135,7 +176,39 @@ def _read_scope(agent_runtime, context, *, expected_root_kind=None):
     return quest_ref
 
 
-def question_history_operations(*, research_graph, agent_runtime, human_collaboration=None):
+def question_creation_basis_descriptor(research_graph, research_memory, *, quest_ref, question_ref, source_quest_ref=None):
+    basis_ref_info = None
+    creation_bases = getattr(research_memory, "creation_bases", None) if research_memory is not None else None
+    if creation_bases is not None:
+        basis = creation_bases.for_question(question_ref, quest_ref)
+        if basis is not None:
+            basis_ref_info = creation_bases.reference(basis)
+    else:
+        with research_graph._database.read() as connection:
+            row = connection.execute(text(
+                "SELECT binding_json FROM rm_question_creation_bases WHERE question_ref=:question AND quest_ref=:quest"
+            ), {"question": question_ref, "quest": quest_ref}).first()
+        if row is not None:
+            basis_ref_info = json.loads(row.binding_json).get("basis")
+    if basis_ref_info is None:
+        return None
+    reader = {
+        "operation": "research_memory.creation_basis.read",
+        "basis_ref": basis_ref_info["basis_ref"],
+        "expected_basis_hash": basis_ref_info["basis_hash"],
+        "view": "understanding",
+    }
+    if source_quest_ref is not None:
+        reader["source_quest_ref"] = source_quest_ref
+    return {
+        "basis_ref": basis_ref_info["basis_ref"],
+        "basis_hash": basis_ref_info["basis_hash"],
+        "kind": basis_ref_info["kind"],
+        "reader": reader,
+    }
+
+
+def question_history_operations(*, research_graph, agent_runtime, human_collaboration=None, research_memory=None):
     def read(context, arguments):
         try:
             quest_ref = _reading_quest(agent_runtime, context, source_quest_ref=arguments.get("source_quest_ref"),
@@ -157,13 +230,20 @@ def question_history_operations(*, research_graph, agent_runtime, human_collabor
                         for key in ("reader", "basis_reader"):
                             if key in stage:
                                 stage[key] = {**stage[key], "source_quest_ref": quest_ref}
-            return {"status": "accepted", "question": asdict(question), **history}
+            creation_basis = question_creation_basis_descriptor(
+                research_graph,
+                research_memory,
+                quest_ref=question.quest_ref,
+                question_ref=question.question_ref,
+                source_quest_ref=quest_ref if arguments.get("source_quest_ref") is not None else None,
+            )
+            return {"status": "accepted", "question": asdict(question), "creation_basis": creation_basis, **history}
         except OwnerConflict as error:
             raise SemanticMcpError(error.code, error.details) from error
 
     return SemanticOperation(
         semantic_operation_id=QUESTION_HISTORY_OPERATION_ID, owning_module="research_graph",
-        description="Companion may select another HC-authorized source_quest_ref and carry it when following returned readers. Read one accepted Question of this Quest (including a question set aside) and a bounded page of historical Cycles. Each Cycle lists stage dispositions and exact readers. Pass query_revision with next_offset; changed scope or Owner facts require restarting at offset 0. Bundle readers resolve the stored AE closure/report, independent of current Sessions.",
+        description="Companion may select another HC-authorized source_quest_ref and carry it when following returned readers. Read one accepted Question of this Quest (including a question set aside), its attached creation_basis reader when present, and a bounded page of historical Cycles. Each Cycle lists stage dispositions and exact readers. Pass query_revision with next_offset; changed scope or Owner facts require restarting at offset 0. Bundle readers resolve the stored AE closure/report, independent of current Sessions.",
         input_schema={"type": "object", "properties": {
             "source_quest_ref": {"type": "string", "minLength": 1, "maxLength": 256},
             "question_ref": {"type": "string", "minLength": 1, "maxLength": 96},
@@ -181,10 +261,10 @@ def question_relation_operations(*, research_graph, agent_runtime, human_collabo
             arguments = dict(arguments)
             quest_ref = (_reading_quest(agent_runtime, context, source_quest_ref=arguments.pop("source_quest_ref", None),
                 human_collaboration=human_collaboration) if action == "read" else
-                _read_scope(agent_runtime, context, expected_root_kind="reasoning"))
+                _read_scope(agent_runtime, context, allowed_root_kinds=QUESTION_RELATION_WRITER_ROOT_KINDS))
             if action == "record":
                 return research_graph.record_question_relation(quest_ref=quest_ref,
-                    source_run_ref=context.run_ref, **arguments)
+                    source_run_ref=context.run_ref, source_stage=context.root_kind, **arguments)
             if action == "reconcile":
                 result = research_graph.query_question_relations(quest_ref=quest_ref,
                     source_run_ref=context.run_ref, effect_id=arguments["effect_id"])
@@ -199,14 +279,15 @@ def question_relation_operations(*, research_graph, agent_runtime, human_collabo
         {"type": "object", "properties": {"source_quest_ref": ref, "question_ref": ref, "offset": {"type": "integer", "minimum": 0},
          "query_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "additionalProperties": False},
         {"type": "object", "properties": {"effect_id": effect, "left_question_ref": ref,
-         "right_question_ref": ref, "notes": {"type": "string", "minLength": 1, "maxLength": 8000}},
+         "right_question_ref": ref, "kind": {"type": "string", "enum": list(QUESTION_RELATION_KINDS)},
+         "notes": {"type": "string", "minLength": 1, "maxLength": 8000}},
          "required": ["effect_id", "left_question_ref", "right_question_ref", "notes"], "additionalProperties": False},
         {"type": "object", "properties": {"effect_id": effect}, "required": ["effect_id"], "additionalProperties": False},
     )
     descriptions = (
         "Companion may select another HC-authorized source_quest_ref. Read a page of related accepted Questions in this Quest, optionally focused on one Question. Continue with next_offset and query_revision; restart if the query or scoped Owner facts changed.",
-        "Record a related/overlapping Question pair and a concise explanation, using exact accepted refs. The current Reasoning run supplies provenance; effect_id has stable retry identity.",
-        "Reconcile a Question relation effect recorded by this same Reasoning run, including after a technical retry.",
+        "Record a typed Question relation (related, overlaps, competes, depends_on, subquestion_of, refines, supersedes) and concise explanation, using exact accepted refs. For directed kinds, left_question_ref relates to right_question_ref in order. An Idea, Plan, Bundle, or Reasoning stage run supplies provenance; effect_id has stable retry identity.",
+        "Reconcile a Question relation effect recorded by this same stage run, including after a technical retry.",
     )
     return tuple(SemanticOperation(semantic_operation_id=operation, owning_module="research_graph",
         description=description, input_schema=schema, output_schema={"type": "object"},

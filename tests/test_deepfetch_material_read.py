@@ -95,7 +95,7 @@ def test_current_initialization_reads_and_delivers_only_frozen_materials(tmp_pat
                         replace(context, capability_binding_hash="f" * 64)):
                     with pytest.raises(HarnessAdmissionError, match="root_agent_human_request_scope_stale"):
                         _channel(runtime, bad)
-                denied = _call(runtime, channel, "research_memory.literature.page")
+                denied = _call(runtime, channel, "research_graph.literature.page")
                 assert denied["structuredContent"]["code"] == "content_quest_scope_required"
             else:
                 # Existing sessions may already have the original exact input
