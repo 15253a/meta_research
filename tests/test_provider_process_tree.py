@@ -242,7 +242,12 @@ raise SystemExit(provider_supervisor.main([sys.argv[1]]))
     }, key)
     (operation / "heartbeat-test-go").write_text("go")
     stdout, stderr = process.communicate(timeout=5)
-    assert (process.returncode, stdout, stderr) == (70, b"", b"")
+    assert (process.returncode, stdout) == (70, b"")
+    err_payload = json.loads(stderr.decode("utf-8"))
+    assert err_payload["schema_ref"] == "meta-research/provider-supervisor-error/v1"
+    assert err_payload["exit_code"] == 70
+    assert err_payload["error_code"]
+    assert str(tmp_path) not in stderr.decode("utf-8")
     assert not (operation / "supervisor-exit.json").exists()
     assert not (operation / "native-launches").exists()
     assert not supervisor_request_never_started(
@@ -289,7 +294,12 @@ raise SystemExit(main([sys.argv[1]]))
         request_schema=SUPERVISOR_REQUEST_SCHEMA_V2,
     )
     stdout, stderr = process.communicate(timeout=5)
-    assert (process.returncode, stdout, stderr) == (70, b"", b"")
+    assert (process.returncode, stdout) == (70, b"")
+    err_payload = json.loads(stderr.decode("utf-8"))
+    assert err_payload["schema_ref"] == "meta-research/provider-supervisor-error/v1"
+    assert err_payload["exit_code"] == 70
+    assert err_payload["error_code"]
+    assert str(tmp_path) not in stderr.decode("utf-8")
     assert not (operation / "native-launches").exists()
 
 

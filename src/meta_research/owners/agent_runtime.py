@@ -815,6 +815,7 @@ class IdeaStageRun:
     predecessor_autonomous_checkpoint: ReasoningAutonomousCheckpoint | None = None
     checkpoint_rejection_receipt: AcceptanceReceipt | None = None
     replayable_primary_attempts: tuple[tuple[str, str, int], ...] = ()
+    replayable_continuation_attempts: tuple[tuple[str, str, int], ...] = ()
 
     @property
     def attempt_execution_receipt(self) -> AcceptanceReceipt | None:
@@ -1907,6 +1908,13 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
     def query_bundle_inbox_checkpoint(
         self, run_ref: str
     ) -> BundleInboxCheckpoint | None: ...
+
+    def query_bundle_inbox_checkpoints_for_attempts(
+        self,
+        *,
+        run_ref: str,
+        attempts: tuple[tuple[str, str, int], ...],
+    ) -> tuple[dict[str, object], ...]: ...
 
     def query_bundle_inbox_operation_checkpoint(
         self,
@@ -5848,6 +5856,50 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 attempt_ref=checkpoint.attempt_ref,
                 fence_ref=checkpoint.fence_ref,
             )
+
+    def query_bundle_inbox_checkpoints_for_attempts(
+        self,
+        *,
+        run_ref: str,
+        attempts: tuple[tuple[str, str, int], ...],
+    ) -> tuple[dict[str, object], ...]:
+        if not attempts:
+            return ()
+        clauses: list[str] = []
+        params: dict[str, object] = {"run_ref": run_ref}
+        seen_pairs: set[tuple[str, str]] = set()
+        for index, (attempt_ref, fence_ref, _generation) in enumerate(attempts):
+            pair = (attempt_ref, fence_ref)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            clauses.append(f"(attempt_ref = :attempt_{index} AND fence_ref = :fence_{index})")
+            params[f"attempt_{index}"] = attempt_ref
+            params[f"fence_{index}"] = fence_ref
+        if not clauses:
+            return ()
+        where_pairs = " OR ".join(clauses)
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_inbox_checkpoints WHERE "
+                    f"run_ref = :run_ref AND ({where_pairs}) "
+                    "ORDER BY checkpoint_revision DESC"
+                ),
+                params,
+            ).all()
+        checkpoints: list[dict[str, object]] = []
+        for row in rows:
+            checkpoint = _bundle_inbox_checkpoint_from_row(row)
+            projection = checkpoint.as_public_dict()
+            validate_bundle_inbox_checkpoint_projection(
+                projection,
+                run_ref=run_ref,
+                attempt_ref=checkpoint.attempt_ref,
+                fence_ref=checkpoint.fence_ref,
+            )
+            checkpoints.append(projection)
+        return tuple(checkpoints)
 
     def query_bundle_inbox_operation_checkpoint(
         self,
@@ -18801,6 +18853,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                             control,
                             now,
                             reuse_checkpoint=reuse_checkpoint,
+                            reuse_operation_refs=False,
                         )
                         connection.execute(
                             text(
@@ -19377,12 +19430,33 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                 connection, run, attempt, fence
             )
             replayable_primary_attempts = ()
-            if (expected_stage == "plan" and technical_replacement is not None
-                    and run.status == "running" and fence.status == "current"
-                    and primary_invocation.status == "prepared" and attempt.primary_draft_json is None):
-                replayable_primary_attempts = _plan_primary_replay_lineage(
-                    connection, run, attempt, primary_invocation
-                )
+            replayable_continuation_attempts = ()
+            if technical_replacement is not None:
+                if (
+                    run.status == "running"
+                    and fence.status == "current"
+                    and primary_invocation.status == "prepared"
+                    and attempt.primary_draft_json is None
+                ):
+                    replayable_primary_attempts = _primary_replay_lineage(
+                        connection, run, attempt, primary_invocation
+                    )
+                elif (
+                    primary_invocation.status == "completed"
+                    and attempt.primary_draft_hash is not None
+                    and attempt.decision_receipt_ref is None
+                    and (
+                        (run.status == "running" and fence.status == "current")
+                        or (
+                            expected_stage == "bundle"
+                            and run.status == "awaiting_acceptance"
+                            and fence.status == "submitted"
+                        )
+                    )
+                ):
+                    replayable_continuation_attempts = _continuation_replay_lineage(
+                        connection, run, attempt, primary_invocation
+                    )
             autonomous_checkpoint = (
                 _reasoning_autonomous_checkpoint_with_completion_lineage(
                     connection,
@@ -19565,6 +19639,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             predecessor_autonomous_checkpoint=predecessor_autonomous_checkpoint,
             checkpoint_rejection_receipt=checkpoint_rejection_receipt,
             replayable_primary_attempts=replayable_primary_attempts,
+            replayable_continuation_attempts=replayable_continuation_attempts,
         )
 
     def record_idea_primary_draft(
@@ -24581,8 +24656,8 @@ def _insert_provider_invocations(
         )
 
 
-def _plan_primary_replay_lineage(connection, run, attempt, invocation) -> tuple[tuple[str, str, int], ...]:
-    """Read the retired fences whose primary result the current Plan may reconcile."""
+def _primary_replay_lineage(connection, run, attempt, invocation) -> tuple[tuple[str, str, int], ...]:
+    """Read the retired fences whose primary result the current Stage may reconcile."""
     rows = connection.execute(text("""
         WITH RECURSIVE lineage(attempt_ref, fence_ref, generation) AS (
             VALUES (:current_attempt, :current_fence, :current_generation)
@@ -24610,6 +24685,41 @@ def _plan_primary_replay_lineage(connection, run, attempt, invocation) -> tuple[
         WHERE generation < :current_generation ORDER BY generation DESC
     """), {"current_attempt": attempt.attempt_ref, "current_fence": attempt.fence_ref,
            "current_generation": attempt.generation, "run": run.run_ref, "root": run.root_session_ref,
+           "operation": invocation.operation_ref, "binding": invocation.runtime_binding_hash})
+    return tuple((row.attempt_ref, row.fence_ref, row.generation) for row in rows)
+
+
+def _continuation_replay_lineage(connection, run, attempt, invocation) -> tuple[tuple[str, str, int], ...]:
+    """Read the retired fences whose post-primary rolling/continuation result the current Stage may reconcile."""
+    rows = connection.execute(text("""
+        WITH RECURSIVE lineage(attempt_ref, fence_ref, generation) AS (
+            VALUES (:current_attempt, :current_fence, :current_generation)
+            UNION ALL
+            SELECT a.attempt_ref, a.fence_ref, a.generation
+            FROM lineage AS child
+            JOIN ar_stage_attempt_replacements r
+              ON r.replacement_attempt_ref = child.attempt_ref AND r.run_ref = :run
+            JOIN ar_stage_attempts a
+              ON a.attempt_ref = r.retired_attempt_ref AND a.run_ref = r.run_ref
+            JOIN ar_execution_fences f
+              ON f.fence_ref = a.fence_ref AND f.attempt_ref = a.attempt_ref
+                 AND f.run_ref = a.run_ref AND f.generation = a.generation
+            JOIN ar_stage_provider_invocations i
+              ON i.attempt_ref = a.attempt_ref AND i.fence_ref = a.fence_ref AND i.run_ref = a.run_ref
+            WHERE r.reason_code = 'runtime_fence_replaced' AND a.generation = child.generation - 1
+              AND a.root_session_ref = :root AND f.status = 'rejected'
+              AND a.primary_draft_hash = :draft_hash AND a.decision_receipt_ref IS NULL
+              AND (a.submission_ref IS NULL OR :stage = 'bundle')
+              AND i.phase = 'primary' AND i.status = 'completed'
+              AND i.operation_ref = :operation AND i.runtime_binding_hash = :binding
+              AND NOT EXISTS (SELECT 1 FROM ar_stage_completion_rejections rejected
+                              WHERE rejected.attempt_ref = a.attempt_ref AND rejected.run_ref = a.run_ref)
+        )
+        SELECT attempt_ref, fence_ref, generation FROM lineage
+        WHERE generation < :current_generation ORDER BY generation DESC
+    """), {"current_attempt": attempt.attempt_ref, "current_fence": attempt.fence_ref,
+           "current_generation": attempt.generation, "run": run.run_ref, "root": run.root_session_ref,
+           "stage": run.stage, "draft_hash": attempt.primary_draft_hash,
            "operation": invocation.operation_ref, "binding": invocation.runtime_binding_hash})
     return tuple((row.attempt_ref, row.fence_ref, row.generation) for row in rows)
 

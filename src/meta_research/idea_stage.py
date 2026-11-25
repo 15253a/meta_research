@@ -547,6 +547,9 @@ class IdeaStageWorker:
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
             fence_ref=run.fence_ref,
+            replayable_primary_attempts=(
+                run.replayable_primary_attempts if job_ref == base_job_ref else ()
+            ),
         )
         if run.primary_draft is None:
             try:

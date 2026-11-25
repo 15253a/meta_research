@@ -261,6 +261,8 @@ class BundleSkillRequest:
     owner_feedback: tuple[str, ...] = ()
     job_ref: str | None = None
     provider_feedback: dict[str, object] | None = None
+    replayable_primary_attempts: tuple[tuple[str, str, int], ...] = ()
+    replayable_inbox_checkpoints: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -315,6 +317,8 @@ class BundleDispatchRequest:
     provider_feedback: dict[str, object] | None = None
     native_replacement_context: dict[str, object] | None = None
     quest_goal_revision: dict[str, object] | None = None
+    replayable_continuation_attempts: tuple[tuple[str, str, int], ...] = ()
+    replayable_inbox_checkpoints: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -352,6 +356,8 @@ class BundleTargetBatchRequest:
     provider_feedback: dict[str, object] | None = None
     native_replacement_context: dict[str, object] | None = None
     quest_goal_revision: dict[str, object] | None = None
+    replayable_continuation_attempts: tuple[tuple[str, str, int], ...] = ()
+    replayable_inbox_checkpoints: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1488,19 +1494,29 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             f"context_pack_ref={request.context_pack_ref}\n"
             f"inbox_checkpoint={canonical_json(request.inbox_checkpoint)}\n"
         )
-        output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
-            run_ref=request.run_ref,
-            attempt_ref=request.attempt_ref,
-            root_session_ref=request.root_session_ref,
-            fence_ref=request.fence_ref,
-            runtime_binding=request.runtime_binding,
-            operation_name="primary",
-            prompt=prompt,
-            schema=_target_plan_envelope_schema(request),
-            native_session_ref=request.native_session_ref,
-            job_ref=request.job_ref,
-            operation_input=stage_operation_input(request, "bundle"),
+        schema = _target_plan_envelope_schema(request)
+        recovered = self._recover_replaced_stage_operation(
+            request,
+            stage="bundle",
+            schema=schema,
+            replayable_inbox_checkpoints=request.replayable_inbox_checkpoints,
         )
+        if recovered is None:
+            output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
+                run_ref=request.run_ref,
+                attempt_ref=request.attempt_ref,
+                root_session_ref=request.root_session_ref,
+                fence_ref=request.fence_ref,
+                runtime_binding=request.runtime_binding,
+                operation_name="primary",
+                prompt=prompt,
+                schema=schema,
+                native_session_ref=request.native_session_ref,
+                job_ref=request.job_ref,
+                operation_input=stage_operation_input(request, "bundle"),
+            )
+        else:
+            output, session_ref, _original_invocation = recovered
         if session_ref is None or type(output) is not dict:
             raise BundleSkillUnavailable("codex_bundle_primary_invalid")
         from meta_research.bundle_output_assembly import assemble_bundle_primary
@@ -1724,7 +1740,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
 
                 # Changed rolling inputs can fail the sealed prompt comparison
                 # before invocation identity. Recovery verifies the old seal.
-                recover_rejected_dispatch(self, request, operation_name)
+                recovered_dispatch = recover_rejected_dispatch(self, request, operation_name)
+                if recovered_dispatch is not None:
+                    return recovered_dispatch
             raise
         try:
             result = _bundle_dispatch_result_from_output(output, session_ref)
@@ -1869,7 +1887,9 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             }:
                 from meta_research.bundle_dispatch_recovery import recover_rejected_target_batch
 
-                recover_rejected_target_batch(self, request, operation_name)
+                recovered_batch = recover_rejected_target_batch(self, request, operation_name)
+                if recovered_batch is not None:
+                    return recovered_batch
             raise
         strategy_update = output.get("strategy_update")
         action = output.get("action", "propose_targets")

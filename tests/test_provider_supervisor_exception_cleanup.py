@@ -97,9 +97,17 @@ raise SystemExit(module.main([sys.argv[1]]))
                 os.killpg(started["provider_process_group"], signal.SIGKILL)
             except ProcessLookupError:
                 pass
-    assert (process.returncode, stdout, stderr) == (
-        70 if cleanup_fails else 0, b"", b"",
-    )
+    import json
+
+    assert (process.returncode, stdout) == (70 if cleanup_fails else 0, b"")
+    if cleanup_fails:
+        err = json.loads(stderr.decode("utf-8"))
+        assert err["schema_ref"] == "meta-research/provider-supervisor-error/v1"
+        assert err["exit_code"] == 70
+        assert err["error_code"] == "provider_tree_proof_missing"
+        assert str(tmp_path) not in stderr.decode("utf-8")
+    else:
+        assert stderr == b""
     assert paths["started_path"].is_file()
     assert (operation / "cleanup-failed").exists() is cleanup_fails
     assert paths["stdout_path"].read_text() == "provider output preserved\n"
