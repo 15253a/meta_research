@@ -510,3 +510,157 @@ def test_windows_provider_waits_for_job_empty_before_terminal_receipt(
     assert job.terminated
     assert job.active_process_count() == 0
     assert job.closed
+
+
+def test_linux_machine_id_fallback_chain_and_32_hex_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+    import json
+    import platform as system_platform
+
+    boot_file = tmp_path / "boot_id"
+    boot_file.write_text("11111111-2222-3333-4444-555555555555\n", encoding="utf-8")
+    etc_machine = tmp_path / "etc-machine-id"
+    dbus_machine = tmp_path / "dbus-machine-id"
+    run_machine = tmp_path / "run-machine-id"
+
+    monkeypatch.setattr(provider_supervisor_module, "_current_platform", lambda: "linux")
+    monkeypatch.setattr(provider_supervisor_module, "_LINUX_BOOT_ID_PATH", boot_file)
+    monkeypatch.setattr(
+        provider_supervisor_module,
+        "_LINUX_MACHINE_ID_PATHS",
+        (etc_machine, dbus_machine, run_machine),
+    )
+
+    # 1. Empty 0-byte /etc/machine-id falls back to valid 32-hex /var/lib/dbus/machine-id.
+    etc_machine.write_bytes(b"")
+    dbus_id = "0123456789abcdef0123456789abcdef"
+    dbus_machine.write_text(dbus_id + "\n", encoding="utf-8")
+    identity = provider_supervisor_module.supervisor_host_identity()
+    expected_host_hash = hashlib.sha256(
+        json.dumps(
+            {"machine_id": dbus_id, "node": system_platform.node()},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+    ).hexdigest()
+    assert identity["host_identity_hash"] == expected_host_hash
+    assert isinstance(identity["boot_identity_hash"], str) and len(identity["boot_identity_hash"]) == 64
+
+    # 2. Invalid /etc/machine-id and missing dbus fall back to /run/machine-id
+    # while preserving the raw 32-hex casing for host_identity_hash stability.
+    etc_machine.write_text("uninitialized\n", encoding="utf-8")
+    dbus_machine.unlink()
+    run_id = "ABCDEF0123456789abcdef0123456789"
+    run_machine.write_text(run_id + "\n", encoding="utf-8")
+    identity_run = provider_supervisor_module.supervisor_host_identity()
+    expected_run_hash = hashlib.sha256(
+        json.dumps(
+            {"machine_id": run_id, "node": system_platform.node()},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+    ).hexdigest()
+    assert identity_run["host_identity_hash"] == expected_run_hash
+
+    # 3. All machine-id sources missing/invalid -> fail closed.
+    run_machine.write_text("not-32-hex\n", encoding="utf-8")
+    with pytest.raises(
+        provider_supervisor_module.ProviderSupervisorError,
+        match="^provider_host_identity_unavailable$",
+    ):
+        provider_supervisor_module.supervisor_host_identity()
+
+
+def test_supervisor_missing_machine_id_fails_closed_cleanly_with_structured_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+    import sys as _sys
+    import meta_research.streaming_provider_supervisor as streaming_module
+    from meta_research.provider_supervisor import (
+        SUPERVISOR_REQUEST_SCHEMA_V2,
+        ensure_transport_key,
+        write_supervisor_request,
+    )
+
+    _, key = ensure_transport_key(tmp_path)
+    invocation_hash = "c" * 64
+    operation = tmp_path / "provider-operations" / invocation_hash[:2] / invocation_hash
+    operation.mkdir(parents=True)
+    prompt_path = operation / "prompt.txt"
+    schema_path = operation / "output-schema.json"
+    stdout_path = operation / "stdout.jsonl"
+    result_path = operation / "last-message.json"
+    stderr_path = operation / "provider-stderr.log"
+    ready_path = operation / "supervisor-ready.json"
+    started_path = operation / "provider-started.json"
+    receipt_path = operation / "supervisor-exit.json"
+    stop_path = operation / "supervisor-stop.json"
+    lock_path = operation / "supervisor.lock"
+    prompt_path.write_text("bounded prompt", encoding="utf-8")
+    schema_path.write_text("{}", encoding="utf-8")
+    request_path = operation / "supervisor-request.json"
+    write_supervisor_request(
+        request_path,
+        {
+            "schema_ref": SUPERVISOR_REQUEST_SCHEMA_V2,
+            "invocation_hash": invocation_hash,
+            "argv": [
+                _sys.executable, "-c", "print('ok')",
+                "--output-schema", str(schema_path),
+                "--output-last-message", str(result_path), "-",
+            ],
+            "timeout_seconds": 5.0,
+            "stream_max_bytes": 4096,
+            "result_max_bytes": 4096,
+            "prompt_path": str(prompt_path),
+            "schema_path": str(schema_path),
+            "stdout_path": str(stdout_path),
+            "result_path": str(result_path),
+            "lock_path": str(lock_path),
+            "ready_path": str(ready_path),
+            "started_path": str(started_path),
+            "receipt_path": str(receipt_path),
+            "stop_path": str(stop_path),
+        },
+        key,
+    )
+
+    boot_file = tmp_path / "boot_id"
+    boot_file.write_text("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n", encoding="utf-8")
+    missing_a = tmp_path / "empty-etc-machine-id"
+    missing_a.write_bytes(b"")
+    missing_b = tmp_path / "missing-dbus-machine-id"
+    missing_c = tmp_path / "missing-run-machine-id"
+
+    monkeypatch.setattr(provider_supervisor_module, "_current_platform", lambda: "linux")
+    monkeypatch.setattr(provider_supervisor_module, "_LINUX_BOOT_ID_PATH", boot_file)
+    monkeypatch.setattr(
+        provider_supervisor_module,
+        "_LINUX_MACHINE_ID_PATHS",
+        (missing_a, missing_b, missing_c),
+    )
+
+    for entrypoint in (provider_supervisor_module.main, streaming_module.main):
+        rc = entrypoint([str(request_path)])
+        captured = capsys.readouterr()
+        assert rc == 70
+        assert captured.out == ""
+        err = json.loads(captured.err)
+        assert err == {
+            "schema_ref": "meta-research/provider-supervisor-error/v1",
+            "exit_code": 70,
+            "error_type": "ProviderSupervisorError",
+            "error_code": "provider_host_identity_unavailable",
+        }
+        assert str(tmp_path) not in captured.err
+        # Zero dirty spool files left behind so retries do not hit spool_invalid.
+        assert not stdout_path.exists()
+        assert not (operation / ".last-message.supervisor.tmp").exists()
+        assert not stderr_path.exists()
+        assert not ready_path.exists()
+        assert not result_path.exists()

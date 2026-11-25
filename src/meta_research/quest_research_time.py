@@ -107,11 +107,16 @@ def _seed_unmeasured_quests(connection, now):
                 _ordered_interval(row["activated_at"], now, "historical_time_evidence_missing")])})
 
 
-def _checkpoint(connection, now):
+def _checkpoint(connection, now) -> bool:
     service = _service(connection)
     if (service is None or service["status"] != "active" or
             _LIVE_SERVICES.get(str(Path(connection.engine.url.database).resolve())) != service["service_ref"]):
-        return
+        return False
+    has_active = connection.execute(text(
+        "SELECT 1 FROM ae_quest_time_budgets WHERE paused=0 AND completed=0 LIMIT 1"
+    )).first() is not None
+    if not has_active:
+        return False
     if now < service["last_observed_at"]:
         for row in connection.execute(text(
             "SELECT quest_ref,unknown_intervals_json FROM ae_quest_time_budgets WHERE paused=0 AND completed=0"
@@ -122,7 +127,7 @@ def _checkpoint(connection, now):
                 connection.execute(text(
                     "UPDATE ae_quest_time_budgets SET unknown_intervals_json=:unknown WHERE quest_ref=:quest"
                 ), {"unknown": json.dumps([*unknown, interval]), "quest": row["quest_ref"]})
-        return
+        return True
     connection.execute(text(
         "UPDATE ae_quest_time_budgets SET confirmed_used_seconds=confirmed_used_seconds + "
         "MAX(0,:now-checkpoint_at), checkpoint_at=:now WHERE paused=0 AND completed=0"
@@ -130,6 +135,7 @@ def _checkpoint(connection, now):
     connection.execute(text(
         "UPDATE ae_research_time_service SET last_observed_at=:now WHERE singleton='service'"
     ), {"now": now})
+    return True
 
 
 def set_quest_time_paused(connection, quest_ref, *, paused, observed_at):
@@ -180,14 +186,28 @@ class QuestResearchTimeMixin:
             self._research_time_service_ref = service_ref
             _LIVE_SERVICES[_key(self._database)] = service_ref
 
-    def checkpoint_research_time_service(self):
+    def checkpoint_research_time_service(self) -> bool:
         service_ref = getattr(self, "_research_time_service_ref", None)
         if service_ref is None or _LIVE_SERVICES.get(_key(self._database)) != service_ref:
-            return
+            return False
+        with self._database.read() as connection:
+            service = _service(connection)
+            if (
+                service is None
+                or service["service_ref"] != service_ref
+                or service["status"] != "active"
+            ):
+                return False
+            has_active = connection.execute(text(
+                "SELECT 1 FROM ae_quest_time_budgets WHERE paused=0 AND completed=0 LIMIT 1"
+            )).first() is not None
+            if not has_active:
+                return False
         with self._database.fenced_write() as connection:
             service = _service(connection)
             if service and service["service_ref"] == service_ref:
-                _checkpoint(connection, time.time())
+                return _checkpoint(connection, time.time())
+        return False
 
     def stop_research_time_service(self):
         service_ref = getattr(self, "_research_time_service_ref", None)

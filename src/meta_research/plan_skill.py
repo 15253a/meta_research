@@ -26,14 +26,11 @@ from meta_research.idea_skill import (
     IdeaSkillUnavailable,
     _DISABLED_CODEX_FEATURES,
     _CODEX_JSON_OBJECT_STRING_MARKER,
-    _CODEX_TRANSPORT_DECODE_FAILURE_KEY,
-    _SEALED_TRANSPORT_CONTRACT_FAILURES,
     _compile_codex_output_schema,
     _decode_codex_provider_output,
     _codex_harness_manifest,
     _file_sha256,
     _shared_codex_adapter_source_hash,
-    _unwrap_codex_root_output,
 )
 from meta_research.owners.agent_runtime import PlanRuntimeBinding
 from meta_research.owners.common import canonical_hash, canonical_json
@@ -55,8 +52,7 @@ from meta_research.plan_contract import (
 from meta_research.provider_supervisor import transport_key_hash
 from meta_research.root_workspace import _read_bytes
 from meta_research.sealed_provider_operations import (
-    _reject_non_finite_json_constant, _write_exclusive, operation_transport_limits,
-    read_business_input, read_completed_operation, read_sealed_invocation,
+    _reject_non_finite_json_constant, _write_exclusive,
 )
 from meta_research.semantic_mcp import SemanticMcpError
 from meta_research.runtime_binding_compatibility import plan_bindings_compatible
@@ -605,48 +601,9 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         self, request: PlanSkillRequest, schema: dict[str, object],
     ) -> tuple[dict[str, object], str | None, dict[str, object]] | None:
         """Consume the old job's verified reply. The successor alone can record a draft."""
-        if not request.replayable_primary_attempts or request.job_ref is None:
-            return None
-        directory = self._workspace / "provider-operations" / canonical_hash({"job_ref": request.job_ref}) / "primary"
-        path = directory / "invocation.json"
-        if not path.exists():
-            return None
-        _, key = self._transport_key()
-        invocation = read_sealed_invocation(path, key=key)
-        limits = operation_transport_limits(invocation)
-        original = read_business_input(directory, invocation, limits)
-        original_hash = canonical_hash(original)
-        if original_hash == canonical_hash(stage_operation_input(request, "plan")):
-            return None
-        if (invocation.get("job_ref") != request.job_ref or invocation.get("operation_name") != "primary"
-                or invocation.get("native_session_ref") != request.native_session_ref
-                or invocation.get("output_schema_hash") != canonical_hash(_compile_codex_output_schema(schema))):
-            raise PlanSkillUnavailable("codex_operation_identity_conflict")
-        for old_attempt, old_fence, generation in request.replayable_primary_attempts:
-            predecessor = replace(request, attempt_ref=old_attempt, fence_ref=old_fence, submission_revision=generation)
-            if canonical_hash(stage_operation_input(predecessor, "plan")) == original_hash:
-                break
-        else:
-            raise PlanSkillUnavailable("codex_operation_identity_conflict")
-        try:
-            output, session, _ = read_completed_operation(
-                directory, invocation_hash=canonical_hash(invocation),
-                native_session_ref=request.native_session_ref, transport_limits=limits,
-            )
-        except PlanSkillUnavailable as error:
-            if error.code not in _SEALED_TRANSPORT_CONTRACT_FAILURES:
-                raise
-            raise self._sealed_transport_contract_failure(
-                directory=directory, job_ref=request.job_ref, operation_name="primary",
-                native_session_ref=request.native_session_ref,
-            ) from error
-        try:
-            decoded = _decode_codex_provider_output(_unwrap_codex_root_output(output, schema), schema)
-        except PlanSkillUnavailable as error:
-            if error.code != "codex_json_object_transport_invalid":
-                raise
-            decoded = {_CODEX_TRANSPORT_DECODE_FAILURE_KEY: error.code}
-        return decoded, session, invocation
+        return self._recover_replaced_stage_operation(
+            request, stage="plan", schema=schema,
+        )
 
     def _read_submitted_plan(
         self, request: PlanSkillRequest, digest: object, *, original_invocation: dict[str, object] | None = None,

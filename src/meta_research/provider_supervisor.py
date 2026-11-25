@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import platform as system_platform
+import re
 import secrets
 import signal
 import stat
@@ -874,11 +875,41 @@ def supervisor_stop_requested(
     return True
 
 
+_LINUX_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+_LINUX_MACHINE_ID_PATHS = (
+    Path("/etc/machine-id"),
+    Path("/var/lib/dbus/machine-id"),
+    Path("/run/machine-id"),
+)
+_LINUX_MACHINE_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+_SAFE_ERROR_CODE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
+
+def _current_platform() -> str:
+    return sys.platform
+
+
+def _read_linux_machine_id(
+    paths: tuple[Path, ...] = _LINUX_MACHINE_ID_PATHS,
+) -> str:
+    for candidate_path in paths:
+        try:
+            value = candidate_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if _LINUX_MACHINE_ID_RE.fullmatch(value):
+            return value
+    raise ProviderSupervisorError("provider_host_identity_unavailable")
+
+
 def supervisor_host_identity() -> dict[str, str | None]:
-    if sys.platform == "linux":
-        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        machine = Path("/etc/machine-id").read_text().strip()
-        if not boot or not machine:
+    if _current_platform() == "linux":
+        try:
+            boot = _LINUX_BOOT_ID_PATH.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as error:
+            raise ProviderSupervisorError("provider_host_identity_unavailable") from error
+        machine = _read_linux_machine_id(_LINUX_MACHINE_ID_PATHS)
+        if not boot:
             raise ProviderSupervisorError("provider_host_identity_unavailable")
         return {
             "boot_identity_hash": hashlib.sha256(
@@ -892,6 +923,28 @@ def supervisor_host_identity() -> dict[str, str | None]:
         "boot_identity_hash": None,
         "host_identity_hash": hashlib.sha256(system_platform.node().encode()).hexdigest(),
     }
+
+
+def emit_supervisor_error(error: BaseException) -> None:
+    """Emit a path-free, secret-free structured error code on stderr before exit 70."""
+    if isinstance(error, (ProviderSupervisorError, ProviderTreeError)):
+        raw = str(error).strip()
+        error_code = raw if _SAFE_ERROR_CODE_RE.fullmatch(raw) else type(error).__name__
+    elif isinstance(error, OSError) and error.errno is not None:
+        error_code = errno.errorcode.get(error.errno, f"errno_{error.errno}")
+    else:
+        error_code = type(error).__name__
+    payload = {
+        "schema_ref": "meta-research/provider-supervisor-error/v1",
+        "exit_code": 70,
+        "error_type": type(error).__name__,
+        "error_code": error_code,
+    }
+    try:
+        sys.stderr.write(_canonical_json(payload) + "\n")
+        sys.stderr.flush()
+    except OSError:
+        pass
 
 
 def verify_process_tree_closed(payload: object) -> None:
@@ -1787,6 +1840,9 @@ def _supervise_locked(
         or result_temporary.exists()
     ):
         raise ProviderSupervisorError("provider_supervisor_spool_invalid")
+    # Validate host identity before creating any spool files so a missing
+    # machine-id or boot_id fails closed without leaving orphan empty files.
+    supervisor_host_identity()
     selected_platform = process_platform.platform_name
     operation_path = (paths["ready_path"].parent / "supervisor-request.json").resolve()
     provider_environment = dict(os.environ)
@@ -1880,6 +1936,16 @@ def _supervise_locked(
         elif selected_platform == "posix":
             provider_job = LinuxProviderJob()
             stack.callback(provider_job.close)
+        def cleanup_unready_spool(exc_type, _error, _traceback) -> None:
+            if exc_type is not None and not paths["ready_path"].exists():
+                for candidate in (stdout_path, result_temporary):
+                    try:
+                        if candidate.is_file() and candidate.stat().st_size == 0:
+                            candidate.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+        stack.push(cleanup_unready_spool)
         prompt_stream = stack.enter_context(
             prompt_path.open("rb", buffering=0)
         )
@@ -2191,7 +2257,8 @@ def main(argv: list[str] | None = None) -> int:
         return 64
     try:
         supervise(Path(arguments[0]))
-    except (OSError, ProviderSupervisorError, ProviderTreeError, subprocess.SubprocessError):
+    except (OSError, ProviderSupervisorError, ProviderTreeError, subprocess.SubprocessError) as error:
+        emit_supervisor_error(error)
         return 70
     return 0
 

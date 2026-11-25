@@ -609,6 +609,14 @@ class BundleStageWorker:
             )
             if pending is None:
                 replacement_context = self._rolling_replacement_context(request, run, graph, commits)
+                replayable_continuation_attempts = run.replayable_continuation_attempts
+                replayable_inbox_checkpoints = (
+                    self._agent_runtime.query_bundle_inbox_checkpoints_for_attempts(
+                        run_ref=run.run_ref, attempts=replayable_continuation_attempts,
+                    )
+                    if replayable_continuation_attempts
+                    else ()
+                )
                 batch_request = BundleTargetBatchRequest(
                     stage_request_ref=request.request_ref,
                     cycle_ref=request.cycle_ref,
@@ -638,6 +646,8 @@ class BundleStageWorker:
                     provider_feedback=self._agent_runtime.query_stage_provider_correction_feedback(
                         run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
                     ),
+                    replayable_continuation_attempts=replayable_continuation_attempts,
+                    replayable_inbox_checkpoints=replayable_inbox_checkpoints,
                 )
                 if not self._runtime_binding_is_current(run):
                     return False
@@ -964,6 +974,14 @@ class BundleStageWorker:
                     self._observation = BundleObservation("failure", next(iter(input_errors.values())))
                     return False
             replacement_context = self._rolling_replacement_context(request, run, graph, commits)
+            replayable_continuation_attempts = run.replayable_continuation_attempts
+            replayable_inbox_checkpoints = (
+                self._agent_runtime.query_bundle_inbox_checkpoints_for_attempts(
+                    run_ref=run.run_ref, attempts=replayable_continuation_attempts,
+                )
+                if replayable_continuation_attempts
+                else ()
+            )
             dispatch_request = BundleDispatchRequest(
                 stage_request_ref=request.request_ref,
                 cycle_ref=request.cycle_ref,
@@ -985,6 +1003,8 @@ class BundleStageWorker:
                 provider_feedback=self._agent_runtime.query_stage_provider_correction_feedback(
                     run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
                 ),
+                replayable_continuation_attempts=replayable_continuation_attempts,
+                replayable_inbox_checkpoints=replayable_inbox_checkpoints,
             )
             try:
                 self._agent_runtime.begin_provider_unit(
@@ -2903,6 +2923,16 @@ class BundleStageWorker:
         accepted_question_content = self._research_memory.read_question_content(
             request.accepted_question.content_ref, request.accepted_question.content_hash
         )
+        replayable_primary_attempts = (
+            run.replayable_primary_attempts if job_ref == base_job_ref else ()
+        )
+        replayable_inbox_checkpoints = (
+            self._agent_runtime.query_bundle_inbox_checkpoints_for_attempts(
+                run_ref=run.run_ref, attempts=replayable_primary_attempts,
+            )
+            if replayable_primary_attempts
+            else ()
+        )
         skill_request = BundleSkillRequest(
             native_replacement_context=self._agent_runtime.query_stage_native_replacement_context(
                 run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref),
@@ -2933,6 +2963,8 @@ class BundleStageWorker:
             provider_feedback=self._agent_runtime.query_stage_provider_correction_feedback(
                 run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref,
             ),
+            replayable_primary_attempts=replayable_primary_attempts,
+            replayable_inbox_checkpoints=replayable_inbox_checkpoints,
         )
         if run.primary_draft is None:
             try:

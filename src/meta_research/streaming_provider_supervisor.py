@@ -9,11 +9,13 @@ import subprocess
 import sys
 from typing import cast
 
+from meta_research.linux_provider_tree import ProviderTreeError
 from meta_research.provider_supervisor import (
     ProviderProcessPlatform,
     ProviderSupervisorError,
     SupervisorFileLock,
     SUPERVISOR_REQUEST_SCHEMA_V2,
+    emit_supervisor_error,
     read_supervisor_request,
     read_transport_envelope,
     read_transport_key_for_operation,
@@ -124,7 +126,8 @@ def main(argv: list[str] | None = None) -> int:
             if str(error) == "provider_outcome_unknown":
                 reconcile_rebooted_supervisor(Path(arguments[0]))
             raise
-    except (OSError, ProviderSupervisorError, subprocess.SubprocessError):
+    except (OSError, ProviderSupervisorError, ProviderTreeError, subprocess.SubprocessError) as error:
+        emit_supervisor_error(error)
         return 70
     return 0
 

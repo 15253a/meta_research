@@ -822,7 +822,7 @@ def create_app(
                 runtime.owners.advancement_engine.checkpoint_research_time_service,
                 health=ReconciliationHealth(), worker_label="Quest research time",
                 timeout_code="research_time_checkpoint_timeout", timeout_seconds=None,
-                on_health_change=None, idle_delay=1.0, active_delay=1.0,
+                on_health_change=None, idle_delay=1.0, active_delay=30.0,
             )
         )
         worker_tasks["harness_conformance_worker"] = _start_background_worker(

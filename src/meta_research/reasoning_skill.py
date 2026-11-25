@@ -250,6 +250,8 @@ class ReasoningSkillRequest:
     # not a new provider output field.  Older deterministic callers leave it
     # unset and retain the legacy validation path.
     research_time_budget_revision: str | None = None
+    replayable_primary_attempts: tuple[tuple[str, str, int], ...] = ()
+    replayable_continuation_attempts: tuple[tuple[str, str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1326,13 +1328,20 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
             f"context_pack_ref={request.context_pack_ref}\n"
             "如缺少完成本次修正所需的材料，沿此冻结引用定向补读。\n"
         )
-        output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
-            request=request,
-            operation_name="primary",
-            prompt=prompt,
-            schema=_reasoning_primary_output_schema(request),
-            native_session_ref=request.native_session_ref,
+        schema = _reasoning_primary_output_schema(request)
+        recovered = self._recover_replaced_stage_operation(
+            request, stage="reasoning", schema=schema,
         )
+        if recovered is None:
+            output, session_ref, _primary_stdout = self._invoke_with_resident_mcp(
+                request=request,
+                operation_name="primary",
+                prompt=prompt,
+                schema=schema,
+                native_session_ref=request.native_session_ref,
+            )
+        else:
+            output, session_ref, _original_invocation = recovered
         if session_ref is None or not isinstance(output, dict):
             raise ReasoningSkillUnavailable("codex_reasoning_primary_invalid")
         output = self._assemble_provider_output(
@@ -1458,7 +1467,18 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         for name, value in materials.items():
             if previous is None or name not in previous or previous[name] != value:
                 prompt += name + "=" + canonical_json(value) + "\n"
-        decision, native_session, _stdout = self._invoke_with_resident_mcp(request=request, operation_name="autonomous-resume", prompt=prompt, schema=schema, native_session_ref=request.native_session_ref, operation_input=stage_operation_input(request, "reasoning", extra=materials))
+        recovered = self._recover_replaced_stage_operation(
+            request,
+            stage="reasoning",
+            schema=schema,
+            operation_name="autonomous-resume",
+            extra=materials,
+            replayable_attempts=request.replayable_continuation_attempts,
+        )
+        if recovered is None:
+            decision, native_session, _stdout = self._invoke_with_resident_mcp(request=request, operation_name="autonomous-resume", prompt=prompt, schema=schema, native_session_ref=request.native_session_ref, operation_input=stage_operation_input(request, "reasoning", extra=materials))
+        else:
+            decision, native_session, _original_invocation = recovered
         if native_session != request.native_session_ref:
             raise ReasoningSkillUnavailable("codex_primary_session_changed")
         if isinstance(decision.get("final_output"), dict):
@@ -1521,16 +1541,28 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
         for name, value in materials.items():
             if previous is None or name not in previous or previous[name] != value:
                 prompt += name + "=" + canonical_json(value) + "\n"
-        reviewed, resumed_session, _stdout = self._invoke_with_resident_mcp(
-            request=request,
-            operation_name="autonomous-resume",
-            prompt=prompt,
-            schema=_reasoning_review_response_schema(
-                request, _reasoning_stage_output_schema(request)
-            ),
-            native_session_ref=request.native_session_ref,
-            operation_input=stage_operation_input(request, "reasoning", extra=materials),
+        review_schema = _reasoning_review_response_schema(
+            request, _reasoning_stage_output_schema(request)
         )
+        recovered = self._recover_replaced_stage_operation(
+            request,
+            stage="reasoning",
+            schema=review_schema,
+            operation_name="autonomous-resume",
+            extra=materials,
+            replayable_attempts=request.replayable_continuation_attempts,
+        )
+        if recovered is None:
+            reviewed, resumed_session, _stdout = self._invoke_with_resident_mcp(
+                request=request,
+                operation_name="autonomous-resume",
+                prompt=prompt,
+                schema=review_schema,
+                native_session_ref=request.native_session_ref,
+                operation_input=stage_operation_input(request, "reasoning", extra=materials),
+            )
+        else:
+            reviewed, resumed_session, _original_invocation = recovered
         if (
             resumed_session != request.native_session_ref
             or set(reviewed)

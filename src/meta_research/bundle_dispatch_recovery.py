@@ -5,7 +5,9 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from meta_research.bundle_skill import (
-        BundleDispatchRequest, BundleTargetBatchRequest, CodexBundleSkillAdapter,
+        BundleDispatchRequest, BundleDispatchResult,
+        BundleTargetBatchRequest, BundleTargetBatchResult,
+        CodexBundleSkillAdapter,
     )
 
 from meta_research.idea_skill import (
@@ -44,8 +46,9 @@ def _completed_operation(adapter, request, operation_name, raw_schema):
         root_capability_profile=profile.as_dict(),
         root_capability_profile_hash=profile.digest,
         output_schema_hash=canonical_hash(_compile_codex_output_schema(raw_schema)),
-        mcp_url=adapter._root_resident_mcp.endpoint_url,
     )
+    if not getattr(request, "replayable_continuation_attempts", ()):
+        expected["mcp_url"] = adapter._root_resident_mcp.endpoint_url
     invocation = _read_operation_invocation(
         directory / "invocation.json", key=key, expected_base=expected,
     )
@@ -76,23 +79,69 @@ def _correction(adapter, request, operation_name, detail, verified_native_sessio
     )
 
 
+def _matching_rolling_predecessor(request, operation_input):
+    from meta_research.bundle_skill import _rolling_operation_identity
+
+    identity = operation_input.get("identity")
+    if identity == _rolling_operation_identity(request):
+        return request, False
+    for old_attempt, old_fence, _generation in getattr(
+        request, "replayable_continuation_attempts", ()
+    ):
+        predecessor = replace(request, attempt_ref=old_attempt, fence_ref=old_fence)
+        if identity == _rolling_operation_identity(predecessor):
+            return predecessor, True
+    raise ProviderOperationUnavailable("codex_operation_identity_conflict")
+
+
+def _inbox_checkpoint_equivalent(
+    original_cp: object,
+    current_cp: object,
+    *,
+    replayed_from_retired: bool,
+    replayable_checkpoints: tuple[dict[str, object], ...],
+    expected_run_ref: str,
+    expected_attempt_ref: str,
+    expected_fence_ref: str,
+) -> bool:
+    if original_cp == current_cp:
+        return True
+    if not replayed_from_retired:
+        return False
+    if (
+        not isinstance(original_cp, dict)
+        or not isinstance(current_cp, dict)
+        or original_cp not in replayable_checkpoints
+    ):
+        return False
+    return (
+        original_cp.get("run_ref") == expected_run_ref
+        and original_cp.get("attempt_ref") == expected_attempt_ref
+        and original_cp.get("fence_ref") == expected_fence_ref
+        and original_cp.get("cursor") == current_cp.get("cursor")
+        and original_cp.get("generation") == current_cp.get("generation")
+    )
+
+
 def recover_rejected_dispatch(
     adapter: "CodexBundleSkillAdapter", request: "BundleDispatchRequest", operation_name: str,
-) -> None:
+) -> "BundleDispatchResult | None":
     """Preserve a completed result; superseded inputs require a new Attempt."""
     from meta_research.bundle_skill import (
         BundleSkillContractError, _bundle_dispatch_result_from_output, _dispatch_schema,
-        validate_bundle_dispatch_result, _rolling_operation_identity,
+        validate_bundle_dispatch_result,
     )
     if request.job_ref is None:
-        return
+        return None
     try:
         operation_input, output, session = _completed_operation(
             adapter, request, operation_name, _dispatch_schema(),
         )
-        if (operation_input.get("kind") != "bundle_dispatch"
-                or operation_input.get("identity") != _rolling_operation_identity(request)):
+        if operation_input.get("kind") != "bundle_dispatch":
             raise ProviderOperationUnavailable("codex_operation_identity_conflict")
+        matched_request, replayed_from_retired = _matching_rolling_predecessor(
+            request, operation_input
+        )
         fields = operation_input["request"]
         if not isinstance(fields, dict):
             raise ValueError("invalid dispatch input")
@@ -101,7 +150,7 @@ def recover_rejected_dispatch(
         if not isinstance(fields["frontier"], list) or not isinstance(fields["state"], dict):
             raise ValueError("invalid dispatch input")
         original = replace(
-            request, frontier=tuple(fields["frontier"]), state=fields["state"],
+            matched_request, frontier=tuple(fields["frontier"]), state=fields["state"],
             inbox_checkpoint=fields["inbox_checkpoint"],
             quest_goal_revision=fields.get("quest_goal_revision"),
         )
@@ -114,29 +163,43 @@ def recover_rejected_dispatch(
         validate_bundle_dispatch_result(original, result)
     except BundleSkillContractError as error:
         _correction(adapter, request, operation_name, str(error), session)
+    inbox_equivalent = _inbox_checkpoint_equivalent(
+        original.inbox_checkpoint,
+        request.inbox_checkpoint,
+        replayed_from_retired=replayed_from_retired,
+        replayable_checkpoints=request.replayable_inbox_checkpoints,
+        expected_run_ref=matched_request.run_ref,
+        expected_attempt_ref=matched_request.attempt_ref,
+        expected_fence_ref=matched_request.fence_ref,
+    )
     if (original.frontier != request.frontier or original.state != request.state
-            or original.inbox_checkpoint != request.inbox_checkpoint
+            or not inbox_equivalent
             or original.quest_goal_revision != request.quest_goal_revision):
         _correction(adapter, request, operation_name, "bundle_operation_inputs_changed", session)
+    return result if replayed_from_retired else None
 
 
 def recover_rejected_target_batch(
     adapter: "CodexBundleSkillAdapter", request: "BundleTargetBatchRequest", operation_name: str,
-) -> None:
+) -> "BundleTargetBatchResult | None":
     """Use the original batch closure for validation before Owner correction."""
+    from meta_research.bundle_output_assembly import assemble_strategy_update
     from meta_research.bundle_skill import (
         BundleSkillContractError, BundleTargetBatchResult, _target_batch_schema,
-        validate_bundle_target_batch_result, _rolling_operation_identity,
+        validate_bundle_target_batch_result,
     )
+    from meta_research.bundle_target_contract import BundleTargetContractError
     if request.job_ref is None:
-        return
+        return None
     try:
         operation_input, output, session = _completed_operation(
             adapter, request, operation_name, _target_batch_schema(request),
         )
-        if (operation_input.get("kind") != "bundle_target_batch"
-                or operation_input.get("identity") != _rolling_operation_identity(request)):
+        if operation_input.get("kind") != "bundle_target_batch":
             raise ProviderOperationUnavailable("codex_operation_identity_conflict")
+        matched_request, replayed_from_retired = _matching_rolling_predecessor(
+            request, operation_input
+        )
         context = operation_input["request"]
         identity_names = (
             "stage_request_ref", "run_ref", "attempt_ref", "fence_ref", "root_session_ref",
@@ -144,15 +207,15 @@ def recover_rejected_target_batch(
             "base_generation", "base_head_receipt",
         )
         if (not isinstance(context, dict)
-                or any(context.get(name) != getattr(request, name) for name in identity_names)
-                or context.get("runtime_binding_hash") != canonical_hash(request.runtime_binding.as_dict())
-                or context.get("initial_target_plan_hash") != canonical_hash(request.initial_target_plan)
-                or context.get("formal_plan") != request.plan_document):
+                or any(context.get(name) != getattr(matched_request, name) for name in identity_names)
+                or context.get("runtime_binding_hash") != canonical_hash(matched_request.runtime_binding.as_dict())
+                or context.get("initial_target_plan_hash") != canonical_hash(matched_request.initial_target_plan)
+                or context.get("formal_plan") != matched_request.plan_document):
             raise ProviderOperationUnavailable("codex_operation_identity_conflict")
         if not isinstance(context.get("current_targets"), list) or not isinstance(context.get("target_commits"), list):
             raise ValueError("invalid batch closure")
         original = replace(
-            request, current_targets=tuple(context["current_targets"]),
+            matched_request, current_targets=tuple(context["current_targets"]),
             target_commits=tuple(context["target_commits"]),
             inbox_checkpoint=context["inbox_checkpoint"],
             quest_goal_revision=context.get("quest_goal_revision"),
@@ -161,16 +224,36 @@ def recover_rejected_target_batch(
         raise
     except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError) as error:
         raise ProviderOperationUnavailable("codex_operation_spool_invalid") from error
+    strategy_update = output.get("strategy_update")
+    action = output.get("action", "propose_targets")
+    replan_basis = output.get("replan_basis")
+    rationale = output.get("rationale")
+    try:
+        if action == "propose_targets" and isinstance(strategy_update, dict):
+            strategy_update = assemble_strategy_update(strategy_update, original.plan_document)
+    except BundleTargetContractError as error:
+        _correction(adapter, request, operation_name, str(error), session)
     result = BundleTargetBatchResult(
-        strategy_update=output.get("strategy_update"), rationale=output.get("rationale"),
+        strategy_update=strategy_update, rationale=rationale,
         native_session_ref=session, adapter_kind="codex_cli",
+        action=action, replan_basis=replan_basis,
     )
     try:
         validate_bundle_target_batch_result(original, result)
     except BundleSkillContractError as error:
         _correction(adapter, request, operation_name, str(error), session)
+    inbox_equivalent = _inbox_checkpoint_equivalent(
+        original.inbox_checkpoint,
+        request.inbox_checkpoint,
+        replayed_from_retired=replayed_from_retired,
+        replayable_checkpoints=request.replayable_inbox_checkpoints,
+        expected_run_ref=matched_request.run_ref,
+        expected_attempt_ref=matched_request.attempt_ref,
+        expected_fence_ref=matched_request.fence_ref,
+    )
     if (original.current_targets != request.current_targets
             or original.target_commits != request.target_commits
-            or original.inbox_checkpoint != request.inbox_checkpoint
+            or not inbox_equivalent
             or original.quest_goal_revision != request.quest_goal_revision):
         _correction(adapter, request, operation_name, "bundle_operation_inputs_changed", session)
+    return result if replayed_from_retired else None

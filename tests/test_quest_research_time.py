@@ -433,3 +433,66 @@ def test_authoritative_quest_ending_stops_time(tmp_path, monkeypatch):
         assert observed["used_seconds"] == 60.0
     finally:
         runtime.close()
+
+
+def test_checkpoint_skips_write_and_wal_when_idle_or_all_paused_and_returns_bool(tmp_path, monkeypatch):
+    from sqlalchemy import text
+
+    now = [1000.0]
+    monkeypatch.setattr("time.time", lambda: now[0])
+    root = prepare_data_root(tmp_path / "idle-clock-wal")
+    runtime = _runtime(root, _IdeaProvider())
+    try:
+        ae = runtime.owners.advancement_engine
+        ae.start_research_time_service()
+        wal_path = Path(str(root.database) + "-wal")
+
+        # Spy on fenced_write to guarantee zero write transactions during idle/paused ticks.
+        fenced_writes = 0
+        original_fenced_write = runtime._database.fenced_write
+
+        def counting_fenced_write(*args, **kwargs):
+            nonlocal fenced_writes
+            fenced_writes += 1
+            return original_fenced_write(*args, **kwargs)
+
+        monkeypatch.setattr(runtime._database, "fenced_write", counting_fenced_write)
+
+        # 1. Zero-Quest idle state: must return False, skip fenced_write, and keep WAL untouched.
+        wal_before = (wal_path.stat().st_mtime_ns, wal_path.stat().st_size) if wal_path.exists() else None
+        now[0] = 1030.0
+        assert ae.checkpoint_research_time_service() is False
+        now[0] = 1060.0
+        assert ae.checkpoint_research_time_service() is False
+        assert fenced_writes == 0
+        wal_after = (wal_path.stat().st_mtime_ns, wal_path.stat().st_size) if wal_path.exists() else None
+        assert wal_after == wal_before
+        with runtime._database.read() as connection:
+            assert connection.execute(
+                text("SELECT last_observed_at FROM ae_research_time_service WHERE singleton='service'")
+            ).scalar_one() == 1000.0
+
+        # 2. Active Quest: checkpoint must advance and return True so active_delay takes effect.
+        monkeypatch.setattr(runtime._database, "fenced_write", original_fenced_write)
+        quest = _confirm_question_with_prefix(runtime, "idle-clock-wal")["quest_ref"]
+        monkeypatch.setattr(runtime._database, "fenced_write", counting_fenced_write)
+        now[0] = 1090.0
+        assert ae.checkpoint_research_time_service() is True
+        assert fenced_writes == 1
+        assert ae.query_research_time(quest)["confirmed_used_seconds"] == 30.0
+
+        # 3. All Quests paused: must return False and perform zero write transactions / WAL writes.
+        monkeypatch.setattr(runtime._database, "fenced_write", original_fenced_write)
+        _control(runtime, quest, "pause", "idle-clock-pause")
+        fenced_writes = 0
+        monkeypatch.setattr(runtime._database, "fenced_write", counting_fenced_write)
+        wal_paused_before = (wal_path.stat().st_mtime_ns, wal_path.stat().st_size) if wal_path.exists() else None
+        now[0] = 1150.0
+        assert ae.checkpoint_research_time_service() is False
+        now[0] = 1210.0
+        assert ae.checkpoint_research_time_service() is False
+        assert fenced_writes == 0
+        wal_paused_after = (wal_path.stat().st_mtime_ns, wal_path.stat().st_size) if wal_path.exists() else None
+        assert wal_paused_after == wal_paused_before
+    finally:
+        runtime.close()

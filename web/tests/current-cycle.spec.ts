@@ -442,7 +442,7 @@ test("the foreground Cycle keeps one exact Question and four Stage states at 144
 test("QuestionTree marks only the foreground Question and keeps its facts separate", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   const f = await openCurrentCycle(page);
-  await page.getByRole("button", { name: "问题树", exact: true }).click();
+  await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "问题树", exact: true }).click();
   const tree = page.getByTestId("question-tree"), inspector = tree.getByRole("region", { name: "选中问题详情" });
   const current = tree.locator(`[data-question-ref="${QUESTION_REF}"]`), sibling = tree.locator('[data-question-ref="question-143-sibling"]');
   await expect(tree).toBeVisible();
@@ -541,9 +541,10 @@ test("root activity preserves source and Cycle scope, reports empty output hones
     await expect(currentRoots.locator(`button[data-session-ref="${session}"]`)).toHaveCount(session === f.acquisition.session_ref ? 4 : 1);
   }
   await expect(currentRoots.locator(`button[data-session-ref="${f.history.session_ref}"]`)).toHaveCount(0);
+  await spectrum.locator('.spectrum-stage[data-stage="reasoning"] .stage-root-sessions > summary').click();
   await currentRoots.locator('button[data-session-ref="reasoning-root-session-143"]').click();
   const reasoning = activity.getByRole("region", { name: "Reasoning 会话", exact: true });
-  await expect(reasoning).toContainText("正在核对当前研究证据。"); await expect(reasoning).toContainText("暂无模型调用在执行");
+  await expect(reasoning).toContainText("正在核对当前研究证据。"); await expect(reasoning).toContainText("等待继续");
   await currentRoots.locator(`button[data-session-ref="${f.deepfetch.session_ref}"]`).click();
   const deepfetch = activity.getByRole("region", { name: "DeepFetch · 文献检索 会话", exact: true });
   await expect(deepfetch.locator(".root-session-heading")).toContainText("正在执行");
@@ -551,15 +552,17 @@ test("root activity preserves source and Cycle scope, reports empty output hones
   await spectrum.locator('.spectrum-stage[data-stage="reasoning"]').locator(`button[data-session-ref="${f.acquisition.session_ref}"]`).click();
   const acquisition = activity.getByRole("region", { name: "Acquisition · 获取资料 会话", exact: true });
   await expect(acquisition.locator(".root-session-heading")).toContainText("Quest 共享");
-  await expect(acquisition).toContainText("暂无模型调用在执行"); await expect(acquisition).toContainText("会话已建立，等待第一条公开工作记录。");
+  await expect(acquisition).toContainText("等待继续"); await expect(acquisition).toContainText("会话已建立，等待第一条公开工作记录。");
   await expect(acquisition.locator(".root-session-heading")).not.toContainText("当前轮");
+  await spectrum.locator('.spectrum-stage[data-stage="bundle"] .stage-root-sessions > summary').click();
   await spectrum.locator('.spectrum-stage[data-stage="bundle"] .stage-root-history > summary').click();
   await spectrum.locator(`button[data-session-ref="${f.history.session_ref}"]`).click();
   await expect(activity.locator(".root-session-heading")).toContainText("历史轮次");
   await expect(activity).toContainText("上一轮 Bundle 的历史执行记录。");
   await expect(activity).not.toContainText("当前轮 Bundle 已形成初始实验安排。");
-  await page.getByRole("button", { name: "问题树", exact: true }).click(); await expect(activity).toBeHidden();
-  await page.getByRole("button", { name: "研究总览", exact: true }).click();
+  const nav = page.getByRole("navigation", { name: "主导航" });
+  await nav.getByRole("button", { name: "问题树", exact: true }).click(); await expect(activity).toBeHidden();
+  await nav.getByRole("button", { name: "研究总览", exact: true }).click();
   await expect(page.locator("main.lumen-main")).toBeVisible(); await expect(activity).toBeVisible();
   await expect(page.getByTestId("current-cycle-overview")).toHaveAttribute("data-cycle-ref", CYCLE_REF);
   expect(f.nonGetRequests).toEqual([]); expect(f.errors).toEqual([]);
@@ -612,12 +615,14 @@ test("terminal Target graph cannot displace an exact active root and historical 
   await page.reload({ waitUntil: "domcontentloaded" });
   const picker = page.getByRole("combobox", { name: "选择实验任务" });
   await expect(picker).toHaveValue(live.target_ref);
+  await page.locator(".research-existing-details > summary").click();
   await expect(page.getByRole("region", { name: "当前研究工作状态" }).getByText("Target 正在开展工作", { exact: true })).toBeVisible();
   await picker.selectOption(stopped.target_ref);
   await expect(picker).toHaveValue(stopped.target_ref);
   live.current_execution.status = "stopped";
   f.target.is_executing = false; f.target.status = "completed";
   await page.reload({ waitUntil: "domcontentloaded" });
+  await page.locator(".research-existing-details > summary").click();
   await expect(page.getByRole("region", { name: "当前研究工作状态" }).getByText("Target 执行已停止，研究结果尚未接纳", { exact: true })).toBeVisible();
   await expect(page.getByText("Target 正在开展工作", { exact: true })).toHaveCount(0);
   expect(f.nonGetRequests).toEqual([]);

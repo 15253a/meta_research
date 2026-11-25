@@ -490,7 +490,14 @@ class ReasoningStageWorker:
             ])) for item in rejected
         )
         return replace(
-            self._skill_request(request, run, job_ref=job_ref),
+            self._skill_request(
+                request,
+                run,
+                job_ref=job_ref,
+                replayable_continuation_attempts=(
+                    run.replayable_continuation_attempts if job_ref == operation_ref else ()
+                ),
+            ),
             continuation_predecessor_job_ref=(None if not rejected else rejected[-1]["job_ref"]),
             continuation_feedback=tuple(
                 feedback
@@ -535,7 +542,14 @@ class ReasoningStageWorker:
                 {"invocation_ref": invocation.invocation_ref, "job_ref": job_ref}
             )[:64]
         )
-        skill_request = self._skill_request(request, run, job_ref=job_ref)
+        skill_request = self._skill_request(
+            request,
+            run,
+            job_ref=job_ref,
+            replayable_primary_attempts=(
+                run.replayable_primary_attempts if job_ref == base_job_ref else ()
+            ),
+        )
         if run.primary_draft is not None:
             # Finalize validates the frozen checkpoint against the revision
             # that was live when the owner accepted it.  A later human budget
@@ -835,6 +849,8 @@ class ReasoningStageWorker:
         run: ReasoningStageRun,
         *,
         job_ref: str | None = None,
+        replayable_primary_attempts: tuple[tuple[str, str, int], ...] = (),
+        replayable_continuation_attempts: tuple[tuple[str, str, int], ...] = (),
     ) -> ReasoningSkillRequest:
         (
             predecessor_candidate_ref,
@@ -886,6 +902,8 @@ class ReasoningStageWorker:
             ),
             job_ref=job_ref,
             research_time_budget_revision=research_time_budget_revision,
+            replayable_primary_attempts=replayable_primary_attempts,
+            replayable_continuation_attempts=replayable_continuation_attempts,
         )
 
     def _owner_rejection_context(

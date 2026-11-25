@@ -761,6 +761,7 @@ class IdeaSkillRequest:
     run_ref: str | None = None
     attempt_ref: str | None = None
     fence_ref: str | None = None
+    replayable_primary_attempts: tuple[tuple[str, str, int], ...] = ()
 
 
 def stage_operation_input(request, stage: str, *, extra=None) -> dict[str, object]:
@@ -1826,23 +1827,30 @@ class CodexIdeaSkillAdapter:
             f"context_pack_ref={request.context_pack_ref}\n"
             "如缺少完成本次修正所需的材料，沿此冻结引用定向补读。\n"
         )
-        primary_output, primary_session, _primary_stdout = (
-            self._invoke_root_operation(
-            operation_name="primary",
-            prompt=primary_prompt,
-            schema=_outcome_envelope_schema(
-                request.question_ref, request.context_pack_ref
-            ),
-            native_session_ref=request.native_session_ref,
-            job_ref=request.job_ref,
-            run_ref=request.run_ref,
-            attempt_ref=request.attempt_ref,
-            root_session_ref=request.root_session_ref,
-            fence_ref=request.fence_ref,
-            runtime_binding=request.runtime_binding.as_dict(),
-            operation_input=stage_operation_input(request, "idea"),
-            )
+        schema = _outcome_envelope_schema(
+            request.question_ref, request.context_pack_ref
         )
+        recovered = self._recover_replaced_stage_operation(
+            request, stage="idea", schema=schema,
+        )
+        if recovered is None:
+            primary_output, primary_session, _primary_stdout = (
+                self._invoke_root_operation(
+                    operation_name="primary",
+                    prompt=primary_prompt,
+                    schema=schema,
+                    native_session_ref=request.native_session_ref,
+                    job_ref=request.job_ref,
+                    run_ref=request.run_ref,
+                    attempt_ref=request.attempt_ref,
+                    root_session_ref=request.root_session_ref,
+                    fence_ref=request.fence_ref,
+                    runtime_binding=request.runtime_binding.as_dict(),
+                    operation_input=stage_operation_input(request, "idea"),
+                )
+            )
+        else:
+            primary_output, primary_session, _original_invocation = recovered
         if primary_session is None:
             raise IdeaSkillUnavailable("codex_primary_session_missing")
         # Child/tool trace is diagnostic provenance, not part of the Idea
@@ -1864,6 +1872,112 @@ class CodexIdeaSkillAdapter:
             primary_session_ref=primary_session,
             adapter_kind="codex_cli",
         )
+
+    def _recover_replaced_stage_operation(
+        self,
+        request,
+        *,
+        stage: str,
+        schema: dict[str, object],
+        operation_name: str = "primary",
+        extra: dict[str, object] | None = None,
+        replayable_attempts: tuple[tuple[str, str, int], ...] | None = None,
+        replayable_inbox_checkpoints: tuple[dict[str, object], ...] = (),
+    ) -> tuple[dict[str, object], str | None, dict[str, object]] | None:
+        """Consume a retired fence's verified reply for the same reused operation."""
+        attempts = (
+            getattr(request, "replayable_primary_attempts", ())
+            if replayable_attempts is None
+            else replayable_attempts
+        )
+        if not attempts or request.job_ref is None:
+            return None
+        directory = (
+            self._workspace
+            / "provider-operations"
+            / canonical_hash({"job_ref": request.job_ref})
+            / operation_name
+        )
+        path = directory / "invocation.json"
+        if not path.exists():
+            return None
+        _, key = self._transport_key()
+        invocation = _read_sealed_operation_invocation(path, key=key)
+        limits = _operation_transport_limits(invocation)
+        original = _read_operation_business_input(directory, invocation, limits)
+        original_hash = canonical_hash(original)
+        if original_hash == canonical_hash(stage_operation_input(request, stage, extra=extra)):
+            return None
+        if (
+            invocation.get("job_ref") != request.job_ref
+            or invocation.get("operation_name") != operation_name
+            or invocation.get("native_session_ref") != request.native_session_ref
+            or invocation.get("output_schema_hash") != canonical_hash(_compile_codex_output_schema(schema))
+        ):
+            raise IdeaSkillUnavailable("codex_operation_identity_conflict")
+        has_submission_revision = hasattr(request, "submission_revision")
+        has_inbox_checkpoint = hasattr(request, "inbox_checkpoint")
+        current_cp = getattr(request, "inbox_checkpoint", None) if has_inbox_checkpoint else None
+        # `stage_operation_input(candidate, ...)` seals `runtime_binding_hash`
+        # (including model_ref and capability_bindings), so candidate hash
+        # equality enforces capability-profile equivalence across fences.
+        for old_attempt, old_fence, generation in attempts:
+            updates: dict[str, object] = {
+                "attempt_ref": old_attempt,
+                "fence_ref": old_fence,
+            }
+            if has_submission_revision:
+                updates["submission_revision"] = generation
+            candidates = [replace(request, **updates)]
+            if has_inbox_checkpoint and replayable_inbox_checkpoints:
+                for checkpoint in replayable_inbox_checkpoints:
+                    if (
+                        checkpoint.get("run_ref") == request.run_ref
+                        and checkpoint.get("attempt_ref") == old_attempt
+                        and checkpoint.get("fence_ref") == old_fence
+                        and (
+                            not isinstance(current_cp, dict)
+                            or (
+                                checkpoint.get("cursor") == current_cp.get("cursor")
+                                and checkpoint.get("generation") == current_cp.get("generation")
+                            )
+                        )
+                    ):
+                        candidates.append(
+                            replace(request, **updates, inbox_checkpoint=checkpoint)
+                        )
+            if any(
+                canonical_hash(stage_operation_input(candidate, stage, extra=extra)) == original_hash
+                for candidate in candidates
+            ):
+                break
+        else:
+            raise IdeaSkillUnavailable("codex_operation_identity_conflict")
+        try:
+            output, session, _ = _read_completed_operation(
+                directory,
+                invocation_hash=canonical_hash(invocation),
+                native_session_ref=request.native_session_ref,
+                transport_limits=limits,
+            )
+        except IdeaSkillUnavailable as error:
+            if error.code not in _SEALED_TRANSPORT_CONTRACT_FAILURES:
+                raise
+            raise self._sealed_transport_contract_failure(
+                directory=directory,
+                job_ref=request.job_ref,
+                operation_name=operation_name,
+                native_session_ref=request.native_session_ref,
+            ) from error
+        try:
+            decoded = _decode_codex_provider_output(
+                _unwrap_codex_root_output(output, schema), schema
+            )
+        except IdeaSkillUnavailable as error:
+            if error.code != "codex_json_object_transport_invalid":
+                raise
+            decoded = {_CODEX_TRANSPORT_DECODE_FAILURE_KEY: error.code}
+        return decoded, session, invocation
 
     @resource_preparation
     def finalize_draft(
