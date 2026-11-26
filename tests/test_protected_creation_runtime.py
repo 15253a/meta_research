@@ -887,3 +887,77 @@ def test_untrusted_control_directory_never_launches(runtime, tmp_path):
     with pytest.raises(ProtectedCreationError, match="protected_creation_jail_unrecognized"):
         protected.run(_call("print('must not launch')"))
     assert not protected.jail_root.exists()
+
+
+def test_prepare_runtime_resolves_node_from_path_when_standard_paths_absent(runtime, tmp_path, monkeypatch):
+    host_node = runtime_module._resolve_node_executable()
+    assert host_node is not None
+
+    relative_dir = tmp_path / "relative-bin"
+    relative_dir.mkdir()
+    for candidate in (tmp_path / "node", relative_dir / "node"):
+        candidate.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        candidate.chmod(0o755)
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_module, "_STANDARD_NODE_PATHS", ())
+        patch.chdir(tmp_path)
+        patch.setenv("PATH", f".{os.pathsep}relative-bin")
+        assert runtime_module._resolve_node_executable() is None
+
+    untrusted_dir = tmp_path / "untrusted-bin"
+    untrusted_dir.mkdir()
+    untrusted_node = untrusted_dir / "node"
+    untrusted_node.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    untrusted_node.chmod(0o777)
+    untrusted_protected = ProtectedCreationRuntime(
+        tmp_path / "untrusted-jail", Path("/bin/bash"), runtime.credentials_home
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_module, "_STANDARD_NODE_PATHS", ())
+        patch.setenv("PATH", f"{untrusted_dir}{os.pathsep}{host_node.parent}")
+        with pytest.raises(ProtectedCreationError, match="protected_creation_runtime_untrusted"):
+            untrusted_protected.run(_call("print('must not launch')"))
+    assert not untrusted_protected.jail_root.exists()
+
+    path_protected = ProtectedCreationRuntime(
+        tmp_path / "path-jail", Path("/bin/bash"), runtime.credentials_home
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_module, "_STANDARD_NODE_PATHS", ())
+        patch.setenv("PATH", str(host_node.parent))
+        completed = path_protected.run(
+            _call('import subprocess; print(subprocess.check_output(["/bin/node", "-e", "console.log(42)"], text=True).strip())')
+        )
+    assert completed.returncode == 0
+    assert completed.stdout == "42\n"
+    assert path_protected.request_stop()["descendants_ended"] is True
+
+
+def test_failed_runtime_staging_cleans_partial_jail_for_retry(runtime, tmp_path, monkeypatch):
+    host_node = runtime_module._resolve_node_executable()
+    assert host_node is not None
+
+    protected = ProtectedCreationRuntime(
+        tmp_path / "retry-jail", Path("/bin/bash"), runtime.credentials_home
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_module, "_STANDARD_NODE_PATHS", ())
+        patch.setenv("PATH", "")
+        with pytest.raises(ProtectedCreationError, match="protected_creation_dependency_unavailable"):
+            protected.run(_call("print('must not launch')"))
+    assert not protected.jail_root.exists()
+
+    completed = protected.run(_call("print('retried cleanly')"))
+    assert completed.returncode == 0
+    assert completed.stdout == "retried cleanly\n"
+    assert protected.request_stop()["descendants_ended"] is True
+
+    preexisting = tmp_path / "preexisting-jail"
+    (preexisting / "sentinel").mkdir(parents=True)
+    (preexisting / "sentinel" / "keep.txt").write_text("keep", encoding="utf-8")
+    blocked = ProtectedCreationRuntime(
+        preexisting, Path("/bin/bash"), runtime.credentials_home
+    )
+    with pytest.raises(ProtectedCreationError, match="protected_creation_jail_unrecognized"):
+        blocked.run(_call("print('must not launch')"))
+    assert (preexisting / "sentinel" / "keep.txt").read_text(encoding="utf-8") == "keep"
