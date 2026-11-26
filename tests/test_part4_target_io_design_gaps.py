@@ -2175,20 +2175,20 @@ def test_acquisition_root_targetless_preflight_and_oa_then_institution_policy(
 ) -> None:
     runner = _AcqSequenceRunner([{
         "status": "unavailable",
-        "browser_context_ref": None,
+        "browser_context_ref": "ctx-synonym-1",
         "reason_code": "no_paper_targets",
         "evidence": {
             "configuration_health": "ok",
-            "browser_control": "skipped",
-            "authorized_resource": "no_targets",
+            "browser_control": "connected",
+            "authorized_resource": "verified",
             "extra_diagnostic": "allowed",
         },
     }])
     adapter = CodexAcquisitionRootAdapter(
         tmp_path / "acq-synonym", _AcquisitionDelegate(), executable=str(_acq_fake_codex(tmp_path / "codex")), process_runner=runner
     )
-    res = adapter.preflight(AcquisitionPreflightRequest("s1", "init1", 1, "a" * 64, "oa_only", "", str(tmp_path / "priv")))
-    assert res.status == "ready"
+    res = adapter.preflight(AcquisitionPreflightRequest("s1", "init1", 1, "a" * 64, "oa_then_institution", "https://lib.example", str(tmp_path / "priv")))
+    assert res.status == "ready" and res.browser_context_ref == "ctx-synonym-1"
     assert "oa_then_institution" in runner.prompts[0]
     assert "preflight" in runner.prompts[0] and (
         "无需论文列表" in runner.prompts[0] or "无论文列表" in runner.prompts[0] or "目标论文" in runner.prompts[0]
@@ -2224,15 +2224,15 @@ def test_acquisition_root_targetless_preflight_and_oa_then_institution_policy(
 
     runner_site_missing = _AcqSequenceRunner([{
         "status": "unavailable",
-        "browser_context_ref": None,
+        "browser_context_ref": "ctx-site-missing",
         "reason_code": "target_site_missing",
-        "evidence": {"configuration_health": "ok", "browser_control": "skipped", "authorized_resource": "no_targets"},
+        "evidence": {"configuration_health": "ok", "browser_control": "connected", "authorized_resource": "verified"},
     }])
     adapter_site_missing = CodexAcquisitionRootAdapter(
         tmp_path / "acq-site-missing", _AcquisitionDelegate(), executable=str(_acq_fake_codex(tmp_path / "codex-site")), process_runner=runner_site_missing
     )
     res_site_missing = adapter_site_missing.preflight(
-        AcquisitionPreflightRequest("s4", "init4", 1, "a" * 64, "oa_only", "", str(tmp_path / "priv4"))
+        AcquisitionPreflightRequest("s4", "init4", 1, "a" * 64, "oa_then_institution", "https://lib.example", str(tmp_path / "priv4"))
     )
     assert res_site_missing.status == "unavailable" and res_site_missing.reason_code == "target_site_missing"
 
@@ -2280,14 +2280,36 @@ def test_acquisition_root_targetless_preflight_and_oa_then_institution_policy(
 
     runner_no_errors = _AcqSequenceRunner([{
         "status": "unavailable",
-        "browser_context_ref": None,
+        "browser_context_ref": "ctx-no-errors",
         "reason_code": "no_targets",
-        "evidence": {"configuration_health": "no_errors", "browser_control": "skipped", "authorized_resource": "no_targets"},
+        "evidence": {"configuration_health": "no_errors", "browser_control": "connected", "authorized_resource": "verified"},
     }])
     adapter_no_errors = CodexAcquisitionRootAdapter(
         tmp_path / "acq-no-errors", _AcquisitionDelegate(), executable=str(_acq_fake_codex(tmp_path / "codex-ne")), process_runner=runner_no_errors
     )
     res_no_errors = adapter_no_errors.preflight(
-        AcquisitionPreflightRequest("s8", "init8", 1, "a" * 64, "oa_only", "", str(tmp_path / "priv8"))
+        AcquisitionPreflightRequest("s8", "init8", 1, "a" * 64, "oa_then_institution", "https://lib.example", str(tmp_path / "priv8"))
     )
-    assert res_no_errors.status == "ready"
+    assert res_no_errors.status == "ready" and res_no_errors.browser_context_ref == "ctx-no-errors"
+
+    for fast_mode in ("oa_only", "provided_only"):
+        runner_fast = _AcqSequenceRunner([])
+        adapter_fast = CodexAcquisitionRootAdapter(
+            tmp_path / f"acq-fast-{fast_mode}",
+            _AcquisitionDelegate(),
+            executable=str(_acq_fake_codex(tmp_path / f"codex-fast-{fast_mode}")),
+            process_runner=runner_fast,
+        )
+        res_fast = adapter_fast.preflight(
+            AcquisitionPreflightRequest(
+                f"s-fast-{fast_mode}",
+                "init-fast",
+                1,
+                "a" * 64,
+                fast_mode,
+                "",
+                str(tmp_path / f"priv-fast-{fast_mode}"),
+            )
+        )
+        assert res_fast.status == "ready" and res_fast.browser_context_ref is None
+        assert runner_fast.prompts == []

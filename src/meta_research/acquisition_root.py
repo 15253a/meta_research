@@ -193,6 +193,10 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
     ) -> AcquisitionPreflightResult:
         if type(request.generation) is not int or request.generation < 1:
             raise AcquisitionUnavailable("acquisition_preflight_generation_invalid")
+        if request.mode in {"oa_only", "provided_only"}:
+            return validate_preflight_result(
+                request, self._delegate.preflight(request)
+            )
         schema = {
             "type": "object", "additionalProperties": False,
             "properties": {
@@ -219,28 +223,12 @@ class CodexAcquisitionRootAdapter(AcquisitionProvider):
             result = AcquisitionPreflightResult(**raw)
         except TypeError as error:
             raise AcquisitionUnavailable("acquisition_root_result_invalid") from error
-        # Session preflight runs before DeepFetch has emitted its first
-        # acquisition effect.  OA-only and provided-only sessions therefore
-        # have no paper targets yet.  A native root may still apply its
-        # batch-level checklist and report that absence as unavailable.  Keep
-        # target identity validation at the batch boundary, where
-        # ``validate_batch_request`` already requires non-empty papers.
+        # ``oa_only`` and ``provided_only`` already returned via deterministic
+        # delegate preflight above.  ``oa_then_institution`` retains native
+        # Codex preflight (browser and institutional login checks) and accepts
+        # targetless preflight when institutional evidence and browser context
+        # are verified; ``validate_batch_request`` enforces targets per batch.
         if (
-            request.mode in {"oa_only", "provided_only"}
-            and result.status == "unavailable"
-            and _is_targetless_preflight_reason(result.reason_code)
-            and _configuration_health_ready(result.evidence)
-        ):
-            result = AcquisitionPreflightResult(
-                status="ready",
-                browser_context_ref=None,
-                reason_code=None,
-                evidence={
-                    **result.evidence,
-                    "targetless_session_preflight": "accepted",
-                },
-            )
-        elif (
             request.mode == "oa_then_institution"
             and result.status == "unavailable"
             and _is_targetless_preflight_reason(result.reason_code)

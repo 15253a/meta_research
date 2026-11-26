@@ -32,12 +32,12 @@ def changed_config(runtime, tmp_path):
 
 def test_public_acquisition_preflight_before_quest_gets_external_context(tmp_path):
     external = configured(tmp_path)
-    runner = _SequenceRunner([{"status": "ready", "browser_context_ref": None, "reason_code": None, "evidence": {"configuration_health": "not_required", "browser_control": "not_required", "authorized_resource": "oa_only"}}])
+    runner = _SequenceRunner([{"status": "ready", "browser_context_ref": "ctx-ext-1", "reason_code": None, "evidence": {"configuration_health": "ready", "browser_control": "functional", "authorized_resource": "verified"}}])
     adapter = CodexAcquisitionRootAdapter(tmp_path / "acquisition", _AcquisitionDelegate(),
         executable=str(_fake_codex(tmp_path / "fake-acquisition")), process_runner=runner)
     adapter.bind_external_mcp(external)
     from meta_research.acquisition import AcquisitionPreflightRequest
-    result = adapter.preflight(AcquisitionPreflightRequest("acquisition-before-quest", "initialization1", 1, "9" * 64, "oa_only", "", str(tmp_path / "private")))
+    result = adapter.preflight(AcquisitionPreflightRequest("acquisition-before-quest", "initialization1", 1, "9" * 64, "oa_then_institution", "https://library.example/login", str(tmp_path / "private")))
     assert result.status == "ready"
     assert "META_RESEARCH_EXTERNAL_MCP_TOKEN" in runner.environments[0]
     assert "Use chamber A for this experiment." in runner.prompts[0]
