@@ -20,22 +20,25 @@ SUPPORTED_CODEX_MODEL_REFS = (
 RESEARCH_STAGES = ("idea", "plan", "bundle", "target", "reasoning")
 DEFAULT_STAGE_MODEL = "gpt-6.1-sol"
 _ENV_CODEX_MODEL = os.environ.get("META_RESEARCH_CODEX_MODEL")
-CODEX_MODEL_REF = _ENV_CODEX_MODEL or "gpt-6.1-sol"
+CODEX_MODEL_REF = _ENV_CODEX_MODEL or DEFAULT_STAGE_MODEL
 if CODEX_MODEL_REF not in SUPPORTED_CODEX_MODEL_REFS:
     raise ValueError(
         "META_RESEARCH_CODEX_MODEL must be one of " + ", ".join(SUPPORTED_CODEX_MODEL_REFS)
     )
-DEFAULT_STAGE_MODELS: dict[str, str] = (
-    {stage: CODEX_MODEL_REF for stage in RESEARCH_STAGES}
-    if _ENV_CODEX_MODEL
-    else {
-        "idea": "gpt-6.2-astra",
-        "plan": DEFAULT_STAGE_MODEL,
-        "bundle": DEFAULT_STAGE_MODEL,
-        "target": DEFAULT_STAGE_MODEL,
-        "reasoning": "gpt-6.2-astra",
-    }
-)
+_ENV_DEFAULT_STAGE_MODEL = os.environ.get("META_RESEARCH_DEFAULT_STAGE_MODEL")
+_NON_ASTRA_STAGE_MODEL = _ENV_DEFAULT_STAGE_MODEL or CODEX_MODEL_REF
+if _NON_ASTRA_STAGE_MODEL not in SUPPORTED_CODEX_MODEL_REFS:
+    raise ValueError(
+        "META_RESEARCH_DEFAULT_STAGE_MODEL must be one of "
+        + ", ".join(SUPPORTED_CODEX_MODEL_REFS)
+    )
+DEFAULT_STAGE_MODELS: dict[str, str] = {
+    "idea": "gpt-6.2-astra",
+    "plan": _NON_ASTRA_STAGE_MODEL,
+    "bundle": _NON_ASTRA_STAGE_MODEL,
+    "target": _NON_ASTRA_STAGE_MODEL,
+    "reasoning": "gpt-6.2-astra",
+}
 if set(DEFAULT_STAGE_MODELS) != set(RESEARCH_STAGES) or any(
     model not in SUPPORTED_CODEX_MODEL_REFS for model in DEFAULT_STAGE_MODELS.values()
 ):

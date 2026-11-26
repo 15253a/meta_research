@@ -126,13 +126,21 @@ def test_unknown_deployment_model_fails_before_provider_execution():
     assert "META_RESEARCH_CODEX_MODEL must be" in result.stderr
 
 
-def test_stage_models_follow_explicit_codex_model_override():
-    def read_stage_models(model: str | None) -> dict[str, object]:
+def test_stage_models_keep_idea_and_reasoning_on_astra_while_other_stages_follow_override():
+    def read_stage_models(
+        model: str | None = None,
+        stage_model: str | None = None,
+        *,
+        expect_ok: bool = True,
+    ) -> dict[str, object] | subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["PYTHONPATH"] = str(SOURCE)
         environment.pop("META_RESEARCH_CODEX_MODEL", None)
+        environment.pop("META_RESEARCH_DEFAULT_STAGE_MODEL", None)
         if model is not None:
             environment["META_RESEARCH_CODEX_MODEL"] = model
+        if stage_model is not None:
+            environment["META_RESEARCH_DEFAULT_STAGE_MODEL"] = stage_model
         proc = subprocess.run(
             [
                 sys.executable,
@@ -145,10 +153,13 @@ def test_stage_models_follow_explicit_codex_model_override():
             text=True,
             timeout=30,
         )
+        if not expect_ok:
+            return proc
         assert proc.returncode == 0, proc.stderr
         return json.loads(proc.stdout)
 
-    default_state = read_stage_models(None)
+    default_state = read_stage_models()
+    assert isinstance(default_state, dict)
     assert default_state["model"] == "gpt-6.1-sol"
     assert default_state["stages"] == {
         "idea": "gpt-6.2-astra",
@@ -158,12 +169,29 @@ def test_stage_models_follow_explicit_codex_model_override():
         "reasoning": "gpt-6.2-astra",
     }
 
-    overridden_state = read_stage_models("gpt-6-astra")
-    assert overridden_state["model"] == "gpt-6-astra"
-    assert overridden_state["stages"] == {
-        "idea": "gpt-6-astra",
+    sol_override = read_stage_models(model="gpt-6.2-sol")
+    assert isinstance(sol_override, dict)
+    assert sol_override["model"] == "gpt-6.2-sol"
+    assert sol_override["stages"] == {
+        "idea": "gpt-6.2-astra",
+        "plan": "gpt-6.2-sol",
+        "bundle": "gpt-6.2-sol",
+        "target": "gpt-6.2-sol",
+        "reasoning": "gpt-6.2-astra",
+    }
+
+    stage_override = read_stage_models(model="gpt-6.2-sol", stage_model="gpt-6-astra")
+    assert isinstance(stage_override, dict)
+    assert stage_override["model"] == "gpt-6.2-sol"
+    assert stage_override["stages"] == {
+        "idea": "gpt-6.2-astra",
         "plan": "gpt-6-astra",
         "bundle": "gpt-6-astra",
         "target": "gpt-6-astra",
-        "reasoning": "gpt-6-astra",
+        "reasoning": "gpt-6.2-astra",
     }
+
+    bad_stage = read_stage_models(stage_model="unknown-stage-model", expect_ok=False)
+    assert isinstance(bad_stage, subprocess.CompletedProcess)
+    assert bad_stage.returncode != 0
+    assert "META_RESEARCH_DEFAULT_STAGE_MODEL must be" in bad_stage.stderr
