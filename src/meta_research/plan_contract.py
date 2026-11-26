@@ -70,12 +70,23 @@ def validate_plan_context_pack(
             "evidence_reference_revision",
         } | ({"evidence_catalog_page"} if "evidence_catalog_page" in context_pack else set())
           | ({"cycle_position"} if "cycle_position" in context_pack else set())
+          | ({"creation_basis"} if "creation_basis" in context_pack else set())
           | ({"prior_accepted_bindings"} if "prior_accepted_bindings" in context_pack else set())
           | ({"goal_revision_ref", "quest_goal_revision"}
              if "goal_revision_ref" in context_pack and "quest_goal_revision" in context_pack
              else set()),
         "plan_context_pack_invalid",
     )
+    if "creation_basis" in context_pack:
+        creation = context_pack["creation_basis"]
+        if (
+            not isinstance(creation, dict)
+            or set(creation) != {"basis_ref", "basis_hash", "kind"}
+            or not _text(creation.get("basis_ref"))
+            or creation.get("kind") not in {"prepared", "literature_revised"}
+        ):
+            raise PlanContractError("plan_context_pack_invalid")
+        _sha256(creation.get("basis_hash"), "plan_context_pack_invalid")
     if "goal_revision_ref" in context_pack or "quest_goal_revision" in context_pack:
         from meta_research.quest_goal import validate_stage_quest_goal_binding
         expected_quest_ref = (

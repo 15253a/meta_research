@@ -1,11 +1,13 @@
 import hashlib
 import os
+import shutil
+import subprocess
+import sys
 
 from tool_catalog_helpers import catalog_operations
 from fastapi.testclient import TestClient
 import pytest
 
-from meta_research.protected_creation_runtime import NativeCreationCall
 from meta_research.owners.common import OwnerConflict
 from meta_research.semantic_mcp import MCP_PROTOCOL_VERSION
 from meta_research.work_material_contract import CREATION_MATERIAL_OPERATION_IDS
@@ -14,11 +16,17 @@ from test_creation_material_consumption import _call, _open, _value
 from test_root_workspace import _make
 
 
-pytestmark = pytest.mark.skipif(os.name != "posix" or os.geteuid() != 0, reason="requires actual chroot boundary")
-
-
 def _native(work, script):
-    return work.run(NativeCreationCall(("/bin/bash", "-c", script), "", 30, {}, (), ()))
+    completed = subprocess.run(
+        ["/bin/bash", "-c", script],
+        cwd=str(work.binding.directory),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if completed.returncode == 0:
+        work.completed_handoff()
+    return completed
 
 
 def test_requested_copy_is_independent_bounded_and_replay_preserves_edits(tmp_path):
@@ -33,12 +41,13 @@ def test_requested_copy_is_independent_bounded_and_replay_preserves_edits(tmp_pa
         with TestClient(create_app(runtime, base_url="http://testserver", control_key="control")) as client:
             anchor, binding, reference = _open(client, runtime, source, "copy-open")
             human, roots = runtime.owners.human_collaboration, runtime.root_workspaces
-            roots.configure_creation_runtime(executable="/bin/bash", credentials_home=tmp_path / "credentials")
             gateway = runtime.harnesses._gateway
             work = roots.protected_creation(binding, human.creation_material_snapshot(anchor), operation_ref="native-copy")
+            assert work.runtime is None
+            assert work.execution_binding["runtime_contract"] == "host-direct-v1"
             with pytest.raises(OwnerConflict, match="protected_creation_unknown_outcome"):
                 work.seal()
-            assert _native(work, "echo ready").returncode == 0
+            work.completed_handoff()
             access = work.channel()
             mcp_headers = {"Authorization": "Bearer " + access.token, "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
                            "Accept": "application/json, text/event-stream"}
@@ -57,9 +66,13 @@ def test_requested_copy_is_independent_bounded_and_replay_preserves_edits(tmp_pa
             receipt = _value(_call(gateway, connection, CREATION_MATERIAL_OPERATION_IDS[2], **args))
             assert receipt["sha256"] == hashlib.sha256(content).hexdigest()
             copied = work.work_directory / receipt["work_file"]["path"]
+            assert receipt["working_path"] == str(copied)
+            assert not receipt["working_path"].startswith("/workspace/")
             assert copied.stat().st_ino != (source / "trial.py").stat().st_ino
             assert copied.stat().st_nlink == 1
-            assert _native(work, f"echo 'print(5 * 5)' > {receipt['working_path']}; python {receipt['working_path']}").stdout.strip() == "25"
+            copied.write_bytes(b"print(5 * 5)\n")
+            completed = subprocess.run([sys.executable, receipt["working_path"]], check=True, capture_output=True, text=True)
+            assert completed.stdout.strip() == "25"
             assert _value(_call(gateway, connection, CREATION_MATERIAL_OPERATION_IDS[2], **args)) == receipt
             assert copied.read_bytes() == b"print(5 * 5)\n"
             assert _value(_call(gateway, connection, CREATION_MATERIAL_OPERATION_IDS[3], effect_id="copy-trial")) == receipt
@@ -87,10 +100,11 @@ def test_native_symlink_cannot_redirect_trusted_copy_to_original(tmp_path):
         with TestClient(create_app(runtime, base_url="http://testserver", control_key="control")) as client:
             anchor, binding, reference = _open(client, runtime, source, "symlink-open")
             human, roots = runtime.owners.human_collaboration, runtime.root_workspaces
-            roots.configure_creation_runtime(executable="/bin/bash", credentials_home=tmp_path / "credentials")
             gateway = runtime.harnesses._gateway
             work = roots.protected_creation(binding, human.creation_material_snapshot(anchor), operation_ref="symlink-copy")
-            assert _native(work, f"ln -s {tmp_path} /workspace/operations").returncode == 0
+            operations_dir = work.work_directory.parent
+            shutil.rmtree(operations_dir)
+            os.symlink(tmp_path, operations_dir)
             access = work.channel()
             class Connection:
                 token = access.token

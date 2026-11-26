@@ -174,6 +174,8 @@ def validate_bundle_context_pack(
     }
     if "goal_revision_ref" in context_pack or "quest_goal_revision" in context_pack:
         expected_keys.update({"goal_revision_ref", "quest_goal_revision"})
+    if "creation_basis" in context_pack:
+        expected_keys.add("creation_basis")
     if schema_ref == BUNDLE_SUCCESSOR_CONTEXT_PACK_SCHEMA_REF:
         expected_keys.add("accepted_idea_set_binding")
     _exact_keys(
@@ -181,6 +183,22 @@ def validate_bundle_context_pack(
         expected_keys,
         "bundle_context_pack_invalid",
     )
+    if "creation_basis" in context_pack:
+        creation = context_pack["creation_basis"]
+        if (
+            not isinstance(creation, dict)
+            or set(creation) != {"basis_ref", "basis_hash", "kind"}
+            or not _text(creation.get("basis_ref"))
+            or creation.get("kind") not in {"prepared", "literature_revised"}
+        ):
+            raise BundleContractError("bundle_context_pack_invalid")
+        basis_hash = creation.get("basis_hash")
+        if (
+            not isinstance(basis_hash, str)
+            or len(basis_hash) != 64
+            or any(ch not in "0123456789abcdef" for ch in basis_hash)
+        ):
+            raise BundleContractError("bundle_context_pack_invalid")
     if "goal_revision_ref" in context_pack or "quest_goal_revision" in context_pack:
         from meta_research.quest_goal import validate_stage_quest_goal_binding
         expected_quest_ref = (

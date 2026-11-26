@@ -144,7 +144,7 @@ def _existing_custody(home: Path, receipt: Path, identity: dict[str, str]) -> bo
 
 def ensure_companion_native_handoff(adapter, binding, native: str) -> None:
     roots = adapter._workspaces
-    if roots is None or roots._creation_runtime_configuration is None:
+    if roots is None:
         return
     location = binding.location
     if location.root_kind != "companion" or location.quest_ref is None:
@@ -172,15 +172,25 @@ def ensure_companion_native_handoff(adapter, binding, native: str) -> None:
         operations = connection.execute(text("SELECT workspace_ref,anchor_json,state FROM hc_creation_material_operations "
             "WHERE root_session_ref=:root"), {"root": preparation.session_ref}).all()
     if not operations:
-        return  # A creation that never used a protected runtime already used this home.
+        return  # A creation that never used creation material operations already used this home.
     prepared = roots._initialization_location(facts["initialization_id"], preparation.session_ref)
-    if (_NATIVE.fullmatch(native) is None or any(row.workspace_ref != prepared.workspace_ref
+    if any(row.workspace_ref != prepared.workspace_ref
             or json.loads(row.anchor_json).get("kind") != "quest_initialization"
             or json.loads(row.anchor_json).get("ref") != facts["initialization_id"]
-            for row in operations)):
+            for row in operations):
         raise OwnerConflict("companion_native_handoff_scope_invalid")
     if any(row.state not in {"sealed", "failed"} for row in operations):
         raise OwnerConflict("companion_native_handoff_unsealed")
+    identity = canonical_hash({"workspace_ref": prepared.workspace_ref, "root_session_ref": preparation.session_ref})
+    legacy_jail = roots._bases["companion"] / ".protected" / identity
+    if not legacy_jail.exists() and not legacy_jail.is_symlink():
+        # Host-direct creation (host-direct-v1) writes rollouts directly to the
+        # active account CODEX_HOME; no chroot rollout transfer is needed.
+        return
+    if _NATIVE.fullmatch(native) is None:
+        raise OwnerConflict("companion_native_handoff_scope_invalid")
+    if roots._creation_runtime_configuration is None:
+        return
     executable, active_home = roots._creation_runtime_configuration
     runner_home = getattr(adapter._runner, "_protected_environment", {}).get("CODEX_HOME")
     if runner_home is None or Path(runner_home).absolute() != active_home:
@@ -192,8 +202,7 @@ def ensure_companion_native_handoff(adapter, binding, native: str) -> None:
     receipt = Path("native-handoffs") / (canonical_hash({"native_session_ref": native}) + ".json")
     if _existing_custody(active_home, receipt, custody_identity):
         return
-    identity = canonical_hash({"workspace_ref": prepared.workspace_ref, "root_session_ref": preparation.session_ref})
-    runtime = ProtectedCreationRuntime(roots._bases["companion"] / ".protected" / identity, executable, active_home)
+    runtime = ProtectedCreationRuntime(legacy_jail, executable, active_home)
     with runtime.exclusive_sealed_work():
         source_home = runtime.jail_root / "home/creation/.codex"
         sources = _matching_rollouts(source_home, native)

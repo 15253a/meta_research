@@ -878,7 +878,15 @@ class PlanStageWorker:
 
     def _context_pack(self, eligible: _EligiblePlan) -> dict[str, object]:
         current = eligible.current
-        return {
+        creation_bases = getattr(self._research_memory, "creation_bases", None)
+        basis = (
+            creation_bases.for_question(
+                current.question.question_ref, current.question.quest_ref
+            )
+            if creation_bases is not None
+            else None
+        )
+        pack: dict[str, object] = {
             "schema_ref": PLAN_CONTEXT_PACK_SCHEMA_REF,
             "cycle_ref": current.cycle_ref,
             "cycle_position": self._advancement_engine.query_cycle_position(current.cycle_ref),
@@ -887,6 +895,9 @@ class PlanStageWorker:
             "evidence_catalog": [],
             "evidence_reference_revision": 0,
         }
+        if basis is not None:
+            pack["creation_basis"] = creation_bases.reference(basis)
+        return pack
 
     def _assert_request_eligibility(
         self, request: StageRunRequest, eligible: _EligiblePlan

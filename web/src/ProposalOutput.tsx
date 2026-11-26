@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { proposalActivities } from "./proposalActivity";
+import { proposalStreamState } from "./proposalActivity";
 import { useSmoothFollowScroll } from "./useSmoothFollowScroll";
 
 type Page = {
@@ -11,7 +11,38 @@ type Page = {
   source_bytes: number;
   has_more: boolean;
   phase?: "understanding" | "drafting" | null;
+  started_at?: number | string | null;
+  last_event_at?: number | string | null;
 };
+
+function parseTimestampMs(value: number | string | null | undefined): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value < 1e12 ? value * 1000 : value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      return numeric < 1e12 ? numeric * 1000 : numeric;
+    }
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function formatDuration(seconds: number): string {
+  const safe = Math.max(0, Math.floor(seconds));
+  const mins = Math.floor(safe / 60);
+  const secs = safe % 60;
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
+function formatClock(ms: number): string {
+  const date = new Date(ms);
+  return [date.getHours(), date.getMinutes(), date.getSeconds()]
+    .map(part => String(part).padStart(2, "0"))
+    .join(":");
+}
 
 export function ProposalOutput({ initializationId, generationRef, status, enabled = true, onPhase, preparation = false, preparationRequestRef, preparationNeedsReview = false }: {
   initializationId: string; generationRef: string; status: string; enabled?: boolean;
@@ -25,13 +56,21 @@ export function ProposalOutput({ initializationId, generationRef, status, enable
   const [error, setError] = useState(false);
   const [retry, setRetry] = useState(0);
   const [visible, setVisible] = useState(document.visibilityState !== "hidden");
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const log = useRef<HTMLDivElement>(null);
-  const streamRef = useRef({ streamKey, offset: 0, text: "" });
-  const seenKeysRef = useRef<{ streamKey: string; hydrated: boolean; seen: Set<string>; entering: Set<string> }>({
+  const streamRef = useRef({ streamKey, offset: 0, text: "", clientStartedAtMs: Date.now(), clientLastEventMs: null as number | null });
+  const seenKeysRef = useRef<{
+    streamKey: string;
+    hydrated: boolean;
+    seen: Set<string>;
+    entering: Set<string>;
+    timestamps: Map<string, string>;
+  }>({
     streamKey,
     hydrated: false,
     seen: new Set(),
     entering: new Set(),
+    timestamps: new Map(),
   });
 
   useEffect(() => {
@@ -42,8 +81,20 @@ export function ProposalOutput({ initializationId, generationRef, status, enable
 
   useEffect(() => {
     if (streamRef.current.streamKey !== streamKey) {
-      streamRef.current = { streamKey, offset: 0, text: "" };
-      seenKeysRef.current = { streamKey, hydrated: false, seen: new Set(), entering: new Set() };
+      streamRef.current = {
+        streamKey,
+        offset: 0,
+        text: "",
+        clientStartedAtMs: Date.now(),
+        clientLastEventMs: null,
+      };
+      seenKeysRef.current = {
+        streamKey,
+        hydrated: false,
+        seen: new Set(),
+        entering: new Set(),
+        timestamps: new Map(),
+      };
       setPage(null);
       setError(false);
     }
@@ -65,26 +116,32 @@ export function ProposalOutput({ initializationId, generationRef, status, enable
         const next: Page = await response.json();
         if (controller.signal.aborted) return;
         if (next.generation_ref !== generationRef || next.next_offset < currentOffset) throw new Error("stale");
+        const receivedNewBytes = next.text.length > 0;
         const combinedText = (streamRef.current.text + next.text).slice(-1024 * 1024);
         streamRef.current.text = combinedText;
         streamRef.current.offset = next.next_offset;
+        if (receivedNewBytes) {
+          streamRef.current.clientLastEventMs = Date.now();
+        }
         setPage(previous => (
           previous &&
           previous.text === combinedText &&
           previous.status === next.status &&
           previous.phase === next.phase &&
-          previous.has_more === next.has_more
+          previous.has_more === next.has_more &&
+          previous.started_at === next.started_at &&
+          previous.last_event_at === next.last_event_at
             ? previous
             : { ...next, text: combinedText }
         ));
         setError(false);
         if (next.has_more || ["queued", "running"].includes(next.status)) {
-          timer = setTimeout(poll, next.has_more ? 50 : 2000);
+          timer = setTimeout(poll, next.has_more ? 50 : 500);
         }
       } catch {
         if (!controller.signal.aborted) {
           setError(true);
-          timer = setTimeout(poll, 3000);
+          timer = setTimeout(poll, 2000);
         }
       }
     }
@@ -92,21 +149,49 @@ export function ProposalOutput({ initializationId, generationRef, status, enable
     return () => { controller.abort(); clearTimeout(timer); };
   }, [initializationId, generationRef, status, enabled, visible, retry, preparation, preparationRequestRef, streamKey]);
 
-  const activities = useMemo(() => proposalActivities(page?.text ?? ""), [page?.text]);
+  const streamState = useMemo(() => proposalStreamState(page?.text ?? ""), [page?.text]);
+  const activities = streamState.activities;
+  const reconnecting = streamState.reconnecting;
+
+  const currentStatus = page?.status ?? status;
+  const label = ({ queued: "排队中", running: "运行中", succeeded: "已完成", failed: "已失败", cancelled: "已取消" } as Record<string, string>)[currentStatus] ?? currentStatus;
+  const active = ["queued", "running"].includes(currentStatus);
+
+  useEffect(() => {
+    if (!active || !enabled || !visible) return;
+    setNowMs(Date.now());
+    const interval = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [active, enabled, visible, streamKey]);
 
   if (seenKeysRef.current.streamKey !== streamKey) {
-    seenKeysRef.current = { streamKey, hydrated: false, seen: new Set(), entering: new Set() };
+    seenKeysRef.current = {
+      streamKey,
+      hydrated: false,
+      seen: new Set(),
+      entering: new Set(),
+      timestamps: new Map(),
+    };
   }
   const tracker = seenKeysRef.current;
   if (page !== null) {
+    const serverEventMs = parseTimestampMs(page.last_event_at);
     if (!tracker.hydrated) {
       for (const item of activities) tracker.seen.add(item.key);
-      tracker.hydrated = true;
+      if (!page.has_more) {
+        if (active && activities.length > 0) {
+          const latest = activities[activities.length - 1];
+          tracker.timestamps.set(latest.key, formatClock(serverEventMs ?? Date.now()));
+        }
+        tracker.hydrated = true;
+      }
     } else {
+      const stamp = formatClock(Date.now());
       for (const item of activities) {
         if (!tracker.seen.has(item.key)) {
           tracker.seen.add(item.key);
           tracker.entering.add(item.key);
+          tracker.timestamps.set(item.key, stamp);
         }
       }
     }
@@ -122,19 +207,34 @@ export function ProposalOutput({ initializationId, generationRef, status, enable
   });
 
   useEffect(() => { onPhase?.(page?.phase ?? null); }, [page?.phase, onPhase]);
-  const currentStatus = page?.status ?? status;
-  const label = ({ queued: "排队中", running: "运行中", succeeded: "已完成", failed: "已失败", cancelled: "已取消" } as Record<string, string>)[currentStatus] ?? currentStatus;
-  const active = ["queued", "running"].includes(currentStatus);
   const statusText = active && page?.phase === "understanding"
     ? "理解资料"
     : active && page?.phase === "drafting"
       ? "起草问题"
       : label;
 
+  const startedAtMs = parseTimestampMs(page?.started_at) ?? streamRef.current.clientStartedAtMs;
+  const elapsedLabel = active ? formatDuration((nowMs - startedAtMs) / 1000) : null;
+  const lastProgressMs = Math.max(
+    parseTimestampMs(page?.last_event_at) ?? 0,
+    streamRef.current.clientLastEventMs ?? 0,
+  ) || null;
+  const freshnessLabel = active && lastProgressMs !== null
+    ? (() => {
+      const ageSec = Math.max(0, Math.floor((nowMs - lastProgressMs) / 1000));
+      return ageSec < 5 ? "刚刚更新" : `${ageSec} 秒前更新`;
+    })()
+    : null;
+
   return <section className={`first-question-activity ${active ? "is-live" : ""}`} data-testid="proposal-output" aria-label="第一问运行活动">
     <header>
       <b><i className={`first-question-live-dot ${active ? "is-live" : ""}`} aria-hidden="true" />最近活动</b>
-      <span>{statusText}</span>
+      <span className="first-question-activity-meta">
+        {active && reconnecting ? <em className="first-question-activity-reconnect">网络重连中（{reconnecting}）</em> : null}
+        {elapsedLabel ? <span>已运行 {elapsedLabel}</span> : null}
+        {freshnessLabel ? <span>{freshnessLabel}</span> : null}
+        <span>{statusText}</span>
+      </span>
     </header>
     {error ? <p className="first-question-activity-error" role="alert">日志连接暂时中断，正在重试。<button type="button" onClick={() => setRetry(value => value + 1)}>重试</button></p> : null}
     <div className="first-question-activity-body">
@@ -148,16 +248,20 @@ export function ProposalOutput({ initializationId, generationRef, status, enable
         aria-atomic="false"
         onScroll={handleScroll}
       >
-        {activities.map((activity, index) => (
-          <div
-            key={activity.key}
-            className={`first-question-activity-row ${activity.status} ${active && index === activities.length - 1 ? "is-latest" : ""}`}
-            data-entering={tracker.entering.has(activity.key) ? "true" : undefined}
-          >
-            <i aria-hidden="true" />
-            <span>{activity.label}</span>
-          </div>
-        ))}
+        {activities.map((activity, index) => {
+          const clock = tracker.timestamps.get(activity.key);
+          return (
+            <div
+              key={activity.key}
+              className={`first-question-activity-row ${activity.status} ${active && index === activities.length - 1 ? "is-latest" : ""}`}
+              data-entering={tracker.entering.has(activity.key) ? "true" : undefined}
+            >
+              <i aria-hidden="true" />
+              {clock ? <time className="first-question-activity-time">{clock}</time> : null}
+              <span>{activity.label}</span>
+            </div>
+          );
+        })}
         {!activities.length ? (
           <p className="first-question-activity-empty">
             {active

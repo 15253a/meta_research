@@ -32,6 +32,7 @@ from meta_research.runtime_conditions import (
 from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_REASONING_EFFORT_BINDING,
+    CODEX_REASONING_SUMMARY_CONFIG,
     codex_root_reasoning_preset_config,
 )
 
@@ -2848,6 +2849,14 @@ class CodexDeepFetchAdapter:
                 "source originals. Read view=literature only for an explicitly retained prior snapshot; "
                 "retain its original identity and do not count it as this request's new acquisition or reading.\n"
             )
+        mounted_refs = request.scope.get("material_references")
+        mounted_note = (
+            f"mounted_material_references={canonical_json(mounted_refs)}\n"
+            "These user-provided server material paths remain persistently accessible read-only on the host "
+            "throughout this Quest even when accepted_material_bindings is empty.\n"
+            if isinstance(mounted_refs, list) and mounted_refs
+            else ""
+        )
         return (
             f"request_ref={request.request_ref}\n"
             f"creation_context_kind={request.creation_context_kind}\n"
@@ -2860,6 +2869,7 @@ class CodexDeepFetchAdapter:
             "is the preference, not authority. Quest identity, creation basis and Cycle identity are independent.\n"
             f"scope={canonical_json(request.scope)}\n"
             f"accepted_material_bindings={canonical_json(list(request.accepted_material_bindings))}\n"
+            + mounted_note
             + (f"provided_materials={canonical_json(materials)}\n"
                "Each path is a verified native copy of this request's exact accepted version. "
                "Use its supplied version/version reader when needed; do not reconstruct binary files from tool pages. "
@@ -3171,6 +3181,8 @@ class CodexDeepFetchAdapter:
                     'approval_policy="never"',
                     "--config",
                     codex_root_reasoning_preset_config(self._model_ref),
+                    "--config",
+                    CODEX_REASONING_SUMMARY_CONFIG,
                     *capability_profile.codex_arguments(output_language=read_output_language(self._workspace)),
                     "--sandbox",
                     self._sandbox_mode,
@@ -3616,6 +3628,8 @@ class CodexDeepFetchAdapter:
             'approval_policy="never"',
             "--config",
             codex_root_reasoning_preset_config(self._model_ref),
+            "--config",
+            CODEX_REASONING_SUMMARY_CONFIG,
             *capability_profile.codex_arguments(output_language=read_output_language(self._workspace)),
             "--sandbox",
             self._sandbox_mode,

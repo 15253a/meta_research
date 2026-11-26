@@ -1131,6 +1131,21 @@ class ManualQuestionCreation:
             scope["inherited_literature"] = prepared_basis.get("inherited_literature", [])
             scope["existing_work_retrieval"] = {field: prepared_basis["understanding"][field]
                 for field in ("claims_and_conditions", "conflicts", "gaps", "unfinished_questions")}
+            mounted_refs = [
+                {
+                    "reference_ref": item["reference_ref"],
+                    "absolute_path": item["source"]["absolute_path"],
+                    "kind": item["source"]["kind"],
+                    **(
+                        {"description": item["description"]}
+                        if isinstance(item.get("description"), str) and item["description"].strip()
+                        else {}
+                    ),
+                }
+                for item in prepared_basis.get("material_references", {}).get("references", [])
+            ]
+            if mounted_refs:
+                scope["material_references"] = mounted_refs
             materials.extend(item["binding"] for item in prepared_basis["sources"] if item["binding"] is not None)
             scope_hash = canonical_hash(scope)
         material_hash = canonical_hash(materials)

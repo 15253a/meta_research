@@ -41,7 +41,7 @@ bound = json.JSONDecoder().raw_decode(prompt.split(marker, 1)[1].lstrip())[0]
 work = Path(bound['execution']['work_directory']); work.mkdir(parents=True, exist_ok=True)
 for guidance in bound['guidance_files'].values():
     assert Path(guidance).read_text()
-previous = len(list(Path('/workspace/operations').glob('*/native-marker.txt')))
+previous = len(list(work.parent.glob('*/native-marker.txt')))
 (work / 'native-marker.txt').write_text(json.dumps({'cwd': os.getcwd(), 'previous_operations': previous}))
 schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema')+1]).read_text())
 if 'proposal_fork_native_session_ref' in schema['properties']:

@@ -73,8 +73,6 @@ def test_recorder_owner_diagnostic_reaches_both_consumers_and_same_frozen_job_co
         runtime.close()
 
 
-@pytest.mark.skipif(os.name != "posix" or os.geteuid() != 0,
-                    reason="requires the actual protected Linux creation runtime")
 def test_creation_grant_corrects_copy_limit_and_reconciles_without_overwriting_work(tmp_path):
     source = tmp_path / "original.txt"
     original = b"Original research observation: 16.\n"
@@ -85,11 +83,10 @@ def test_creation_grant_corrects_copy_limit_and_reconciles_without_overwriting_w
         with TestClient(create_app(runtime, base_url="http://testserver", control_key="control")) as client:
             anchor, binding, reference = _open(client, runtime, source, "diagnostic-creation")
             roots = runtime.root_workspaces
-            roots.configure_creation_runtime(executable="/bin/bash", credentials_home=tmp_path / "credentials")
             work = roots.protected_creation(binding,
                 runtime.owners.human_collaboration.creation_material_snapshot(anchor),
                 operation_ref="creation-diagnostic-operation")
-            assert work.run(NativeCreationCall(("/bin/bash", "-c", "echo ready"), "", 30, {}, (), ())).returncode == 0
+            work.completed_handoff()
             connection = work.channel()
             gateway = runtime.harnesses._gateway
             status, catalog = gateway.dispatch(connection.token, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})

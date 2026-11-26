@@ -409,9 +409,10 @@ def test_native_creation_understands_synthesizes_and_commits_through_owners(tmp_
         assert ready["proposal"]["content"] == QUESTION
         assert [kind for kind, _ in adapter.native_calls] == ["initialization-understanding", "first-question-synthesis"]
         works = [work for _, work in adapter.native_calls]
-        assert works[0].runtime.work_directory == works[1].runtime.work_directory
+        assert works[0].runtime is None and works[1].runtime is None
+        assert works[0].binding.directory == works[1].binding.directory
         assert len(adapter.native_markers) == 2
-        assert all(marker["cwd"] == "/workspace" for marker in adapter.native_markers)
+        assert all(marker["cwd"] == str(works[0].binding.directory) for marker in adapter.native_markers)
         with runtime._database.read() as connection:
             assert connection.execute(text("SELECT count(*) FROM rg_questions")).scalar_one() == 0
         prepared = ready["creation_basis"]

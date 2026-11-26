@@ -503,6 +503,71 @@ class RootWorkspaces:
             raise OwnerConflict("workspace_scope_stale")
         return self.native_directory_prompt(current)
 
+    def _mounted_material_references(self, current: WorkspaceLocation) -> tuple[dict[str, object], ...]:
+        if self._hc is None or getattr(self._hc, "_database", None) is None:
+            return ()
+        quest_ref = current.quest_ref
+        init_id = current.initialization_id
+        from sqlalchemy import text
+        with self._hc._database.read() as connection:
+            if init_id is None and quest_ref is not None:
+                init_id = connection.execute(
+                    text("SELECT initialization_id FROM rg_quests WHERE quest_ref=:q"),
+                    {"q": quest_ref},
+                ).scalar_one_or_none()
+            elif quest_ref is None and init_id is not None:
+                quest_ref = connection.execute(
+                    text("SELECT quest_ref FROM rg_quests WHERE initialization_id=:i"),
+                    {"i": init_id},
+                ).scalar_one_or_none()
+            if quest_ref is None and init_id is None:
+                return ()
+            rows = connection.execute(
+                text(
+                    "SELECT r.reference_ref, r.selection_json, s.command_json, s.anchor_kind "
+                    "FROM hc_work_material_references r "
+                    "JOIN hc_work_material_submissions s USING(submission_ref) "
+                    "WHERE s.state='ready' AND s.anchor_kind IN ('creation','manual','guidance','input','request','acquired') "
+                    "AND ("
+                    "(:quest IS NOT NULL AND ("
+                    "json_extract(s.receiver_json,'$.quest_ref')=:quest OR "
+                    "EXISTS (SELECT 1 FROM json_each(s.receiver_json,'$.roots') root "
+                    "WHERE json_extract(root.value,'$.quest_ref')=:quest)"
+                    ")) OR "
+                    "(:init IS NOT NULL AND ("
+                    "(s.anchor_kind='creation' AND s.anchor_ref=:init) OR "
+                    "(s.anchor_kind IN ('request','acquired') AND ("
+                    "EXISTS (SELECT 1 FROM json_each(s.receiver_json,'$.roots') root "
+                    "WHERE json_extract(root.value,'$.initialization_id')=:init) OR "
+                    "EXISTS (SELECT 1 FROM json_each(s.receiver_json,'$.roots') root "
+                    "JOIN ar_deepfetch_runs dr ON dr.run_ref=json_extract(root.value,'$.work_ref') "
+                    "JOIN hc_deepfetch_requests d ON d.request_ref=dr.request_ref "
+                    "WHERE d.initialization_id=:init)"
+                    "))))"
+                    ") ORDER BY s.created_at ASC, r.ordinal ASC, r.reference_ref ASC"
+                ),
+                {"quest": quest_ref, "init": init_id},
+            ).all()
+        mounted: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for row in rows:
+            if row.reference_ref in seen:
+                continue
+            seen.add(row.reference_ref)
+            selection = json.loads(row.selection_json)
+            command = json.loads(row.command_json)
+            entry: dict[str, object] = {
+                "reference_ref": row.reference_ref,
+                "absolute_path": selection["absolute_path"],
+                "kind": selection["kind"],
+                "access": "read_only",
+            }
+            description = command.get("description")
+            if isinstance(description, str) and description.strip():
+                entry["description"] = description
+            mounted.append(entry)
+        return tuple(mounted)
+
     def native_directory_prompt(self, current: WorkspaceLocation) -> str:
         scope = (
             "For Cycle work, the current and previous two Cycles follow the Quest research sequence; "
@@ -516,14 +581,22 @@ class RootWorkspaces:
             {key: entry[key] for key in fields if entry.get(key) is not None}
             for entry in self._native_directories(current)
         ]
-        return ("\n\nUse native file or shell tools in these work directories. "
-                + scope
-                + "Unlisted paths are not granted and do not imply absent research history; "
-                "use authorized exact readers for relevant historical content. "
-                "Write only in your own read_write directory; other listed work is read-only. "
-                "Do not traverse parent directories, private spools or authority stores. "
-                "Presence does not admit a formal asset. Work directories: "
-                + canonical_json(directories))
+        prompt = ("\n\nUse native file or shell tools in these work directories. "
+                  + scope
+                  + "Unlisted paths are not granted and do not imply absent research history; "
+                  "use authorized exact readers for relevant historical content. "
+                  "Write only in your own read_write directory; other listed work is read-only. "
+                  "Do not traverse parent directories, private spools or authority stores. "
+                  "Presence does not admit a formal asset. Work directories: "
+                  + canonical_json(directories))
+        mounted = self._mounted_material_references(current)
+        if mounted:
+            prompt += (
+                "\nMounted server materials (persistent read-only references, directly accessible on host "
+                "or via research_workspace.materials.*): "
+                + canonical_json(list(mounted))
+            )
+        return prompt
 
     def list_companion_files(self, scope_ref: str, root_session_ref: str, *, offset=0, limit=50):
         """List the requested page for the human-facing Companion file panel."""
