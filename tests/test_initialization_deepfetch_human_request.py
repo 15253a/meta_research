@@ -142,17 +142,13 @@ def test_initialization_acquisition_wait_replay_does_not_advance_or_repeat_effec
     from meta_research.acquisition_root import CodexAcquisitionRootAdapter
     from test_external_root_resident_mcp import _AcquisitionDelegate, _SequenceRunner
 
-    ready = {"status": "ready", "browser_context_ref": None, "reason_code": None,
-             "evidence": {"configuration_health": "ready", "browser_control": "not_required",
-                          "authorized_resource": "provided_only"}}
-
     class Runner(_SequenceRunner):
         runtime = None
         opened = None
         artifact = None
 
         def __call__(self, argv, prompt, timeout, environment=None):
-            if len(self.prompts) == 1:
+            if len(self.prompts) == 0:
                 task = json.loads(next(line.removeprefix("request=") for line in prompt.splitlines()
                                        if line.startswith("request=")))
                 self.artifact = Path(task["target_dir"]) / "already-written.html"
@@ -170,14 +166,14 @@ def test_initialization_acquisition_wait_replay_does_not_advance_or_repeat_effec
                 self.opened = envelope["result"]["structuredContent"]
                 self._outputs = iter([{"results": [{"paper_id": "local-paper", "status": "waiting_user",
                     "path": None, "format": None, "failure": {"code": "local_verifier_needs_repair", "detail": "Waiting for operator repair."}}]}])
-            elif len(self.prompts) == 2:
+            elif len(self.prompts) == 1:
                 assert "resume" in argv
                 assert self.artifact.is_file()
                 self._outputs = iter([{"results": [{"paper_id": "local-paper", "status": "obtained",
                     "path": str(self.artifact), "format": "html", "failure": None}]}])
             return super().__call__(argv, prompt, timeout, environment)
 
-    runner = Runner([ready])
+    runner = Runner([])
     provider = CodexAcquisitionRootAdapter(tmp_path / "provider", _AcquisitionDelegate(),
         executable=str(_fake_codex(tmp_path / "codex")), process_runner=runner)
     runtime = build_production_runtime(prepare_data_root(tmp_path / "data"), acquisition_provider=provider,
@@ -192,6 +188,7 @@ def test_initialization_acquisition_wait_replay_does_not_advance_or_repeat_effec
         session = owner.prepare_acquisition_session(initialization_id=opened["initialization_id"],
             draft_revision=opened["quest_draft"]["revision"],
             config={"mode": "provided_only", "library_entry_url": ""}, provider=provider)
+        assert runner.prompts == []
         request = AcquisitionBatchRequest("local-paper-effect", "oa_first_then_institution",
             (AcquisitionPaper("local-paper", "Exact provided article", None, None, ()),))
         first = owner.acquire_literature(session.session_ref, request, provider)
@@ -203,7 +200,7 @@ def test_initialization_acquisition_wait_replay_does_not_advance_or_repeat_effec
         repeated = owner.acquire_literature(session.session_ref, request, provider)
         assert repeated == first
         assert owner.query_managed_run(request.request_id) == prior_control
-        assert len(runner.prompts) == 2
+        assert len(runner.prompts) == 1
         assert provider._latest_native_session_ref(session.session_ref) == prior_native
         assert (runner.artifact.read_bytes(), runner.artifact.stat().st_mtime_ns) == saved
         human.respond_to_human_request(runner.opened["request_ref"],
@@ -211,11 +208,11 @@ def test_initialization_acquisition_wait_replay_does_not_advance_or_repeat_effec
             idempotency_key="acquisition-wait-response")
         complete = owner.acquire_literature(session.session_ref, request, provider)
         assert complete.status == "obtained"
-        assert len(runner.prompts) == 3
+        assert len(runner.prompts) == 2
         assert provider._latest_native_session_ref(session.session_ref) == prior_native
         assert (runner.artifact.read_bytes(), runner.artifact.stat().st_mtime_ns) == saved
         assert owner.query_managed_run(request.request_id)["status"] == "completed"
         assert owner.acquire_literature(session.session_ref, request, provider) == complete
-        assert len(runner.prompts) == 3
+        assert len(runner.prompts) == 2
     finally:
         runtime.close()

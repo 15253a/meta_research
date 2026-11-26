@@ -90,8 +90,8 @@ def native_session(tmp_path, request):
         pytest.skip('The production signed provider supervisor runs on Linux')
     server = _server(tmp_path / 'native-codex')
     server.with_suffix('.payload').write_text(json.dumps({'status': 'ready',
-        'browser_context_ref': None, 'reason_code': None, 'evidence': {
-            'configuration_health': 'ready', 'browser_control': 'not_required', 'authorized_resource': 'oa_only'}}))
+        'browser_context_ref': 'ctx-native-1', 'reason_code': None, 'evidence': {
+            'configuration_health': 'ready', 'browser_control': 'functional', 'authorized_resource': 'verified'}}))
     data_root = prepare_data_root(tmp_path / 'data')
     if getattr(request, 'param', None) == 'saved-threads':
         from test_native_session_cleanup import _saved_threads, _vendor
@@ -107,7 +107,7 @@ def native_session(tmp_path, request):
         creation = runtime.owners.human_collaboration.create_quest({}, 'native-replacement-create')
         session = runtime.owners.agent_runtime.prepare_acquisition_session(
             initialization_id=creation['initialization_id'], draft_revision=creation['quest_draft']['revision'],
-            config={'mode': 'oa_only', 'library_entry_url': ''}, provider=adapter)
+            config={'mode': 'oa_then_institution', 'library_entry_url': 'https://library.example/login'}, provider=adapter)
         assert session.status == 'ready', session
         binding = runtime.root_workspaces.bind_acquisition_session(session.session_ref)
         (binding.directory / 'download-notes.md').write_text('Reuse the existing article; preserve this session directory.')

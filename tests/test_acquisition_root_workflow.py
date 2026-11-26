@@ -2,7 +2,8 @@ from pathlib import Path
 from dataclasses import replace
 import pytest
 from meta_research.acquisition import (AcquisitionBatchRequest, AcquisitionPaper,
-    AcquisitionPreflightRequest, AcquisitionUnavailable, validate_batch_request)
+    AcquisitionPreflightRequest, AcquisitionPreflightResult, AcquisitionUnavailable,
+    NatureDownloaderAdapter, validate_batch_request)
 from meta_research.acquisition_root import CodexAcquisitionRootAdapter
 from test_external_root_resident_mcp import _AcquisitionDelegate, _SequenceRunner as _ObservedSequenceRunner
 from role_delivery_process_support import controlled_codex as _fake_codex, run_observed_durable_result
@@ -61,24 +62,153 @@ def test_batch_validation_still_requires_paper_targets(tmp_path):
         validate_batch_request(replace(request, papers=()))
 
 
+def _preflight_request(
+    tmp_path: Path, mode: str, library_entry_url: str = ""
+) -> AcquisitionPreflightRequest:
+    return AcquisitionPreflightRequest(
+        "preflight-session",
+        "initialization1",
+        1,
+        "a" * 64,
+        mode,
+        library_entry_url,
+        str(tmp_path / "private"),
+    )
+
+
+class _SpyPreflightDelegate(_AcquisitionDelegate):
+    def __init__(self, result: AcquisitionPreflightResult) -> None:
+        super().__init__()
+        self._result = result
+        self.preflight_requests: list[AcquisitionPreflightRequest] = []
+
+    def preflight(
+        self, request: AcquisitionPreflightRequest
+    ) -> AcquisitionPreflightResult:
+        self.preflight_requests.append(request)
+        return self._result
+
+
 @pytest.mark.parametrize("mode", ["oa_only", "provided_only"])
-def test_targetless_session_preflight_accepts_native_missing_paper_targets(
-    tmp_path, mode
+def test_oa_and_provided_only_delegates_fast_preflight(tmp_path, mode):
+    expected_evidence = {
+        "configuration_health": "not_required",
+        "browser_control": "not_required",
+        "authorized_resource": mode,
+    }
+    delegate = _SpyPreflightDelegate(
+        AcquisitionPreflightResult(
+            status="ready",
+            browser_context_ref=None,
+            reason_code=None,
+            evidence=expected_evidence,
+        )
+    )
+    runner = _SequenceRunner([])
+    adapter = CodexAcquisitionRootAdapter(
+        tmp_path / "provider",
+        delegate,
+        executable=str(_fake_codex(tmp_path / "codex")),
+        process_runner=runner,
+    )
+    request = _preflight_request(tmp_path, mode)
+
+    result = adapter.preflight(request)
+
+    assert result.status == "ready"
+    assert result.browser_context_ref is None
+    assert result.reason_code is None
+    assert result.evidence == expected_evidence
+    assert delegate.preflight_requests == [request]
+    assert runner.prompts == []
+
+
+@pytest.mark.parametrize("mode", ["oa_only", "provided_only"])
+def test_oa_and_provided_only_propagates_delegate_unavailable(tmp_path, mode):
+    unavailable = AcquisitionPreflightResult(
+        status="unavailable",
+        browser_context_ref=None,
+        reason_code="nature_downloader_unavailable",
+        evidence={"provider_bundle": "unavailable"},
+    )
+    delegate = _SpyPreflightDelegate(unavailable)
+    runner = _SequenceRunner([])
+    adapter = CodexAcquisitionRootAdapter(
+        tmp_path / "provider",
+        delegate,
+        executable=str(_fake_codex(tmp_path / "codex")),
+        process_runner=runner,
+    )
+    request = _preflight_request(tmp_path, mode)
+
+    result = adapter.preflight(request)
+
+    assert result == unavailable
+    assert delegate.preflight_requests == [request]
+    assert runner.prompts == []
+
+
+@pytest.mark.parametrize("mode", ["oa_only", "provided_only"])
+def test_oa_and_provided_only_rejects_invalid_delegate_result(tmp_path, mode):
+    invalid = AcquisitionPreflightResult(
+        status="ready",
+        browser_context_ref=None,
+        reason_code=None,
+        evidence=None,
+    )
+    delegate = _SpyPreflightDelegate(invalid)
+    runner = _SequenceRunner([])
+    adapter = CodexAcquisitionRootAdapter(
+        tmp_path / "provider",
+        delegate,
+        executable=str(_fake_codex(tmp_path / "codex")),
+        process_runner=runner,
+    )
+    request = _preflight_request(tmp_path, mode)
+
+    with pytest.raises(AcquisitionUnavailable, match="acquisition_preflight_result_invalid"):
+        adapter.preflight(request)
+    assert delegate.preflight_requests == [request]
+    assert runner.prompts == []
+
+
+@pytest.mark.parametrize("mode", ["oa_only", "provided_only"])
+def test_oa_and_provided_only_fast_preflight_real_nature_delegate(tmp_path, mode):
+    runner = _SequenceRunner([])
+    adapter = CodexAcquisitionRootAdapter(
+        tmp_path / "provider",
+        NatureDownloaderAdapter(),
+        executable=str(_fake_codex(tmp_path / "codex")),
+        process_runner=runner,
+    )
+    request = _preflight_request(tmp_path, mode)
+
+    result = adapter.preflight(request)
+
+    assert result.status == "ready"
+    assert result.browser_context_ref is None
+    assert result.reason_code is None
+    assert result.evidence == {
+        "configuration_health": "not_required",
+        "browser_control": "not_required",
+        "authorized_resource": mode,
+    }
+    assert runner.prompts == []
+
+
+def test_oa_then_institution_preflight_uses_native_root_and_accepts_targetless(
+    tmp_path,
 ):
     runner = _SequenceRunner(
         [
             {
                 "status": "unavailable",
-                "browser_context_ref": None,
+                "browser_context_ref": "ctx-inst-targetless",
                 "reason_code": "missing_paper_targets",
                 "evidence": {
-                    "authorized_resource": (
-                        "工作区与全局 acquisition session 均无论文条目、manifest 或正文产物"
-                    ),
-                    "browser_control": "未启动浏览器；oa_only 不进入机构路线",
-                    "configuration_health": (
-                        "已核实请求中缺少 title、paper_id、DOI、arXiv ID 与 source_urls"
-                    ),
+                    "configuration_health": "ready",
+                    "browser_control": "functional",
+                    "authorized_resource": "verified",
                 },
             }
         ]
@@ -89,20 +219,14 @@ def test_targetless_session_preflight_accepts_native_missing_paper_targets(
         executable=str(_fake_codex(tmp_path / "codex")),
         process_runner=runner,
     )
-    request = AcquisitionPreflightRequest(
-        "preflight-session",
-        "initialization1",
-        1,
-        "a" * 64,
-        mode,
-        "",
-        str(tmp_path / "private"),
+    request = _preflight_request(
+        tmp_path, "oa_then_institution", "https://lib.example"
     )
 
     result = adapter.preflight(request)
 
     assert result.status == "ready"
-    assert result.browser_context_ref is None
+    assert result.browser_context_ref == "ctx-inst-targetless"
     assert result.reason_code is None
     assert result.evidence["targetless_session_preflight"] == "accepted"
     assert len(runner.prompts) == 1
@@ -113,7 +237,7 @@ def test_targetless_session_preflight_rejects_non_dict_evidence(tmp_path):
         [
             {
                 "status": "unavailable",
-                "browser_context_ref": None,
+                "browser_context_ref": "ctx-inst-1",
                 "reason_code": "missing_paper_targets",
                 "evidence": None,
             }
@@ -125,14 +249,8 @@ def test_targetless_session_preflight_rejects_non_dict_evidence(tmp_path):
         executable=str(_fake_codex(tmp_path / "codex")),
         process_runner=runner,
     )
-    request = AcquisitionPreflightRequest(
-        "preflight-session",
-        "initialization1",
-        1,
-        "a" * 64,
-        "oa_only",
-        "",
-        str(tmp_path / "private"),
+    request = _preflight_request(
+        tmp_path, "oa_then_institution", "https://lib.example"
     )
 
     with pytest.raises(AcquisitionUnavailable, match="acquisition_preflight_result_invalid"):

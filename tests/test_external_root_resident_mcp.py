@@ -338,7 +338,7 @@ def test_quest_bound_acquisition_batch_uses_exact_resident_operation_tree(
 def test_unmanaged_acquisition_turn_remains_without_resident_channel(
     tmp_path: Path,
 ) -> None:
-    runner = _SequenceRunner([{"status": "ready", "browser_context_ref": None, "reason_code": None, "evidence": {"configuration_health": "not_required", "browser_control": "not_required", "authorized_resource": "oa_only"}}])
+    runner = _SequenceRunner([{"status": "ready", "browser_context_ref": "ctx-unmanaged-1", "reason_code": None, "evidence": {"configuration_health": "ready", "browser_control": "functional", "authorized_resource": "verified"}}])
     adapter = CodexAcquisitionRootAdapter(
         tmp_path / "unmanaged-acquisition",
         _AcquisitionDelegate(),  # type: ignore[arg-type]
@@ -349,7 +349,7 @@ def test_unmanaged_acquisition_turn_remains_without_resident_channel(
     adapter.bind_resident_mcp_authority(authority)
     adapter.configure_resident_mcp_endpoint("http://127.0.0.1:8766")
     request = AcquisitionPreflightRequest("pre-quest-acquisition-session:1", "initialization1", 1,
-        "9" * 64, "oa_only", "", str(tmp_path / "private"))
+        "9" * 64, "oa_then_institution", "https://library.example/login", str(tmp_path / "private"))
 
     adapter.preflight(request)  # type: ignore[arg-type]
 
@@ -438,7 +438,7 @@ def test_production_acquisition_owner_injects_scope_into_actual_root_adapter(
     delegate = _AcquisitionDelegate()
     runner = _SequenceRunner(
         [
-            {"status": "ready", "browser_context_ref": None, "reason_code": None, "evidence": {"configuration_health": "not_required", "browser_control": "not_required", "authorized_resource": "oa_only"}},
+            {"status": "ready", "browser_context_ref": "ctx-prod-1", "reason_code": None, "evidence": {"configuration_health": "ready", "browser_control": "functional", "authorized_resource": "verified"}},
             {"results": [{"paper_id": "paper:1", "status": "missing", "path": None, "format": None, "failure": {"code": "oa_not_found", "detail": "No OA body."}}]},
         ]
     )
@@ -485,8 +485,8 @@ def test_production_acquisition_owner_injects_scope_into_actual_root_adapter(
                 "time_budget": "30d",
                 "route": "direct",
                 "literature": {
-                    "mode": "oa_only",
-                    "library_entry_url": "",
+                    "mode": "oa_then_institution",
+                    "library_entry_url": "https://library.example/login",
                     "scope_exclusions": "",
                     "accepted_material_bindings": [],
                 },
@@ -503,7 +503,7 @@ def test_production_acquisition_owner_injects_scope_into_actual_root_adapter(
         session = runtime.owners.agent_runtime.prepare_acquisition_session(
             initialization_id=initialization_id,
             draft_revision=revised["quest_draft"]["revision"],
-            config={"mode": "oa_only", "library_entry_url": ""},
+            config={"mode": "oa_then_institution", "library_entry_url": "https://library.example/login"},
             provider=adapter,
         )
         assert session.status == "ready"

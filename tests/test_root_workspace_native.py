@@ -49,7 +49,7 @@ def _native_executable(path, *, workspace_thread=False):
         "            marker.write_text(previous + os.getcwd() + '\\n')\n"
         "            if 'phase=preflight' in prompt:\n"
         "                Path('preflight-nonce.txt').write_text('Acquisition preflight pending nonce')\n"
-        "                value = dict(status='ready', browser_context_ref=None, reason_code=None, evidence={'configuration_health':'not_required','browser_control':'not_required','authorized_resource':'oa_only'})\n"
+        "                value = dict(status='ready', browser_context_ref=('ctx-native-preflight' if 'oa_then_institution' in prompt else None), reason_code=None, evidence={'configuration_health':'not_required','browser_control':('functional' if 'oa_then_institution' in prompt else 'not_required'),'authorized_resource':('verified' if 'oa_then_institution' in prompt else 'oa_only')})\n"
         "            elif 'phase=batch' in prompt:\n"
         "                Path('native-observed-preflight.txt').write_text(Path('preflight-nonce.txt').read_text())\n"
         "                value = {'results': [{'paper_id':'paper:1','status':'missing','path':None,'format':None,'failure':{'code':'oa_not_found','detail':'No OA body.'}}]}\n"
@@ -76,7 +76,7 @@ def _native_executable(path, *, workspace_thread=False):
         "    Path('native-observed-human.txt').write_text('\\n'.join(human))\n"
         "value = {'cwd': os.getcwd(), 'previous': bool(previous), 'human': human, 'reply': 'Checked pending observations.', 'accepted': True, 'human_request': None}\n"
         "if 'phase=preflight' in prompt:\n"
-        "    value.update(status='ready', browser_context_ref=None, reason_code=None, evidence={'configuration_health':'not_required','browser_control':'not_required','authorized_resource':'oa_only'})\n"
+        "    value.update(status='ready', browser_context_ref=('ctx-native-preflight' if 'oa_then_institution' in prompt else None), reason_code=None, evidence={'configuration_health':'not_required','browser_control':('functional' if 'oa_then_institution' in prompt else 'not_required'),'authorized_resource':('verified' if 'oa_then_institution' in prompt else 'oa_only')})\n"
         "elif 'phase=batch' in prompt:\n"
         "    value['results'] = [{'paper_id':'paper:1','status':'missing','path':None,'format':None,'failure':{'code':'oa_not_found','detail':'No OA body.'}}]\n"
         "if '--output-last-message' in sys.argv:\n"
@@ -542,7 +542,7 @@ def test_actual_acquisition_wrapper_binds_preflight_and_scoped_batch_native_work
         session = runtime.owners.agent_runtime.prepare_acquisition_session(
             initialization_id=creation["initialization_id"],
             draft_revision=creation["quest_draft"]["revision"],
-            config={"mode": "oa_only", "library_entry_url": ""}, provider=adapter)
+            config={"mode": "oa_then_institution", "library_entry_url": "https://library.example/login"}, provider=adapter)
         preflight = runtime.root_workspaces.bind_acquisition_session(session.session_ref).location
         assert (preflight.directory / "native-marker.txt").read_text() == str(preflight.directory) + "\n"
         assert (preflight.directory / "preflight-nonce.txt").read_text() == "Acquisition preflight pending nonce"
