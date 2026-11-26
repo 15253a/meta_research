@@ -124,3 +124,46 @@ def test_unknown_deployment_model_fails_before_provider_execution():
     result = _isolated_model_check("unknown-model")
     assert result.returncode != 0
     assert "META_RESEARCH_CODEX_MODEL must be" in result.stderr
+
+
+def test_stage_models_follow_explicit_codex_model_override():
+    def read_stage_models(model: str | None) -> dict[str, object]:
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(SOURCE)
+        environment.pop("META_RESEARCH_CODEX_MODEL", None)
+        if model is not None:
+            environment["META_RESEARCH_CODEX_MODEL"] = model
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import json; from meta_research.codex_runtime import CODEX_MODEL_REF, DEFAULT_STAGE_MODELS; "
+                "print(json.dumps({'model': CODEX_MODEL_REF, 'stages': DEFAULT_STAGE_MODELS}))",
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return json.loads(proc.stdout)
+
+    default_state = read_stage_models(None)
+    assert default_state["model"] == "gpt-6.1-sol"
+    assert default_state["stages"] == {
+        "idea": "gpt-6.2-astra",
+        "plan": "gpt-6.1-sol",
+        "bundle": "gpt-6.1-sol",
+        "target": "gpt-6.1-sol",
+        "reasoning": "gpt-6.2-astra",
+    }
+
+    overridden_state = read_stage_models("gpt-6-astra")
+    assert overridden_state["model"] == "gpt-6-astra"
+    assert overridden_state["stages"] == {
+        "idea": "gpt-6-astra",
+        "plan": "gpt-6-astra",
+        "bundle": "gpt-6-astra",
+        "target": "gpt-6-astra",
+        "reasoning": "gpt-6-astra",
+    }

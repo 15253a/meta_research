@@ -2,9 +2,27 @@ import { expect, test, type Page, type Route } from "@playwright/test";
 import { mkdir, readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 
+type QuotaView = {
+  ordinary_usage_allowed?: boolean | null;
+  used_percent?: number | null;
+  remaining_percent?: number | null;
+  window_duration_mins?: number | null;
+  resets_at?: number | null;
+  secondary_used_percent?: number | null;
+  secondary_resets_at?: number | null;
+  spend_control_reached?: boolean | null;
+  rate_limit_reached_type?: string | null;
+  has_credits?: boolean | null;
+  unlimited?: boolean | null;
+  balance?: string | null;
+  exhausted: boolean;
+  accountId?: string;
+};
+
 type AccountView = {
   status: "authenticated" | "unauthenticated" | "unavailable";
   account: null | { type: "chatgpt" | "apiKey"; email: string | null; plan_type: string | null };
+  quota?: QuotaView | null;
   login: null | { id: string; status: "pending" | "completed" | "failed" | "cancelled"; verification_url: string | null; user_code: string | null; error_code: string | null; expires_at: number | null };
   error_code: string | null;
 };
@@ -223,4 +241,72 @@ test("long account identities stay reachable on desktop and mobile", async ({ pa
     await page.screenshot({ path: resolve(screenshots, `account-panel-${width}.png`) });
     await page.keyboard.press("Escape");
   }
+});
+
+test("unauthenticated startup auto-opens the login dialog and stays dismissed across refresh polls", async ({ page }) => {
+  const state = await workspace(page, { status: "unauthenticated", account: null, quota: null, login: null, error_code: null });
+  await expect(entry(page)).toHaveText("Codex · 未登录");
+  await expect(dialog(page)).toBeVisible();
+  await expect(dialog(page).getByRole("button", { name: "登录 Codex", exact: true })).toBeEnabled();
+  await page.keyboard.press("Escape");
+  await expect(dialog(page)).not.toBeVisible();
+  const readsBefore = state.reads;
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await expect.poll(() => state.reads).toBeGreaterThan(readsBefore);
+  await expect(dialog(page)).not.toBeVisible();
+});
+
+test("live quota bar renders healthy usage without leaking secrets and auto-opens when exhausted", async ({ page }) => {
+  await workspace(page, {
+    ...signedIn(),
+    quota: {
+      ordinary_usage_allowed: true,
+      used_percent: 61,
+      remaining_percent: 39,
+      window_duration_mins: 10080,
+      resets_at: 1796000000,
+      spend_control_reached: false,
+      rate_limit_reached_type: null,
+      has_credits: true,
+      unlimited: false,
+      balance: "42.50",
+      exhausted: false,
+      accountId: "secret-quota-account-id",
+    },
+  });
+  await expect(entry(page)).toHaveText("Codex · researcher@example.com");
+  await expect(dialog(page)).not.toBeVisible();
+  await entry(page).click();
+  await expect(dialog(page)).toBeVisible();
+  await expect(dialog(page).getByText("剩余 39%", { exact: true })).toBeVisible();
+  await expect(dialog(page).getByText("已使用 61%", { exact: true })).toBeVisible();
+  await expect(dialog(page).getByText("7 天周期", { exact: true })).toBeVisible();
+  await expect(page.locator("body")).not.toContainText("secret-quota-account-id");
+  await page.keyboard.press("Escape");
+  await expect(dialog(page)).not.toBeVisible();
+
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+  await workspace(page, {
+    ...signedIn(),
+    quota: {
+      ordinary_usage_allowed: false,
+      used_percent: 100,
+      remaining_percent: 0,
+      window_duration_mins: 10080,
+      resets_at: 1796000000,
+      spend_control_reached: false,
+      rate_limit_reached_type: "weekly_limit",
+      has_credits: false,
+      unlimited: false,
+      balance: null,
+      exhausted: true,
+    },
+  });
+  await expect(dialog(page)).toBeVisible();
+  await expect(dialog(page).getByText("额度已耗尽", { exact: true })).toBeVisible();
+  await expect(dialog(page).getByText("额度受限", { exact: true })).toBeVisible();
+  await expect(dialog(page).getByRole("status")).toContainText("当前账户可用额度已耗尽或受限");
+  await expect(dialog(page).getByRole("button", { name: "切换账户", exact: true })).toBeEnabled();
+  await page.keyboard.press("Escape");
+  await expect(dialog(page)).not.toBeVisible();
 });

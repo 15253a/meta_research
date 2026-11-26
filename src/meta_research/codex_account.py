@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import base64
 import hashlib
+import math
 import os
 from pathlib import Path
 import queue
@@ -188,6 +189,112 @@ def _public_account(result: object) -> dict | None:
             "plan_type": text(account.get("planType"), 64) if account["type"] == "chatgpt" else None}
 
 
+def _public_quota(result: object) -> dict | None:
+    if not isinstance(result, dict):
+        return None
+    raw_ordinary = result.get("ordinaryUsageAllowed")
+    ordinary = raw_ordinary if type(raw_ordinary) is bool else None
+    rl = result.get("rateLimits")
+    if ordinary is None and not (isinstance(rl, dict) and rl):
+        return None
+
+    def flag(value: object) -> bool | None:
+        return value if type(value) is bool else None
+
+    def percent(value: object) -> float | None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value <= 100:
+            return round(float(value), 1)
+        return None
+
+    def positive_int(value: object) -> int | None:
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        return None
+
+    def timestamp(value: object) -> int | float | None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
+            return value
+        return None
+
+    def clean_text(value: object) -> str | None:
+        if not isinstance(value, str) or len(value) > 64 or any(ord(c) < 32 for c in value):
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    used_percent = None
+    remaining_percent = None
+    window_duration_mins = None
+    resets_at = None
+    secondary_used_percent = None
+    secondary_resets_at = None
+    spend_control_reached = None
+    rate_limit_reached_type = None
+    has_credits = None
+    unlimited = None
+    balance = None
+
+    if isinstance(rl, dict):
+        primary = rl.get("primary")
+        if isinstance(primary, dict):
+            used_percent = percent(primary.get("usedPercent"))
+            if used_percent is not None:
+                remaining_percent = max(0.0, round(100.0 - used_percent, 1))
+            window_duration_mins = positive_int(primary.get("windowDurationMins"))
+            resets_at = timestamp(primary.get("resetsAt"))
+        secondary = rl.get("secondary")
+        if isinstance(secondary, dict):
+            secondary_used_percent = percent(secondary.get("usedPercent"))
+            secondary_resets_at = timestamp(secondary.get("resetsAt"))
+        spend_control_reached = flag(rl.get("spendControlReached"))
+        rate_limit_reached_type = clean_text(rl.get("rateLimitReachedType"))
+        credits = rl.get("credits")
+        if isinstance(credits, dict):
+            has_credits = flag(credits.get("hasCredits"))
+            unlimited = flag(credits.get("unlimited"))
+            balance = clean_text(credits.get("balance"))
+
+    if all(
+        item is None
+        for item in (
+            ordinary,
+            used_percent,
+            window_duration_mins,
+            resets_at,
+            secondary_used_percent,
+            secondary_resets_at,
+            spend_control_reached,
+            rate_limit_reached_type,
+            has_credits,
+            unlimited,
+            balance,
+        )
+    ):
+        return None
+
+    exhausted = bool(
+        (ordinary is False)
+        or (spend_control_reached is True)
+        or (used_percent is not None and used_percent >= 100.0)
+        or (rate_limit_reached_type is not None)
+    )
+    return {
+        "ordinary_usage_allowed": ordinary,
+        "used_percent": used_percent,
+        "remaining_percent": remaining_percent,
+        "window_duration_mins": window_duration_mins,
+        "resets_at": resets_at,
+        "secondary_used_percent": secondary_used_percent,
+        "secondary_resets_at": secondary_resets_at,
+        "spend_control_reached": spend_control_reached,
+        "rate_limit_reached_type": rate_limit_reached_type,
+        "has_credits": has_credits,
+        "unlimited": unlimited,
+        "balance": balance,
+        "exhausted": exhausted,
+    }
+
+
 def _read_private(path: Path) -> bytes | None:
     try:
         metadata = path.lstat()
@@ -298,36 +405,44 @@ class CodexAccountService:
         except OSError as error:
             raise _AccountError("codex_account_credentials_invalid") from error
 
-    def _account(self) -> dict | None:
+    def _account_and_quota(self) -> tuple[dict | None, dict | None]:
         self._check_home()
         try:
             ensure_codex_account_current(self.root.codex_home)
         except _AccountError as error:
             if error.code == "codex_account_logged_out":
-                return None
+                return None, None
             raise
         rpc = _Rpc(self.root.validated_codex_cli_executable(CODEX_LOCKED_VERSION), self.root)
         try:
             account = _public_account(rpc.request("account/read", {"refreshToken": False}))
             ensure_codex_account_current(self.root.codex_home)
-            return account
+            quota = None
+            if account is not None:
+                try:
+                    quota = _public_quota(rpc.request("account/rateLimits/read", {}))
+                except Exception:
+                    quota = None
+            return account, quota
         finally:
             rpc.close()
 
     def read(self) -> dict:
         with self._lock:
             account = None
+            quota = None
             error = None
             try:
                 if self._closed:
                     raise _AccountError("codex_account_service_closed")
-                account = self._account()
+                account, quota = self._account_and_quota()
             except _AccountError as failure:
                 error = failure.code
             except Exception:
                 error = "codex_account_provider_unavailable"
             return {"status": "unavailable" if error else "authenticated" if account else "unauthenticated",
-                    "account": account, "login": None if self._login is None else dict(self._login),
+                    "account": account, "quota": quota,
+                    "login": None if self._login is None else dict(self._login),
                     "error_code": error}
 
     def close(self) -> None:
@@ -381,7 +496,7 @@ class CodexAccountService:
                     if rpc is not None:
                         rpc.close()
                 auth.unlink(missing_ok=True)
-                return {"status": "unauthenticated", "account": None,
+                return {"status": "unauthenticated", "account": None, "quota": None,
                         "login": None if self._login is None else dict(self._login), "error_code": None}
             except Exception as failure:
                 result = self.read()

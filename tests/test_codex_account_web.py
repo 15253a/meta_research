@@ -103,3 +103,61 @@ def test_web_shutdown_closes_pending_account_login(account_runtime):
     with TestClient(web.create_app(runtime, base_url='http://testserver', control_key='control')):
         assert not service.closed
     assert service.closed
+
+
+def test_codex_account_api_exposes_sanitized_quota_and_stays_compatible(account_runtime):
+    runtime, service, _ = account_runtime
+    client, _ = _authenticated_client(runtime)
+    legacy = client.get('/api/v1/codex/account')
+    assert legacy.status_code == 200, legacy.text
+    assert 'quota' in legacy.json()
+    assert legacy.json()['quota'] is None
+
+    def read_with_quota():
+        return {
+            'status': 'authenticated',
+            'account': {'type': 'chatgpt', 'email': 'researcher@example.invalid', 'plan_type': 'pro'},
+            'quota': {
+                'ordinary_usage_allowed': True,
+                'used_percent': 61.0,
+                'remaining_percent': 39.0,
+                'window_duration_mins': 10080,
+                'resets_at': 1796000000,
+                'secondary_used_percent': 15.0,
+                'secondary_resets_at': 1796100000,
+                'spend_control_reached': False,
+                'rate_limit_reached_type': None,
+                'has_credits': True,
+                'unlimited': False,
+                'balance': '18.00',
+                'exhausted': False,
+                'accountId': 'secret-account-id',
+                'access_token': 'must-not-leave-server',
+            },
+            'login': None,
+            'error_code': None,
+            'accountId': 'top-level-secret-account-id',
+        }
+
+    service.read = read_with_quota
+    response = client.get('/api/v1/codex/account')
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload['quota'] == {
+        'ordinary_usage_allowed': True,
+        'used_percent': 61.0,
+        'remaining_percent': 39.0,
+        'window_duration_mins': 10080,
+        'resets_at': 1796000000,
+        'secondary_used_percent': 15.0,
+        'secondary_resets_at': 1796100000,
+        'spend_control_reached': False,
+        'rate_limit_reached_type': None,
+        'has_credits': True,
+        'unlimited': False,
+        'balance': '18.00',
+        'exhausted': False,
+    }
+    assert 'secret-account-id' not in response.text
+    assert 'must-not-leave-server' not in response.text
+    assert 'accountId' not in response.text
