@@ -21,6 +21,14 @@ class _OutputSource:
     path: Path
     size: int
     phase: str
+    invocation_mtime: float | None = None
+    output_mtime: float | None = None
+
+
+def _valid_timestamp(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
 
 
 def _operation_output(root: Path, job_ref: str, name: str, phase: str) -> _OutputSource | None:
@@ -44,7 +52,15 @@ def _operation_output(root: Path, job_ref: str, name: str, phase: str) -> _Outpu
             or invocation.get("operation_name") != name
             or invocation.get("schema_ref") != "meta-research/codex-provider-operation/v3"):
         raise ValueError("proposal_output_unavailable")
-    return _OutputSource(output, output.stat().st_size if output.exists() else 0, phase)
+    invocation_stat = invocation_path.stat()
+    output_stat = output.stat() if output.exists() else None
+    return _OutputSource(
+        output,
+        output_stat.st_size if output_stat is not None else 0,
+        phase,
+        invocation_mtime=invocation_stat.st_mtime,
+        output_mtime=output_stat.st_mtime if output_stat is not None and output_stat.st_size > 0 else None,
+    )
 
 
 def read_proposal_output(data_root: Path, generation: dict, after: int, limit: int) -> dict:
@@ -68,21 +84,34 @@ def read_preparation_output(data_root: Path, deepfetch: dict, after: int, limit:
     """Read only the authorized request's pre-DeepFetch understanding operation."""
     if after < 0 or not 4 <= limit <= 262144:
         raise ValueError("proposal_output_cursor_invalid")
-    preparation_ref = deepfetch.get("preparation", {}).get("ref", deepfetch["request_ref"])
+    preparation = deepfetch.get("preparation") or {}
+    preparation_ref = preparation.get("ref", deepfetch["request_ref"])
     root = data_root / "companion-provider" / "provider-operations"
     source = _operation_output(root, preparation_ref + ":understanding",
                                "initialization-understanding", "understanding")
     status = {"accepting": "running"}.get(deepfetch["status"], deepfetch["status"])
-    identity = {"ref": preparation_ref, "status": status, "failure": deepfetch.get("failure")}
+    identity = {
+        "ref": preparation_ref,
+        "status": status,
+        "failure": deepfetch.get("failure"),
+        "started_at": preparation.get("started_at") or deepfetch.get("started_at"),
+    }
     return _output_page(identity, [] if source is None else [source], after, limit)
 
 
 def _output_page(generation: dict, sources: list[_OutputSource], after: int, limit: int) -> dict:
     status = generation["status"]
+    started_at = _valid_timestamp(generation.get("started_at"))
+    if started_at is None:
+        invocation_mtimes = [s.invocation_mtime for s in sources if s.invocation_mtime is not None]
+        started_at = min(invocation_mtimes) if invocation_mtimes else None
+    event_mtimes = [s.output_mtime for s in sources if s.output_mtime is not None and s.size > 0]
+    last_event_at = max(event_mtimes) if event_mtimes else None
     page = dict(generation_ref=generation["ref"], status=status, text="", offset=after,
                 next_offset=after, source_bytes=0, has_more=False,
                 availability="waiting", failure=generation.get("failure"),
-                phase=sources[-1].phase if sources else None)
+                phase=sources[-1].phase if sources else None,
+                started_at=started_at, last_event_at=last_event_at)
 
     # Provider JSONL normally ends in a newline. Keep even a final unterminated
     # record distinct when the next operation starts, without rewriting either

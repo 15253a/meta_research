@@ -257,6 +257,79 @@ def validate_understanding(value, manifest, read_witness) -> dict[str, object]:
     return value
 
 
+def _resolve_host_reference_ref(witness_ref, references):
+    if not isinstance(witness_ref, str) or not witness_ref.strip():
+        return None
+    if witness_ref in references:
+        return witness_ref
+    if witness_ref.startswith("host:") and witness_ref[5:] in references:
+        return witness_ref[5:]
+    try:
+        candidate_path = Path(witness_ref)
+        if not candidate_path.is_absolute():
+            return None
+        resolved_candidate = candidate_path.resolve()
+    except (OSError, ValueError):
+        return None
+    matches = []
+    for ref_id, entry in references.items():
+        source = entry.get("source") if isinstance(entry, dict) else None
+        abs_path = source.get("absolute_path") if isinstance(source, dict) else None
+        if not isinstance(abs_path, str) or not abs_path:
+            continue
+        try:
+            root = Path(abs_path).resolve()
+        except (OSError, ValueError):
+            continue
+        if resolved_candidate == root:
+            matches.append((len(root.parts), ref_id))
+        elif source.get("kind") == "directory":
+            try:
+                resolved_candidate.relative_to(root)
+            except ValueError:
+                continue
+            matches.append((len(root.parts), ref_id))
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return matches[0][1]
+
+
+def _predecessor_host_cited_refs(predecessor):
+    prior_references = {
+        entry["reference_ref"]: entry
+        for entry in predecessor.get("material_references", {}).get("references", [])
+    }
+    if not prior_references:
+        return set()
+    mcp_refs = {
+        item["witness_ref"]
+        for item in predecessor.get("input_identity", {}).get("consumed", [])
+    }
+    for inherited in predecessor.get("inherited_evidence", []):
+        mcp_refs.add(inherited["witness"]["witness_ref"])
+    cited = set()
+    understanding = predecessor.get("understanding", {})
+    for field in UNDERSTANDING_FIELDS:
+        for statement in understanding.get(field, []):
+            for citation in statement.get("sources", []):
+                token = citation.get("witness_ref")
+                if token in mcp_refs:
+                    continue
+                ref = _resolve_host_reference_ref(token, prior_references)
+                if ref is not None:
+                    cited.add(ref)
+    for item in understanding.get("coverage", []):
+        for citation in item.get("read_ranges", []):
+            token = citation.get("witness_ref")
+            if token in mcp_refs:
+                continue
+            ref = _resolve_host_reference_ref(token, prior_references)
+            if ref is not None:
+                cited.add(ref)
+    return cited
+
+
 def validate_reference_understanding(value, inputs, identity, server_files, historical=(), inherited_selection=()):
     from jsonschema import Draft202012Validator
     try:
@@ -268,33 +341,43 @@ def validate_reference_understanding(value, inputs, identity, server_files, hist
         if len(coverage) != len(value["coverage"]) or set(coverage) != set(references):
             raise ValueError("coverage")
 
-        def witness(citation):
-            item = witnesses[citation["witness_ref"]]
-            if item.reference_ref not in references:
-                raise ValueError("witness source")
-            return item
+        def resolve_citation(citation):
+            token = citation["witness_ref"]
+            if token in witnesses:
+                item = witnesses[token]
+                if item.reference_ref not in references:
+                    raise ValueError("witness source")
+                return item, False
+            host_ref = _resolve_host_reference_ref(token, references)
+            if host_ref is not None:
+                return host_ref, True
+            raise ValueError("witness source")
 
         for key, item in coverage.items():
-            ranges = [witness(citation) for citation in item["read_ranges"]]
-            if any(part.reference_ref != key for part in ranges):
+            resolved = [resolve_citation(citation) for citation in item["read_ranges"]]
+            if any((part if is_host else part.reference_ref) != key for part, is_host in resolved):
                 raise ValueError("coverage source")
-            if item["kind"] == "unread" and ranges or item["kind"] != "unread" and not ranges:
+            if item["kind"] == "unread" and resolved or item["kind"] != "unread" and not resolved:
                 raise ValueError("coverage")
             if item["kind"] != "read" and not item["unread_description"].strip():
                 raise ValueError("unread")
             if item["kind"] == "read":
-                if references[key]["source"]["kind"] != "file" or any(part.path for part in ranges):
+                if references[key]["source"]["kind"] != "file":
                     raise ValueError("directory incomplete")
-                with server_files._open_reference(references[key]["source"], "") as (_, details):
-                    size = int(details["size"])
-                ordered = sorted(set((part.offset, part.offset + part.length) for part in ranges))
-                cursor = 0
-                for start, end in ordered:
-                    if start > cursor:
+                if not any(is_host for _, is_host in resolved):
+                    ranges = [part for part, _ in resolved]
+                    if any(part.path for part in ranges):
+                        raise ValueError("directory incomplete")
+                    with server_files._open_reference(references[key]["source"], "") as (_, details):
+                        size = int(details["size"])
+                    ordered = sorted(set((part.offset, part.offset + part.length) for part in ranges))
+                    cursor = 0
+                    for start, end in ordered:
+                        if start > cursor:
+                            raise ValueError("incomplete read")
+                        cursor = max(cursor, end)
+                    if cursor != size:
                         raise ValueError("incomplete read")
-                    cursor = max(cursor, end)
-                if cursor != size:
-                    raise ValueError("incomplete read")
         statement_refs = set()
         for field in UNDERSTANDING_FIELDS:
             for statement in value[field]:
@@ -306,7 +389,9 @@ def validate_reference_understanding(value, inputs, identity, server_files, hist
                 for citation in statement["sources"]:
                     if citation["witness_ref"] in historical:
                         continue
-                    if coverage[witness(citation).reference_ref]["kind"] == "unread":
+                    target, is_host = resolve_citation(citation)
+                    target_ref = target if is_host else target.reference_ref
+                    if coverage[target_ref]["kind"] == "unread":
                         raise ValueError("unread claim")
         selected = set()
         for item in value["selection"]:
@@ -390,9 +475,23 @@ class CreationBasisMemory:
                     pass
             facts.append({"witness": item, "live_source_eligible": live, "live_source_limit": live_limit,
                 "managed_history_keys": historical})
+        current_references = {item["reference_ref"]: item for item in inputs.references}
+        host_cited = [
+            {
+                "reference_ref": ref,
+                "present_in_current_materials": ref in current_references,
+                "absolute_path": (
+                    current_references[ref]["source"]["absolute_path"]
+                    if ref in current_references
+                    else None
+                ),
+            }
+            for ref in sorted(_predecessor_host_cited_refs(predecessor))
+        ]
         return {"predecessor": self.reference(predecessor), "prior_draft": predecessor.get("draft_context"),
             "prior_understanding": predecessor["understanding"], "current_materials": inputs.as_dict(),
-            "evidence_facts": facts, "prior_sources": self.source_views(predecessor),
+            "evidence_facts": facts, "host_cited_references": host_cited,
+            "prior_sources": self.source_views(predecessor),
             "prior_literature": self._literature_relations(predecessor)}
 
     def _literature_relations(self, basis):
@@ -455,8 +554,11 @@ class CreationBasisMemory:
             prior_witnesses = {item["witness_ref"]: item for item in predecessor["input_identity"]["consumed"]}
             for inherited in predecessor.get("inherited_evidence", []):
                 prior_witnesses[inherited["witness"]["witness_ref"]] = inherited["witness"]
+            prior_host_refs = _predecessor_host_cited_refs(predecessor)
+            current_references = {item["reference_ref"]: item for item in inputs.references}
             inherited = []
             seen = set()
+            seen_host_refs = set()
             selected = {item["material_key"]: item for item in predecessor["sources"] if item.get("binding") is not None}
             keys = delta["inherited_selection_keys"]
             if len(set(keys)) != len(keys) or not set(keys).issubset(selected):
@@ -465,21 +567,33 @@ class CreationBasisMemory:
                 for new in understanding["selection"] for old in selected.values()):
                 raise ValueError("existing selection must be inherited")
             for item in delta["inherited_evidence"]:
-                witness = prior_witnesses[item["witness_ref"]]
-                if witness["witness_ref"] in seen:
-                    raise ValueError("duplicate inherited evidence")
-                seen.add(witness["witness_ref"])
-                if item["kind"] == "live_source":
-                    if item["selected_material_key"] is not None:
-                        raise ValueError("live binding")
-                    require_identity(self.workspaces._hc, CreationInputIdentity(inputs.anchor, inputs.set_hash, (ReadWitness(**witness),)))
-                    proof = {}
+                witness_ref = item["witness_ref"]
+                if witness_ref in prior_witnesses:
+                    witness = prior_witnesses[witness_ref]
+                    if witness["witness_ref"] in seen:
+                        raise ValueError("duplicate inherited evidence")
+                    seen.add(witness["witness_ref"])
+                    if item["kind"] == "live_source":
+                        if item["selected_material_key"] is not None:
+                            raise ValueError("live binding")
+                        require_identity(self.workspaces._hc, CreationInputIdentity(inputs.anchor, inputs.set_hash, (ReadWitness(**witness),)))
+                        proof = {}
+                    else:
+                        if item["selected_material_key"] not in keys:
+                            raise ValueError("history selection")
+                        source = self._historical_witness(predecessor, witness, item["selected_material_key"])
+                        proof = {"binding": source["binding"], "content_hash": source["sha256"]}
+                    inherited.append({**item, **proof, "predecessor": self.reference(predecessor), "witness": witness})
                 else:
-                    if item["selected_material_key"] not in keys:
-                        raise ValueError("history selection")
-                    source = self._historical_witness(predecessor, witness, item["selected_material_key"])
-                    proof = {"binding": source["binding"], "content_hash": source["sha256"]}
-                inherited.append({**item, **proof, "predecessor": self.reference(predecessor), "witness": witness})
+                    if item["kind"] != "live_source" or item["selected_material_key"] is not None:
+                        raise ValueError("unknown inherited evidence")
+                    host_ref = _resolve_host_reference_ref(witness_ref, current_references)
+                    if host_ref is None or host_ref not in prior_host_refs:
+                        raise ValueError("unknown inherited evidence")
+                    if witness_ref in seen or host_ref in seen_host_refs:
+                        raise ValueError("duplicate inherited evidence")
+                    seen.add(witness_ref)
+                    seen_host_refs.add(host_ref)
             inherited_sources = [copy.deepcopy(selected[key]) for key in keys]
             for source in inherited_sources:
                 source["inherited_from"] = self.reference(predecessor)
@@ -849,14 +963,30 @@ class CreationBasisMemory:
         if item is None:
             inherited = next((item for item in basis.get("inherited_evidence", [])
                 if item["witness"]["witness_ref"] == citation["witness_ref"]), None)
-            if inherited is None:
+            if inherited is not None:
+                item = inherited["witness"]
+                provenance = {key: value for key, value in inherited.items() if key != "witness"}
+            else:
+                references = {
+                    entry["reference_ref"]: entry
+                    for entry in basis.get("material_references", {}).get("references", [])
+                }
+                host_ref = _resolve_host_reference_ref(citation["witness_ref"], references)
+                if host_ref is not None:
+                    source = references[host_ref]["source"]
+                    return {
+                        "witness_ref": citation["witness_ref"],
+                        "reference_ref": host_ref,
+                        "material_key": host_ref,
+                        "path": source["absolute_path"],
+                        "location": citation["location"],
+                        "provenance": {"kind": "host_direct"},
+                    }
                 if basis.get("predecessor") is None:
                     raise OwnerConflict("creation_inheritance_invalid")
                 predecessor = self.query(basis["predecessor"]["basis_ref"], basis["predecessor"]["basis_hash"])
                 return {**self.citation_view(predecessor, citation), "provenance": {
                     "kind": "historical_identity", "predecessor": basis["predecessor"]}}
-            item = inherited["witness"]
-            provenance = {key: value for key, value in inherited.items() if key != "witness"}
         return {**item, "material_key": item["reference_ref"], "location": citation["location"], "provenance": provenance}
 
     def understanding_view(self, basis):

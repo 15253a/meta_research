@@ -24,7 +24,7 @@ Writing follows the confirmed [Writing decision](https://github.com/15253a/meta_
 
 The runtime provides the full schema for the current operation and the actual granted capabilities. An already known exact reader or path can be used directly under those grants. References contain the detailed evidence, custody and literature rules. They are not a reason to preload every source, perform a full directory scan, recompute hashes, or replay unrelated conversations. The initial input keeps the scientific obligations and confirmation boundaries stated in the main role document.
 
-Protected input paths, work directory and reader scope must agree with what the model can actually access. A host path is not an actionable protected path. Missing access or conflicting bindings are reported against the exact operation; they do not justify host execution or a fabricated read witness.
+Host input paths, `execution.work_directory`, `guidance_files`, `context_files`, `mounted_references_summary`, and granted MCP readers agree directly on the host (`host-direct-v1`). Registered originals are read-only on the host and remain persistently accessible throughout the Quest even when `selection` is empty (`[]`). Missing access or unavailable paths are reported truthfully; never fabricate citations or modify originals in place.
 
 ## Manual Question drafting window
 

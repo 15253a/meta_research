@@ -2155,7 +2155,7 @@ def test_work_materials_single_file_cross_turn_and_native_read_feedback(
         discovered = _accepted(_call(rt, ch2, "research_workspace.materials.discover"))
         refs = {item["reference_ref"] for item in discovered["references"]}
         assert ref_human in refs
-        assert ref_acq not in refs
+        assert ref_acq in refs
         page = _accepted(_call(rt, ch2, "research_workspace.materials.discover", reference_ref=ref_human))
         read_res = _accepted(_call(
             rt, ch2, "research_workspace.materials.read",

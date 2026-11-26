@@ -1,20 +1,19 @@
-"""Close a failed legacy creation attempt before another formal generation.
+"""Close a failed creation attempt before another formal generation.
 
-This is failure cleanup, never provider completion recovery. Legacy helper
-receipts cannot be promoted into the newer signed process-tree contract.
+This is failure cleanup, never provider completion recovery. Host-direct
+creation operations reconcile their durable supervisor spool and revoke active
+material operations without touching the legacy chroot runtime.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
-import re
 
 from sqlalchemy import text
 
 from meta_research.creation_inputs import CreationAnchor, MaterialSet
+from meta_research.idea_skill import IdeaSkillUnavailable
 from meta_research.owners.common import OwnerConflict, canonical_hash
-from meta_research.protected_creation_runtime import ProtectedCreationError, _regular_reader
 from meta_research.provider_supervisor import (
     ProviderSupervisorError, read_transport_envelope, read_transport_key_for_operation,
 )
@@ -23,22 +22,28 @@ from meta_research.provider_supervisor import (
 _LIMIT = 16 * 1024 * 1024
 
 
-def _bytes(path: Path, *, host_owned: bool = True, private: bool = True) -> bytes:
+def _read_regular_bytes(path: Path) -> bytes:
     import os
+    import stat
 
-    with _regular_reader(path) as stream:
-        details = os.fstat(stream.fileno())
-        if details.st_nlink != 1 or details.st_size > _LIMIT or (host_owned and (
-            details.st_uid != 0 or details.st_mode & (0o077 if private else 0o022)
-        )):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1 or details.st_size > _LIMIT:
             raise OwnerConflict("protected_creation_cleanup_unverified")
-        return stream.read(_LIMIT + 1)
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            return stream.read(_LIMIT + 1)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
-def _exact_legacy_launch(work, directory: Path) -> None:
-    """Called with the runtime's exclusive sealed-work lock held."""
+def _verify_host_failed_operation(adapter, work, directory: Path) -> None:
+    if not (directory / "invocation.json").is_file():
+        raise OwnerConflict("protected_creation_cleanup_unverified")
     _, key = read_transport_key_for_operation(directory)
-    _bytes(directory / "invocation.json", private=False)
     invocation = read_transport_envelope(directory / "invocation.json", key)
     if (invocation.get("job_ref") != work.operation.operation_ref
         or invocation.get("operation_name") != "initialization-understanding"
@@ -46,42 +51,16 @@ def _exact_legacy_launch(work, directory: Path) -> None:
         or invocation.get("workspace_binding") != work.binding.seal()
         or invocation.get("working_directory") != str(work.binding.directory)
         or invocation.get("mcp_scope_binding_hash") != work.operation.binding_hash
-        or invocation.get("prompt_hash") != canonical_hash(_bytes(directory / "prompt.txt", private=False).decode("utf-8"))
-        or invocation.get("output_schema_hash") != canonical_hash(json.loads(_bytes(directory / "output-schema.json", private=False)))):
+        or invocation.get("prompt_hash") != canonical_hash(_read_regular_bytes(directory / "prompt.txt").decode("utf-8"))
+        or invocation.get("output_schema_hash") != canonical_hash(json.loads(_read_regular_bytes(directory / "output-schema.json")))):
         raise OwnerConflict("protected_creation_cleanup_unverified")
-    if any((directory / name).exists() for name in ("exit.json", "completed.json", "supervisor-exit.json")):
+    if (directory / "completed.json").exists():
         raise OwnerConflict("protected_creation_cleanup_unverified")
-    expected = hashlib.sha256(_bytes(directory / "last-message.json")).digest()
-    matches = []
-    control = work.runtime._control
-    for path in control.glob("launch-*.json"):
-        if path.name.endswith(".receipt.json"):
-            continue
-        launch = json.loads(_bytes(path))
-        if launch.get("jail") != str(work.runtime.jail_root):
+    reconcile = getattr(adapter, "_reconcile_cancelled_job_spools", None)
+    if callable(reconcile):
+        if not reconcile(work.operation.operation_ref):
             raise OwnerConflict("protected_creation_cleanup_unverified")
-        argv = launch.get("argv")
-        if not isinstance(argv, list) or argv.count("--output-last-message") != 1:
-            continue
-        index = argv.index("--output-last-message") + 1
-        if index == len(argv) or not isinstance(argv[index], str) or re.fullmatch(
-            r"/outputs/[0-9a-f]{16}-0000-last-message\.json", argv[index]
-        ) is None:
-            raise OwnerConflict("protected_creation_cleanup_unverified")
-        output = work.runtime.jail_root / argv[index].lstrip("/")
-        if not output.exists():
-            continue
-        if hashlib.sha256(_bytes(output, host_owned=False)).digest() != expected:
-            continue
-        receipt_path = path.with_suffix(".receipt.json")
-        if launch.get("receipt") != str(receipt_path):
-            raise OwnerConflict("protected_creation_cleanup_unverified")
-        receipt = json.loads(_bytes(receipt_path))
-        if (receipt.get("status") != "completed" or type(receipt.get("returncode")) is not int
-            or receipt["returncode"] != 0 or receipt.get("descendants_ended") is not True):
-            raise OwnerConflict("protected_creation_cleanup_unverified")
-        matches.append(path)
-    if len(matches) != 1:
+    elif not adapter.reconcile_cancelled_job(work.operation.operation_ref):
         raise OwnerConflict("protected_creation_cleanup_unverified")
 
 
@@ -131,16 +110,15 @@ def close_failed_initialization_work(adapter, initialization_id, draft_revision,
             if work.operation.fence_ref != row.fence_ref or work.operation.binding_hash != row.binding_hash:
                 raise OwnerConflict("protected_creation_cleanup_unverified")
             directory = adapter._workspace / "provider-operations" / canonical_hash({"job_ref": row.operation_ref}) / "initialization-understanding"
-            with work.runtime.exclusive_sealed_work():
-                _exact_legacy_launch(work, directory)
-                # Recheck the business authority after filesystem verification.
-                with human._database.read() as connection:
-                    status = connection.execute(text("SELECT status FROM hc_proposal_generation_attempts WHERE generation_ref=:ref"),
-                        {"ref": generation_ref}).scalar_one()
-                if status != "failed":
-                    raise OwnerConflict("protected_creation_cleanup_unverified")
-                work.fail()
-                if previous is not None and previous is not work:
-                    previous.fail()
-        except (OSError, ValueError, TypeError, KeyError, ProtectedCreationError, ProviderSupervisorError) as error:
+            _verify_host_failed_operation(adapter, work, directory)
+            # Recheck the business authority after filesystem verification.
+            with human._database.read() as connection:
+                status = connection.execute(text("SELECT status FROM hc_proposal_generation_attempts WHERE generation_ref=:ref"),
+                    {"ref": generation_ref}).scalar_one()
+            if status != "failed":
+                raise OwnerConflict("protected_creation_cleanup_unverified")
+            work.fail()
+            if previous is not None and previous is not work:
+                previous.fail()
+        except (OSError, ValueError, TypeError, KeyError, ProviderSupervisorError, IdeaSkillUnavailable) as error:
             raise OwnerConflict("protected_creation_cleanup_unverified") from error

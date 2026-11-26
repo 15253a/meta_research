@@ -324,8 +324,10 @@ class WorkMaterialsMixin(MaterialProcessingMixin):
             raise OwnerConflict("material_not_visible")
 
     def _quest_directory_references(self, context):
-        # The current runtime binding is checked on every call. Only human
-        # originals cross receiving-work/Cycle boundaries, never scratch files.
+        # The current runtime binding is checked on every call. Persistent
+        # server references (including human uploads/directories, acquired
+        # server materials, and initialization-phase HumanRequest deliveries)
+        # remain visible across receiving-work/Cycle boundaries.
         location = self._root_workspaces.bind_runtime(context).location
         if not location.quest_ref:
             return set()
@@ -333,13 +335,22 @@ class WorkMaterialsMixin(MaterialProcessingMixin):
             rows = connection.execute(text(
                 "SELECT r.reference_ref FROM hc_work_material_references r "
                 "JOIN hc_work_material_submissions s USING(submission_ref) "
-                "WHERE s.state='ready' AND s.anchor_kind IN ('creation','manual','guidance','input','request') "
+                "WHERE s.state='ready' AND s.anchor_kind IN ('creation','manual','guidance','input','request','acquired') "
                 "AND json_extract(r.selection_json,'$.kind') IN ('directory','file') AND ("
                 "json_extract(s.receiver_json,'$.quest_ref')=:quest OR "
                 "EXISTS (SELECT 1 FROM json_each(s.receiver_json,'$.roots') root "
                 "WHERE json_extract(root.value,'$.quest_ref')=:quest) OR "
                 "(s.anchor_kind='creation' AND EXISTS (SELECT 1 FROM rg_quests q "
-                "WHERE q.initialization_id=s.anchor_ref AND q.quest_ref=:quest)))"
+                "WHERE q.initialization_id=s.anchor_ref AND q.quest_ref=:quest)) OR "
+                "(s.anchor_kind IN ('request','acquired') AND ("
+                "EXISTS (SELECT 1 FROM json_each(s.receiver_json,'$.roots') root "
+                "JOIN rg_quests q ON q.initialization_id=json_extract(root.value,'$.initialization_id') "
+                "WHERE q.quest_ref=:quest) OR "
+                "EXISTS (SELECT 1 FROM json_each(s.receiver_json,'$.roots') root "
+                "JOIN ar_deepfetch_runs dr ON dr.run_ref=json_extract(root.value,'$.work_ref') "
+                "JOIN hc_deepfetch_requests d ON d.request_ref=dr.request_ref "
+                "JOIN rg_quests q ON q.initialization_id=d.initialization_id "
+                "WHERE q.quest_ref=:quest))))"
             ), {"quest": location.quest_ref}).all()
         return {row.reference_ref for row in rows}
 
@@ -497,7 +508,7 @@ class WorkMaterialsMixin(MaterialProcessingMixin):
                 details = os.fstat(stream.fileno())
                 receipt = {"state": "ready", "effect_key": key,
                     "work_file": {"kind": "work_file", "work_ref": operation.work.work_ref, "path": name, "trial_ref": key},
-                    "working_path": ("/workspace/" + operation.work.relative_directory + "/" + name if creation
+                    "working_path": (str(operation.work.work_directory / name) if creation
                         else str(operation.work.location.directory / name)),
                     "source": {"kind": "original_file", "reference_ref": reference_ref, "path": path, "observation_ref": observation_ref},
                     "bytes": offset, "sha256": digest.hexdigest(), "read_witnesses": witnesses,

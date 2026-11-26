@@ -92,6 +92,7 @@ def test_linked_processing_result_survives_cycle_cleanup_and_reports_later_drift
             acquired = _accepted(_call(self.runtime, channel, "research_workspace.materials.acquire",
                 effect_id="acquire-linked", absolute_path=str(source), description="Retrieve the reported observation."))
             reference = acquired["references"][0]["reference_ref"]
+            self.reference = reference
             observation = _accepted(_call(self.runtime, channel, "research_workspace.materials.discover",
                 reference_ref=reference))["entries"][0]["observation"]["observation_ref"]
             copied = _accepted(_call(self.runtime, channel, "research_workspace.materials.copy",
@@ -119,7 +120,7 @@ def test_linked_processing_result_survives_cycle_cleanup_and_reports_later_drift
             run_ref="post-cleanup-reader", root_ref="post-cleanup-session"))
         channel = _channel(runtime, successor)
         first = _accepted(_call(runtime, channel, "research_workspace.materials.discover", limit=1))
-        assert first["references"] == [] and first["next_offset"] == 1
+        assert [item["reference_ref"] for item in first["references"]] == [idea.reference] and first["next_offset"] == 1
         second = _accepted(_call(runtime, channel, "research_workspace.materials.discover", limit=1, offset=1))
         assert second["references"] == [] and second["next_offset"] is None
         assert {item["feedback_ref"] for item in first["retained_treatments"] + second["retained_treatments"]} == {
@@ -260,10 +261,7 @@ def test_receiving_research_root_chooses_custody_and_successor_reads_retained_us
         successor = _external_context(_scope(runtime, quest_ref=observed["quest"], run_ref="later-root", root_ref="later-session"))
         channel = _channel(runtime, successor)
         discovered = _accepted(_call(runtime, channel, "research_workspace.materials.discover"))
-        if source_kind == "acquired":
-            assert observed["reference"] not in [item["reference_ref"] for item in discovered["references"]]
-        else:
-            assert observed["reference"] in [item["reference_ref"] for item in discovered["references"]]
+        assert observed["reference"] in [item["reference_ref"] for item in discovered["references"]]
         retained = [item for item in discovered["retained_treatments"] if item["reference_ref"] == observed["reference"]]
         assert len(retained) == (0 if choice == "neither" else 1)
         for selected in observed["treatment"]["selections"]:

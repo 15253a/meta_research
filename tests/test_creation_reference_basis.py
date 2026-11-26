@@ -11,20 +11,16 @@ from meta_research.owners.common import OwnerConflict
 from meta_research.work_material_contract import CREATION_MATERIAL_OPERATION_IDS
 from meta_research.web import create_app
 from test_creation_material_consumption import _call, _open, _value
-from test_creation_material_copy import _native
 from test_root_workspace import _make
-
-
-pytestmark = pytest.mark.skipif(os.name != "posix" or os.geteuid() != 0, reason="requires protected native execution")
 
 
 def _understood(runtime, client, source, key):
     anchor, binding, reference = _open(client, runtime, source, key)
     human, roots = runtime.owners.human_collaboration, runtime.root_workspaces
-    roots.configure_creation_runtime(executable="/bin/bash", credentials_home=source.parent / "credentials")
     inputs = human.creation_material_snapshot(anchor)
     work = roots.protected_creation(binding, inputs, operation_ref=key + "-understand")
-    assert _native(work, f"mkdir -p /workspace/{work.relative_directory}; printf 'result 25\\n' > /workspace/{work.relative_directory}/result.txt").returncode == 0
+    (work.work_directory / "result.txt").write_bytes(b"result 25\n")
+    work.completed_handoff()
     access = work.channel()
     class Connection:
         token = access.token
@@ -66,7 +62,7 @@ def test_exact_original_result_selection_custody_and_small_projection(tmp_path, 
                     "custody": "linked_local", "reason": "Retain the explicitly selected trial result."})
             memory = runtime.owners.research_memory.creation_bases
             os.symlink(source, work.work_directory / "external-original")
-            (work.runtime.work_directory / "companion-kept.txt").write_text("Other Companion state.")
+            (work.binding.directory / "companion-kept.txt").write_text("Other Companion state.")
             if selection == "neither":
                 from sqlalchemy import text
                 with memory._database.write() as connection:
@@ -81,7 +77,7 @@ def test_exact_original_result_selection_custody_and_small_projection(tmp_path, 
                     connection.execute(text("UPDATE hc_creation_material_copies SET state='failed' WHERE effect_key='pending-copy'"))
                 assert work.cleanup_after_acceptance(basis) == {"status": "cleaned"}
             assert not work.work_directory.exists()
-            assert (work.runtime.work_directory / "companion-kept.txt").read_text() == "Other Companion state."
+            assert (work.binding.directory / "companion-kept.txt").read_text() == "Other Companion state."
             assert work.cleanup_after_acceptance(basis) == {"status": "cleaned"}
             selected = [item for item in basis["sources"] if item["binding"] is not None]
             assert len(selected) == len(value["selection"])
@@ -98,7 +94,7 @@ def test_exact_original_result_selection_custody_and_small_projection(tmp_path, 
             assert not list(binding.directory.glob(".creation-context/sources/*"))
             assert (source / "note.txt").read_bytes() == original
             assert (source / "large.bin").stat().st_blocks == 0
-            assert not list(work.runtime.jail_root.rglob("large.bin"))
+            assert not list(work.binding.directory.rglob("large.bin"))
             copied_value = copy.deepcopy(value)
             copied_value["claims_and_conditions"][0]["sources"][0]["witness_ref"] = "other-session"
             with pytest.raises(OwnerConflict, match="creation_understanding_invalid"):

@@ -309,29 +309,40 @@ class BundleStageWorker:
                 raise OwnerConflict("bundle_foreground_epoch_stale")
             accepted_formal_plan = eligible.accepted_formal_plan()
             accepted_idea_set = eligible.accepted_idea_set
+            creation_bases = getattr(self._research_memory, "creation_bases", None)
+            basis = (
+                creation_bases.for_question(
+                    current.question.question_ref, current.question.quest_ref
+                )
+                if creation_bases is not None
+                else None
+            )
+            bundle_context_pack: dict[str, object] = {
+                "schema_ref": (
+                    BUNDLE_CONTEXT_PACK_SCHEMA_REF
+                    if accepted_idea_set is None
+                    else BUNDLE_SUCCESSOR_CONTEXT_PACK_SCHEMA_REF
+                ),
+                "cycle_ref": current.cycle_ref,
+                "cycle_position": self._advancement_engine.query_cycle_position(current.cycle_ref),
+                "accepted_question_binding": current.question.as_binding().as_dict(),
+                "accepted_formal_plan_binding": accepted_formal_plan.as_dict(),
+                **(
+                    {}
+                    if accepted_idea_set is None
+                    else {
+                        "accepted_idea_set_binding": accepted_idea_set.as_dict()
+                    }
+                ),
+            }
+            if basis is not None:
+                bundle_context_pack["creation_basis"] = creation_bases.reference(basis)
             self._advancement_engine.ensure_bundle_stage_request(
                 cycle_ref=current.cycle_ref,
                 accepted_question=current.question.as_binding(),
                 accepted_formal_plan=accepted_formal_plan,
                 accepted_idea_set=accepted_idea_set,
-                context_pack={
-                    "schema_ref": (
-                        BUNDLE_CONTEXT_PACK_SCHEMA_REF
-                        if accepted_idea_set is None
-                        else BUNDLE_SUCCESSOR_CONTEXT_PACK_SCHEMA_REF
-                    ),
-                    "cycle_ref": current.cycle_ref,
-                    "cycle_position": self._advancement_engine.query_cycle_position(current.cycle_ref),
-                    "accepted_question_binding": current.question.as_binding().as_dict(),
-                    "accepted_formal_plan_binding": accepted_formal_plan.as_dict(),
-                    **(
-                        {}
-                        if accepted_idea_set is None
-                        else {
-                            "accepted_idea_set_binding": accepted_idea_set.as_dict()
-                        }
-                    ),
-                },
+                context_pack=bundle_context_pack,
                 idempotency_key=_operation_key(
                     "bundle-request", current.cycle_ref, str(epoch)
                 ),

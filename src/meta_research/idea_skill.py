@@ -76,6 +76,7 @@ from meta_research.codex_runtime import (
     CODEX_MODEL_REF,
     CODEX_LOCKED_VERSION,
     CODEX_REASONING_EFFORT_BINDING,
+    CODEX_REASONING_SUMMARY_CONFIG,
     codex_root_reasoning_preset_config,
 )
 from meta_research.idea_contract import (
@@ -1326,6 +1327,9 @@ class CodexIdeaSkillAdapter:
         """Stop and verify every durable phase belonging to a terminal Run."""
 
         self.cancel_job(job_ref)
+        return self._reconcile_cancelled_job_spools(job_ref)
+
+    def _reconcile_cancelled_job_spools(self, job_ref: str) -> bool:
         operation_root = (
             self._workspace
             / "provider-operations"
@@ -2260,8 +2264,9 @@ class CodexIdeaSkillAdapter:
         return tuple(text for _, _, text in inputs), False
 
     def _turn_conditions(self, runner, run_ref, workspace_binding, *, native_session_ref=None,
-                         exclude_directory=None):
+                         exclude_directory=None, extra_runtime_conditions=None):
         conditions = (getattr(runner, "runtime_conditions", None)
+                      or extra_runtime_conditions
                       or render_runtime_conditions(self._workspace, run_ref=run_ref))
         if workspace_binding is not None and workspace_binding.location.cycle_ref and self._workspaces is not None:
             conditions += self._workspaces.native_directory_prompt(workspace_binding.location)
@@ -2294,6 +2299,7 @@ class CodexIdeaSkillAdapter:
         operation_input: dict[str, object] | None = None,
         execution_access_mode: str | None = None,
         execution_write_root: Path | None = None,
+        extra_runtime_conditions: str | None = None,
     ) -> tuple[dict[str, object], str | None, str]:
         entry_path: RootCapabilityEntryPath = (
             "resume" if native_session_ref is not None else "initial"
@@ -2381,11 +2387,13 @@ class CodexIdeaSkillAdapter:
                     invocation_runner=invocation_runner,
                     provider_execution_binding=provider_execution_binding,
                     operation_input=operation_input,
+                    extra_runtime_conditions=extra_runtime_conditions,
                 )
             else:
                 prompt = compose_runtime_prompt(
                     prompt, self._turn_conditions(invocation_runner, run_ref, workspace_binding,
-                        native_session_ref=native_session_ref)
+                        native_session_ref=native_session_ref,
+                        extra_runtime_conditions=extra_runtime_conditions)
                 )
                 _validate_provider_inputs(prompt, schema, transport_limits=transport_limits)
                 model_ref = selected_stage_model(self._workspace, self._root_agent_kind, run_ref=run_ref, default=self._model_ref)
@@ -2471,6 +2479,7 @@ class CodexIdeaSkillAdapter:
         operation_input: dict[str, object] | None = None,
         execution_access_mode: str | None = None,
         execution_write_root: Path | None = None,
+        extra_runtime_conditions: str | None = None,
     ) -> tuple[dict[str, object], str | None, str, dict[str, object]]:
         runner = self._runner if invocation_runner is None else invocation_runner
         directory.mkdir(parents=True, exist_ok=True)
@@ -2517,7 +2526,8 @@ class CodexIdeaSkillAdapter:
             model_ref = selected_stage_model(self._workspace, self._root_agent_kind, run_ref=run_ref, default=self._model_ref)
             prompt = compose_runtime_prompt(
                 prompt, self._turn_conditions(invocation_runner, run_ref, workspace_binding,
-                    native_session_ref=native_session_ref, exclude_directory=directory)
+                    native_session_ref=native_session_ref, exclude_directory=directory,
+                    extra_runtime_conditions=extra_runtime_conditions)
             )
         _validate_provider_inputs(prompt, schema, transport_limits=transport_limits)
         capability_profile = root_capability_profile(self._root_agent_kind, model_ref)
@@ -2753,6 +2763,8 @@ class CodexIdeaSkillAdapter:
             'approval_policy="never"',
             "--config",
             codex_root_reasoning_preset_config(model_ref),
+            "--config",
+            CODEX_REASONING_SUMMARY_CONFIG,
             *(
                 value
                 for feature in _DISABLED_CODEX_FEATURES

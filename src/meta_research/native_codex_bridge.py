@@ -61,7 +61,8 @@ def _exec_item(item):
     names = {"agentMessage": "agent_message", "commandExecution": "command_execution",
              "fileChange": "file_change", "mcpToolCall": "mcp_tool_call",
              "collabAgentToolCall": "collab_tool_call", "webSearch": "web_search",
-             "imageView": "image_view", "contextCompaction": "context_compaction"}
+             "imageView": "image_view", "contextCompaction": "context_compaction",
+             "reasoning": "reasoning"}
     kind = item.get("type")
     if kind not in names:
         return None

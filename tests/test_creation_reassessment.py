@@ -16,9 +16,6 @@ from test_creation_material_copy import _native
 from test_root_workspace import _make
 
 
-pytestmark = pytest.mark.skipif(os.name != "posix" or os.geteuid() != 0, reason="requires protected native execution")
-
-
 def read_materials(runtime, binding, inputs, operation_ref, reference, paths):
     work = runtime.root_workspaces.protected_creation(binding, inputs, operation_ref=operation_ref)
     assert _native(work, "true").returncode == 0

@@ -5453,6 +5453,21 @@ class SQLiteHumanCollaboration(WorkMaterialsMixin, HumanResearchInputMixin, Huma
             "existing_work_applicability": basis.get("applicability"),
             "inherited_literature": basis.get("inherited_literature", []),
             "existing_work_retrieval": {key: basis["understanding"][key] for key in ("claims_and_conditions", "conflicts", "gaps", "unfinished_questions")}}
+        mounted_refs = [
+            {
+                "reference_ref": item["reference_ref"],
+                "absolute_path": item["source"]["absolute_path"],
+                "kind": item["source"]["kind"],
+                **(
+                    {"description": item["description"]}
+                    if isinstance(item.get("description"), str) and item["description"].strip()
+                    else {}
+                ),
+            }
+            for item in basis.get("material_references", {}).get("references", [])
+        ]
+        if mounted_refs:
+            scope["material_references"] = mounted_refs
         materials = [*request.accepted_material_bindings, *(source["binding"] for source in basis["sources"] if source["binding"] is not None)]
         materials = list({item["version_ref"]: item for item in materials}.values())
         scope_hash = canonical_hash(scope)

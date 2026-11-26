@@ -9,7 +9,6 @@ from pathlib import Path
 import stat
 
 from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
-from meta_research.protected_creation_runtime import ProtectedCreationRuntime
 from meta_research.semantic_mcp import TOOL_DISCOVERY_OPERATION_IDS
 from meta_research.work_material_contract import CREATION_MATERIAL_OPERATION_IDS
 
@@ -48,23 +47,26 @@ def _remove_owned_contents(directory):
 
 class ProtectedCreation:
     def __init__(self, owner, binding, inputs, operation_ref):
-        if owner._creation_runtime_configuration is None:
-            raise OwnerConflict("protected_creation_runtime_unavailable")
-        executable, credentials_home = owner._creation_runtime_configuration
         identity = canonical_hash({"workspace_ref": binding.location.workspace_ref,
                                    "root_session_ref": binding.location.root_session_ref})
-        self.runtime = ProtectedCreationRuntime(owner._bases["companion"] / ".protected" / identity,
-                                               executable, credentials_home)
+        self.runtime = None
+        self.work_root = (owner._bases["companion"] / "creation-work" / identity).absolute()
+        resolved_work_root = self.work_root.resolve()
         for item in inputs.references:
-            original = Path(item["source"]["absolute_path"]).absolute()
-            if original.is_relative_to(self.runtime.jail_root):
+            raw_original = Path(item["source"]["absolute_path"])
+            if (
+                raw_original.absolute().is_relative_to(self.work_root)
+                or raw_original.resolve().is_relative_to(resolved_work_root)
+            ):
                 raise OwnerConflict("creation_original_in_work")
         self.owner = owner
         self.operation = owner._hc.begin_creation_material_operation(inputs, binding, operation_ref)
         self.operation.work = self
-        self.binding = replace(binding, location=replace(binding.location, directory=self.runtime.work_directory))
+        self.binding = replace(binding, location=replace(binding.location, directory=self.work_root))
         self.work_ref = "creation_work:" + canonical_hash({"operation_ref": operation_ref})
         self.relative_directory = "operations/" + canonical_hash({"operation_ref": operation_ref})
+        owner._ensure_directory(self.work_root)
+        owner._ensure_directory(self.work_directory)
         self._token = None
         self._terminal = False
         self._executed = False
@@ -75,12 +77,12 @@ class ProtectedCreation:
         self.read_inherited_literature = ()
         self.execution_binding = {"operation_ref": operation_ref, "fence_ref": self.operation.fence_ref,
             "binding_hash": self.operation.binding_hash, "work_ref": self.work_ref,
-            "work_directory": "/workspace/" + self.relative_directory,
-            "runtime_contract": "linux-x86_64-chroot-v1"}
+            "work_directory": str(self.work_directory),
+            "runtime_contract": "host-direct-v1"}
 
     @property
     def work_directory(self):
-        return self.runtime.work_directory / self.relative_directory
+        return self.work_root / self.relative_directory
 
     def channel(self, extra_operations=()):
         from meta_research.root_resident_mcp import RootResidentMcpAccess
@@ -139,31 +141,35 @@ class ProtectedCreation:
             "historical": True, "inherited_literature": self.read_inherited_literature}
 
     def completed_handoff(self):
-        outcome = self.runtime.request_stop()
-        if not outcome["descendants_ended"] or outcome["status"] not in {"completed", "stopped"}:
-            raise OwnerConflict("protected_creation_unknown_outcome")
+        if self.runtime is not None:
+            outcome = self.runtime.request_stop()
+            if not outcome["descendants_ended"] or outcome["status"] not in {"completed", "stopped"}:
+                raise OwnerConflict("protected_creation_unknown_outcome")
         self._executed = True
 
     def run(self, call):
         if self._terminal:
             raise OwnerConflict("creation_work_closed")
+        if self.runtime is None:
+            raise OwnerConflict("protected_creation_runtime_unavailable")
         completed = self.runtime.run(call)
         self._executed = True
         return completed
 
     def request_stop(self):
-        return self.runtime.request_stop()
+        if self.runtime is not None:
+            return self.runtime.request_stop()
+        return {"status": "completed" if self._executed else "stopped", "descendants_ended": True}
 
     @contextmanager
     def new_copy(self, effect_key, suffix):
-        with owned_directory(self.runtime.work_directory) as root:
+        with owned_directory(self.work_root) as root:
             parent = root
             opened = []
             try:
                 for part in self.relative_directory.split("/"):
                     try:
                         os.mkdir(part, 0o700, dir_fd=parent)
-                        os.chown(part, 65534, 65534, dir_fd=parent, follow_symlinks=False)
                     except FileExistsError:
                         pass
                     parent = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
@@ -179,7 +185,6 @@ class ProtectedCreation:
                         details = os.fstat(stream.fileno())
                         if details.st_nlink != 1:
                             raise OwnerConflict("creation_work_unsafe")
-                        os.fchown(stream.fileno(), 65534, 65534)
                 except BaseException:
                     os.unlink(name, dir_fd=parent)
                     raise
@@ -311,7 +316,7 @@ class ProtectedCreation:
         try:
             if not self._executed:
                 raise OwnerConflict("protected_creation_unknown_outcome")
-            outcome = self.runtime.request_stop()
+            outcome = self.request_stop()
             if not outcome["descendants_ended"] or outcome["status"] not in {"completed", "stopped"}:
                 raise OwnerConflict("protected_creation_unknown_outcome")
             identity = self.operation.seal()
@@ -323,7 +328,6 @@ class ProtectedCreation:
 
     def cleanup_after_acceptance(self, basis):
         from sqlalchemy import text
-        from meta_research.protected_creation_runtime import ProtectedCreationError
 
         if self.sealed_identity is None or not self._terminal:
             return {"status": "retained", "reason": "creation_work_not_sealed"}
@@ -353,8 +357,11 @@ class ProtectedCreation:
                 memory._owner.verify_asset_binding(asset_ref=binding["asset_ref"], version_ref=binding["version_ref"],
                     content_hash=binding["content_hash"], manifest_hash=binding["manifest_hash"],
                     receipt=memory._owner.query_asset_version(binding["version_ref"]).receipt)
-            with self.runtime.exclusive_sealed_work() as workspace, owned_directory(workspace) as directory:
-                operations = os.open("operations", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            with owned_directory(self.work_root) as directory:
+                try:
+                    operations = os.open("operations", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                except FileNotFoundError:
+                    return {"status": "cleaned"}
                 try:
                     name = self.relative_directory.split("/")[1]
                     try:
@@ -369,13 +376,15 @@ class ProtectedCreation:
                 finally:
                     os.close(operations)
             return {"status": "cleaned"}
-        except (OwnerConflict, ProtectedCreationError, OSError) as error:
+        except (OwnerConflict, OSError) as error:
             return {"status": "retained", "reason": getattr(error, "code", "creation_work_unsafe")}
 
     def fail(self, *, unknown_outcome=False):
-        self.operation.fail(unknown_outcome=unknown_outcome)
-        self._terminal = True
-        self._revoke()
+        try:
+            self.operation.fail(unknown_outcome=unknown_outcome)
+            self._terminal = True
+        finally:
+            self._revoke()
 
     def _revoke(self):
         if self._token is not None:

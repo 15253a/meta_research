@@ -26,6 +26,7 @@ from typing import Literal, Protocol, cast
 from meta_research.system_prompt import read_output_language
 from meta_research.codex_runtime import (
     CODEX_LOCKED_VERSION, DEFAULT_CODEX_CLI_VERSION, SUPPORTED_CODEX_CLI_VERSIONS,
+    CODEX_REASONING_SUMMARY_CONFIG,
     codex_root_reasoning_preset_config,
 )
 from meta_research.codex_ledger import CodexHomeLedgerReader
@@ -1142,6 +1143,8 @@ class CodexHarnessAdapter(_NativeCliHarnessAdapter):
             'approval_policy="never"',
             "--config",
             codex_root_reasoning_preset_config(invocation.model_ref),
+            "--config",
+            CODEX_REASONING_SUMMARY_CONFIG,
             "--config",
             "mcp_servers={}",
             "--sandbox",

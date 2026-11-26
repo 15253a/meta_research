@@ -451,12 +451,18 @@ def compose_runtime_prompt(prompt: str, conditions: str) -> str:
     return f"{_PREFIX}{len(conditions)}]\n{conditions}\n\n{prompt}"
 
 
+_MOUNTED_MATERIALS_MARKER = (
+    "Mounted server materials (persistent read-only references, directly accessible on host "
+    "or via research_workspace.materials.*): "
+)
+
+
 def resume_runtime_conditions(conditions: str, previous: tuple[str, ...], *, ordered=False) -> str:
     if not previous:
         return conditions
-    current_values, current_directories = _runtime_prompt_values(conditions)
+    current_values, current_directories, current_mounted = _runtime_prompt_values(conditions)
     observed = [_runtime_prompt_values(value) for value in previous]
-    if not current_values and current_directories is None:
+    if not current_values and current_directories is None and current_mounted is None:
         compared = previous[:1] if ordered else previous
         return "" if all(value == conditions for value in compared) else conditions
     updates = {}
@@ -467,7 +473,7 @@ def resume_runtime_conditions(conditions: str, previous: tuple[str, ...], *, ord
                 "overrun_seconds", "observed_at", "accuracy", "status", "budget_policy",
                 "accounting_corrections", "unknown_intervals") if key in value}
         else:
-            known = [values[field] for values, _ in observed if field in values]
+            known = [values[field] for values, _, _ in observed if field in values]
             if ordered:
                 known = known[:1]
             if not known or any(item != value for item in known):
@@ -480,7 +486,7 @@ def resume_runtime_conditions(conditions: str, previous: tuple[str, ...], *, ord
         if "research_style" in updates:
             lines.append(render_research_style(updates["research_style"]))
     if current_directories is not None:
-        prior_lists = [directories for _, directories in observed if directories is not None]
+        prior_lists = [directories for _, directories, _ in observed if directories is not None]
         if ordered:
             prior_lists = prior_lists[:1]
         current_by_ref = {item["workspace_ref"]: item for item in current_directories}
@@ -491,6 +497,21 @@ def resume_runtime_conditions(conditions: str, previous: tuple[str, ...], *, ord
         if changed or removed:
             lines.append("工作目录授权更新=" + json.dumps({"directories": current_directories,
                 "removed_workspace_refs": removed}, ensure_ascii=False, separators=(",", ":")))
+    prior_mounted_lists = [mounted for _, _, mounted in observed if mounted is not None]
+    if ordered:
+        prior_mounted_lists = prior_mounted_lists[:1]
+    if current_mounted is not None or prior_mounted_lists:
+        current_list = current_mounted or []
+        current_by_ref = {item["reference_ref"]: item for item in current_list}
+        known_refs = {item["reference_ref"] for mounted in prior_mounted_lists for item in mounted}
+        changed = [item for item in current_list
+                   if not prior_mounted_lists or any(item not in mounted for mounted in prior_mounted_lists)]
+        removed = sorted(known_refs - current_by_ref.keys())
+        if changed or removed:
+            lines.append("挂载材料授权更新=" + json.dumps({
+                "mounted_materials": current_list,
+                "removed_reference_refs": removed,
+            }, ensure_ascii=False, separators=(",", ":")))
     return "\n".join(lines)
 
 
@@ -503,7 +524,7 @@ def runtime_conditions_from_prompt(prompt: str) -> str:
 
 
 def _runtime_prompt_values(conditions):
-    values, directories = {}, None
+    values, directories, mounted = {}, None, None
     for line in conditions.splitlines():
         if line.startswith("当前运行条件更新="):
             values.update(json.loads(line.split("=", 1)[1]))
@@ -511,11 +532,15 @@ def _runtime_prompt_values(conditions):
             value = json.loads(line)
             if "quest_ref" in value and "revision" in value:
                 values.update(value)
-        if "Work directories: " in line:
-            directories = json.loads(line.split("Work directories: ", 1)[1])
+        elif line.startswith(_MOUNTED_MATERIALS_MARKER):
+            mounted = json.loads(line.split(_MOUNTED_MATERIALS_MARKER, 1)[1])
+        elif line.startswith("挂载材料授权更新="):
+            mounted = json.loads(line.split("=", 1)[1])["mounted_materials"]
         elif line.startswith("工作目录授权更新="):
             directories = json.loads(line.split("=", 1)[1])["directories"]
-    return values, directories
+        elif "Work directories: " in line:
+            directories = json.loads(line.split("Work directories: ", 1)[1])
+    return values, directories, mounted
 
 
 def split_runtime_prompt(prompt: str) -> tuple[str, str]:

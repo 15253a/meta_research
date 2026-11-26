@@ -1,14 +1,14 @@
-import os
 import copy
+import hashlib
 import json
 from pathlib import Path
+import re
 
 from fastapi.testclient import TestClient
 import pytest
 
 from meta_research.companion import CodexCompanionAdapter
 from meta_research.creation_basis import FirstQuestionSynthesisRequest, InitializationUnderstandingRequest, empty_manifest, empty_understanding, first_creation_instructions
-from meta_research.protected_creation_runtime import NativeCreationCall
 from meta_research.quest_drafting import DraftingUnavailable
 from meta_research.owners.common import OwnerConflict
 from meta_research.web import create_app
@@ -16,8 +16,6 @@ from meta_research.work_material_contract import CREATION_MATERIAL_OPERATION_IDS
 from test_creation_material_consumption import _call, _open, _value
 from test_root_workspace import _make
 
-
-pytestmark = pytest.mark.skipif(os.name != "posix" or os.geteuid() != 0, reason="requires actual protected creation runtime")
 
 QUESTION = {"title": "Compare the calibration", "unknown_statement": "Does the cold condition reproduce the effect?",
     "answer_shape": "A controlled comparison", "applicability_scope": "Small calibration experiment",
@@ -34,24 +32,24 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
         self.calls = []
 
     def _invoke(self, **arguments):
-        runner = arguments["invocation_runner"]
-        work = runner.work
+        assert arguments["invocation_runner"] is None
+        work = self._creation_calls[arguments["job_ref"]]
+        assert work.runtime is None
+        assert work.execution_binding["runtime_contract"] == "host-direct-v1"
         self.calls.append((arguments, work))
-        guidance = runner.read_only_inputs[:3]
-        assert len(runner.read_only_inputs) >= 3
-        completed = work.run(NativeCreationCall(("/bin/bash", "-c",
-            f"cat \"$@\"; mkdir -p /workspace/{work.relative_directory}; printf 'trial 25\\n' > /workspace/{work.relative_directory}/trial.txt", "guidance", *(str(path) for path in guidance)),
-            arguments["prompt"], None, {}, runner.read_only_inputs, ()))
-        assert completed.returncode == 0
-        assert "# Understand existing work" in completed.stdout
-        for path in guidance:
-            assert path.read_text(encoding="utf-8") in completed.stdout
+        marker = "Protected creation binding and explicit guidance file locations:\n"
+        binding_payload = json.JSONDecoder().raw_decode(arguments["prompt"].split(marker, 1)[1])[0]
+        guidance = [Path(path) for path in binding_payload["guidance_files"].values()]
+        assert len(guidance) >= 3
+        combined_guidance = "\n".join(path.read_text(encoding="utf-8") for path in guidance)
+        assert "# Understand existing work" in combined_guidance
+        (work.work_directory / "trial.txt").write_text("trial 25\n", encoding="utf-8")
         if arguments["operation_name"] == "initialization-understanding":
             prompt = arguments["prompt"]
             loaded = json.JSONDecoder().raw_decode(prompt[prompt.index("{"):])[0]
             assert loaded["instruction_bundle"] == first_creation_instructions()
         assert arguments["operation_name"] in {"initialization-understanding", "first-question-synthesis", "companion-turn"}
-        assert "third-party Python scientific packages" in runner.runtime_conditions
+        assert "extra_runtime_conditions" in arguments
         assert "protected_creation" not in str(self._runner)
         class Connection:
             token = arguments["mcp_token"]
@@ -171,57 +169,36 @@ class ProtectedCreationFixture(CodexCompanionAdapter):
 
 class ReadableGuidanceFixture(ProtectedCreationFixture):
     def _invoke(self, **arguments):
-        runner = arguments["invocation_runner"]
         developer = next(value for value in self.capability_profile().codex_arguments()
                          if value.startswith("developer_instructions="))
-        # Execute the advertised paths, including links inside the actual copied
-        # documents, with the same filesystem boundary as the native reader.
-        script = '''import hashlib, json, pathlib, re, sys
-developer = json.loads(sys.argv[1].split("=", 1)[1])
-allowed = {pathlib.Path(path).resolve() for path in json.loads(sys.argv[3])}
-root = pathlib.Path(re.search(r"^Shared reference root: (.+)$", developer, re.M)[1])
-pending = [root / path for path in re.findall(r"`(references/[^`]+)`", developer)]
-pending += [pathlib.Path(path) for path in re.findall(r"^(?:Shared writing skill|Companion role|Creation role) source: (.+)$", developer, re.M)]
-seen = set()
-while pending:
-    path = pending.pop(0).resolve()
-    if path in seen:
-        continue
-    seen.add(path)
-    content = path.read_text()
-    for link in re.findall(r"\\]\\(([^)]+)\\)", content):
-        if "://" not in link and not link.startswith("#"):
-            linked = (path.parent / link.split("#", 1)[0]).resolve()
-            if linked in allowed:
-                pending.append(linked)
-            else:
-                assert not linked.exists(), str(linked)
-assert len(seen) >= 14
-prompt = sys.argv[2]
-binding = json.loads(prompt.split("Protected creation binding and explicit guidance file locations:\\n", 1)[1].split("\\nRead guidance", 1)[0])
-task = json.JSONDecoder().raw_decode(prompt[prompt.index("\\n{") + 1:])[0]
-context = task.get("sealed_context")
-if context is not None:
-    assert set(binding["context_files"]) == {item["path"] for item in context["manifest"]}
-    for item in context["manifest"]:
-        content = pathlib.Path(binding["context_files"][item["path"]]).read_bytes()
-        assert hashlib.sha256(content).hexdigest() == item["sha256"]
-        json.loads(content)
-print(json.dumps({"context": context, "guidance_files_read": len(seen)}))
-'''
-        call = NativeCreationCall(("/bin/bash", "-c", 'exec /bin/python - "$@"',
-            "read-guidance", developer, arguments["prompt"], json.dumps(list(map(str, runner.read_only_inputs)))),
-            script, 30.0, {}, runner.read_only_inputs, ())
-        # The baseline lacks this projection field; still execute its real
-        # preparation so the regression fails on unreadable advertised paths.
-        if hasattr(runner, "input_layout_root"):
-            from dataclasses import replace
-            call = replace(call, input_layout_root=runner.input_layout_root)
-        completed = runner.work.run(call)
-        assert completed.returncode == 0, completed.stderr
-        proof = json.loads(completed.stdout)
-        task = json.JSONDecoder().raw_decode(arguments["prompt"][arguments["prompt"].index("\n{") + 1:])[0]
-        assert proof["context"] == task.get("sealed_context")
+        developer_text = json.loads(developer.split("=", 1)[1])
+        root = Path(re.search(r"^Shared reference root: (.+)$", developer_text, re.M)[1])
+        pending = [root / path for path in re.findall(r"`(references/[^`]+)`", developer_text)]
+        pending += [Path(path) for path in re.findall(r"^(?:Shared writing skill|Companion role|Creation role) source: (.+)$", developer_text, re.M)]
+        seen = set()
+        while pending:
+            path = pending.pop(0).resolve()
+            if path in seen:
+                continue
+            seen.add(path)
+            content = path.read_text(encoding="utf-8")
+            for link in re.findall(r"\]\(([^)]+)\)", content):
+                if "://" not in link and not link.startswith("#"):
+                    linked = (path.parent / link.split("#", 1)[0]).resolve()
+                    if linked.is_file():
+                        pending.append(linked)
+        assert len(seen) >= 14
+        prompt = arguments["prompt"]
+        marker = "Protected creation binding and explicit guidance file locations:\n"
+        binding = json.JSONDecoder().raw_decode(prompt.split(marker, 1)[1])[0]
+        task = json.JSONDecoder().raw_decode(prompt[prompt.index("\n{") + 1:])[0]
+        context = task.get("sealed_context")
+        if context is not None:
+            assert set(binding["context_files"]) == {item["path"] for item in context["manifest"]}
+            for item in context["manifest"]:
+                content = Path(binding["context_files"][item["path"]]).read_bytes()
+                assert hashlib.sha256(content).hexdigest() == item["sha256"]
+                json.loads(content)
         return super()._invoke(**arguments)
 
 
@@ -252,8 +229,11 @@ def test_actual_adapter_methods_share_current_protected_gateway_and_readers(tmp_
                 basis, context, None))
             assert synthesis.content == QUESTION
             assert synthesis.input_identity.consumed == ()
-            assert synthesis.work.runtime.jail_root == result.work.runtime.jail_root
-            assert {Path(path).name for path in adapter.calls[1][0]["invocation_runner"].read_only_inputs} >= {"sources.json", "basis.json"}
+            assert synthesis.work.runtime is None
+            assert synthesis.work.binding.directory == result.work.binding.directory
+            marker = "Protected creation binding and explicit guidance file locations:\n"
+            synth_binding = json.JSONDecoder().raw_decode(adapter.calls[1][0]["prompt"].split(marker, 1)[1])[0]
+            assert {Path(path).name for path in synth_binding["context_files"].values()} >= {"sources.json", "basis.json"}
             from meta_research.semantic_mcp import TOOL_DISCOVERY_OPERATION_IDS
             assert adapter.calls[1][0]["authorized_operation_ids"] == (
                 *TOOL_DISCOVERY_OPERATION_IDS, *CREATION_MATERIAL_OPERATION_IDS,
@@ -305,7 +285,7 @@ def test_unexpected_transport_error_revokes_material_scope_without_claiming_unkn
             captured = {}
 
             def fail_transport(**arguments):
-                work = arguments["invocation_runner"].work
+                work = adapter._creation_calls[arguments["job_ref"]]
                 captured.update(work=work, token=arguments["mcp_token"])
                 if not tree_closed:
                     monkeypatch.setattr(work, "request_stop", lambda: {

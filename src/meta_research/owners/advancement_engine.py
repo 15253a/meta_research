@@ -5171,6 +5171,9 @@ class SQLiteAdvancementEngine(
                         quest_goal_revision=quest_goal_revision,
                         reasoning_graph_context=reasoning_graph_context,
                         prior_accepted_bindings=prior,
+                        creation_basis=self._question_creation_basis_reference(
+                            accepted_question
+                        ),
                         evidence_reuse_closure=evidence_reuse_closure,
                         current_target_evidence_closure=(
                             current_target_evidence_closure
@@ -5945,6 +5948,11 @@ class SQLiteAdvancementEngine(
                 prior_accepted_bindings=(
                     self._reasoning_prior_accepted_bindings(requested.cycle_ref)
                     if "prior_accepted_bindings" in requested.context_pack else None
+                ),
+                creation_basis=(
+                    self._question_creation_basis_reference(requested.accepted_question)
+                    if "creation_basis" in requested.context_pack
+                    else None
                 ),
                 quest_goal_revision=cast(
                     dict[str, object],
@@ -9103,6 +9111,21 @@ class SQLiteAdvancementEngine(
         )
         return successor_skip_count
 
+    def _question_creation_basis_reference(
+        self, accepted_question: AcceptedQuestionBinding
+    ) -> dict[str, object] | None:
+        creation_bases = getattr(self._literature_snapshot_verifier, "creation_bases", None)
+        if creation_bases is None:
+            creation_bases = getattr(
+                self._question_literature_revision_verifier, "creation_bases", None
+            )
+        if creation_bases is None:
+            return None
+        basis = creation_bases.for_question(
+            accepted_question.question_ref, accepted_question.quest_ref
+        )
+        return None if basis is None else creation_bases.reference(basis)
+
     def _freeze_reasoning_successor_idea_context(
         self,
         *,
@@ -9145,6 +9168,7 @@ class SQLiteAdvancementEngine(
             **_reasoning_commit_document(source_commit),
             "cycle_ref": source_commit.cycle_ref,
         }
+        creation_basis = self._question_creation_basis_reference(accepted_question)
         context_pack: dict[str, object] = {
             "schema_ref": IDEA_CONTEXT_PACK_SCHEMA_V4_REF,
             "cycle_ref": cycle_ref,
@@ -9157,6 +9181,8 @@ class SQLiteAdvancementEngine(
             "prior_accepted_bindings": [reasoning_handoff_reference(prior)],
             "active_guidance_bindings": guidance,
         }
+        if creation_basis is not None:
+            context_pack["creation_basis"] = creation_basis
         try:
             validate_idea_context_pack(
                 context_pack,
@@ -11399,6 +11425,7 @@ def _reasoning_context_pack_from_rows(
     question_literature_revision: dict[str, object] | None = None,
     reference_literature: bool = True,
     prior_accepted_bindings: list[dict[str, object]] | None = None,
+    creation_basis: dict[str, object] | None = None,
     quest_goal_revision: dict[str, object] | None = None,
     reasoning_graph_context: dict[str, object] | None = None,
     evidence_reuse_closure: tuple[EvidenceReuseLeaf, ...] = (),
@@ -11598,6 +11625,8 @@ def _reasoning_context_pack_from_rows(
         context_pack["typed_skip_basis_refs_by_stage"] = typed_skip_basis_refs_by_stage
     if prior_accepted_bindings is not None:
         context_pack["prior_accepted_bindings"] = prior_accepted_bindings
+    if creation_basis is not None:
+        context_pack["creation_basis"] = creation_basis
     _validate_reasoning_context_pack(
         context_pack,
         cycle_ref=cycle_ref,
@@ -11694,7 +11723,11 @@ def _validate_reasoning_context_pack(
     epoch: int,
     accepted_question_binding: dict[str, object],
 ) -> None:
-    if set(context_pack) - {"prior_accepted_bindings", "typed_skip_basis_refs_by_stage"} != {
+    if set(context_pack) - {
+        "prior_accepted_bindings",
+        "typed_skip_basis_refs_by_stage",
+        "creation_basis",
+    } != {
         "schema_ref",
         "cycle_position",
         "cycle_ref",
@@ -11715,6 +11748,20 @@ def _validate_reasoning_context_pack(
         != accepted_question_binding
     ):
         raise OwnerConflict("reasoning_context_pack_invalid")
+    if "creation_basis" in context_pack:
+        creation = context_pack["creation_basis"]
+        basis_hash = creation.get("basis_hash") if isinstance(creation, dict) else None
+        if (
+            not isinstance(creation, dict)
+            or set(creation) != {"basis_ref", "basis_hash", "kind"}
+            or not isinstance(creation.get("basis_ref"), str)
+            or not creation["basis_ref"]
+            or creation.get("kind") not in {"prepared", "literature_revised"}
+            or not isinstance(basis_hash, str)
+            or len(basis_hash) != 64
+            or any(ch not in "0123456789abcdef" for ch in basis_hash)
+        ):
+            raise OwnerConflict("reasoning_context_pack_invalid")
     typed_skip = context_pack.get("typed_skip_basis_refs_by_stage", {})
     if (
         not isinstance(typed_skip, dict)

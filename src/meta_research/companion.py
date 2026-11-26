@@ -48,6 +48,48 @@ from meta_research.creation_basis import (
 )
 
 
+_CREATION_DIRECT_MCP_SHAPES: dict[str, dict[str, object]] = {
+    "research_workspace.materials.discover": {
+        "reference_ref": "<reference_ref>",
+        "path": "",
+        "limit": 50,
+    },
+    "research_workspace.materials.read": {
+        "reference_ref": "<reference_ref>",
+        "path": "<relative_path_or_empty>",
+        "observation_ref": "<from_discover>",
+        "offset": 0,
+        "max_bytes": 65536,
+    },
+    "research_workspace.materials.copy": {
+        "reference_ref": "<reference_ref>",
+        "path": "<relative_path_or_empty>",
+        "observation_ref": "<from_discover>",
+        "effect_id": "<unique_effect_id>",
+    },
+    "research_workspace.materials.copy.reconcile": {
+        "effect_id": "<unique_effect_id>",
+    },
+    "research_memory.creation_basis.read": {
+        "basis_ref": "<basis_ref>",
+        "expected_basis_hash": "<basis_hash>",
+        "view": "understanding",
+    },
+    "research_memory.content.read": {
+        "source_ref": "<source_ref>",
+        "version_ref": "<version_ref>",
+    },
+}
+
+_CREATION_UNKNOWN_OUTCOME_CODES = frozenset({
+    "protected_creation_unknown_outcome",
+    "codex_operation_reconciliation_pending",
+    "codex_job_outcome_unknown",
+    "codex_job_spool_invalid",
+    "codex_job_spool_conflict",
+})
+
+
 class CodexCompanionAdapter(
     CodexIdeaSkillAdapter, ProposalDrafter, IntentDraftingProvider
 ):
@@ -143,32 +185,68 @@ class CodexCompanionAdapter(
                     raise IdeaSkillUnavailable("companion_native_handoff_invalid") from error
         return super()._invoke(**kwargs)
 
+    def _stop_and_reconcile_target(self, target_ref: str, *, is_durable: bool) -> bool:
+        ok = True
+        try:
+            self._request_durable_job_stop(target_ref)
+        except IdeaSkillUnavailable:
+            ok = False
+        cancel_runner = getattr(self._runner, "cancel_job", None)
+        if callable(cancel_runner):
+            try:
+                cancel_runner(target_ref)
+            except IdeaSkillUnavailable:
+                ok = False
+        if is_durable:
+            try:
+                if not self._reconcile_cancelled_job_spools(target_ref):
+                    ok = False
+            except IdeaSkillUnavailable:
+                ok = False
+        return ok
+
     def cancel_job(self, job_ref: str) -> bool:
         with self._creation_call_lock:
-            runners = [runner for key, runner in self._creation_calls.items()
-                       if key == job_ref or key.startswith(job_ref + ":")]
-            outcomes = [value for key, value in self._creation_outcomes.items()
-                        if key == job_ref or key.startswith(job_ref + ":")]
+            active_works = [
+                (key, work)
+                for key, work in self._creation_calls.items()
+                if key == job_ref or key.startswith(job_ref + ":")
+            ]
+            outcomes = [
+                value
+                for key, value in self._creation_outcomes.items()
+                if key == job_ref or key.startswith(job_ref + ":")
+            ]
             self._creation_stops.add(job_ref)
-        if runners:
-            return all([runner.cancel_job(runner.work.operation.operation_ref)["descendants_ended"] for runner in runners])
-        if outcomes:
-            return all(outcome["descendants_ended"] for outcome in outcomes)
+        target_refs = [job_ref]
+        for key, _work in active_works:
+            if key not in target_refs:
+                target_refs.append(key)
+        db_states: list[str] = []
         if self._workspaces is not None:
             from sqlalchemy import text
             with self._workspaces._hc._database.read() as connection:
                 rows = connection.execute(text("SELECT operation_ref,state FROM hc_creation_material_operations")).all()
-            states = [row.state for row in rows if row.operation_ref == job_ref or row.operation_ref.startswith(job_ref + ":")]
-            if states:
-                return all(state in {"sealed", "failed"} for state in states)
-        self._request_durable_job_stop(job_ref)
-        cancel_job = getattr(self._runner, "cancel_job", None)
-        if callable(cancel_job):
-            cancel_job(job_ref)
-        return True
+            for row in rows:
+                if row.operation_ref == job_ref or row.operation_ref.startswith(job_ref + ":"):
+                    db_states.append(row.state)
+                    if row.operation_ref not in target_refs:
+                        target_refs.append(row.operation_ref)
+        is_durable = callable(getattr(self._runner, "run_durable_job", None))
+        reconciled_all = True
+        for target_ref in target_refs:
+            if not self._stop_and_reconcile_target(target_ref, is_durable=is_durable):
+                reconciled_all = False
+        if active_works:
+            works_ended = all(work.request_stop()["descendants_ended"] for _, work in active_works)
+            return reconciled_all and works_ended
+        if outcomes:
+            return reconciled_all and all(outcome["descendants_ended"] for outcome in outcomes)
+        if db_states:
+            return reconciled_all and all(state in {"sealed", "failed"} for state in db_states)
+        return reconciled_all
 
     def _protected_creation_invoke(self, request, *, operation_name, prompt, schema, native_session_ref, inputs):
-        from meta_research.creation_work import ProtectedCreationRunner
         from meta_research.runtime_conditions import render_runtime_conditions
         if self._workspaces is None or not request.job_ref:
             raise IdeaSkillUnavailable("protected_creation_runtime_unavailable")
@@ -186,71 +264,124 @@ class CodexCompanionAdapter(
         elif getattr(request, "reassessment", None) is not None:
             work.bind_reassessment_readers(request.reassessment)
             extra = ("research_memory.creation_basis.read", "research_memory.content.read")
-        from meta_research.research_guidance import SHARED_REFERENCE_PATHS, shared_reference_root, shared_writing_resources
-        resource_root = shared_reference_root()
         guidance = first_creation_instructions()["paths"]
-        files = [Path(value) for value in guidance.values()]
-        files.extend(resource_root / name for name in sorted(SHARED_REFERENCE_PATHS))
-        files.append(resource_root / "companion-work.md")
-        files.extend(resource_root / "writing-report" / name for name in shared_writing_resources())
         context = getattr(request, "context", None)
         context_files = {}
         if context is not None:
             original_binding = self._creation_workspace(request)
             context_files = {item["path"]: str(original_binding.directory / item["path"])
                              for item in context["manifest"]}
-            files.extend(Path(path) for path in context_files.values())
-        proxy_environment = {key: ",".join(filter(None, (os.environ.get(key), "127.0.0.1", "localhost")))
-                             for key in ("NO_PROXY", "no_proxy")}
-        runner = ProtectedCreationRunner(work, read_only_inputs=files, environment=proxy_environment,
-                                        input_layout_root=resource_root)
-        runner.runtime_conditions = render_runtime_conditions(self._workspace,
-            initialization_id=request.initialization_id) + "\n" + runner.runtime_conditions
+        extra_runtime_conditions = render_runtime_conditions(
+            self._workspace, initialization_id=request.initialization_id
+        )
+        precancelled = False
         with self._creation_call_lock:
             if request.job_ref in self._creation_calls:
                 raise IdeaSkillUnavailable("protected_creation_active")
-            self._creation_calls[request.job_ref] = runner
-            if any(request.job_ref == key or request.job_ref.startswith(key + ":") for key in self._creation_stops):
-                runner.cancel_job(request.job_ref)
+            self._creation_calls[request.job_ref] = work
+            precancelled = any(
+                request.job_ref == key or request.job_ref.startswith(key + ":")
+                for key in self._creation_stops
+            )
+        final_outcome = {"status": "unknown_outcome", "descendants_ended": False}
+        is_durable = callable(getattr(self._runner, "run_durable_job", None))
         try:
+            if precancelled:
+                raise IdeaSkillUnavailable("codex_cli_stopped")
             access = work.channel(extra)
+            mounted_summary = [
+                {
+                    "reference_ref": item["reference_ref"],
+                    "absolute_path": item["source"]["absolute_path"],
+                    "kind": item["source"]["kind"],
+                }
+                for item in inputs.references
+            ]
+            direct_mcp = {
+                op_id: _CREATION_DIRECT_MCP_SHAPES[op_id]
+                for op_id in access.operation_ids
+                if op_id in _CREATION_DIRECT_MCP_SHAPES
+            }
             prompt += "\n\nProtected creation binding and explicit guidance file locations:\n" + _canonical_json({
-                "execution": work.execution_binding, "material_references": inputs.as_dict(),
-                "guidance_files": guidance, "context_files": context_files})
-            prompt += "\nRead guidance through these exact declared locations, including its reference files. "
-            prompt += "Read sealed context through context_files; its keys preserve the canonical manifest paths, "
-            prompt += "and its values are the readable locations. The canonical manifest and context_hash remain unchanged; "
-            prompt += "its logical relative_root is not a mounted directory. "
-            prompt += "Create the operation work directory before writing a program or result. The reference descriptors name unreadable external originals."
-            raw, native_ref, stdout = self._invoke(operation_name=operation_name, prompt=prompt, schema=schema,
-                native_session_ref=native_session_ref, job_ref=request.job_ref,
-                workspace_binding=work.binding, invocation_runner=runner, provider_execution_binding=work.execution_binding,
-                mcp_url=access.url, mcp_token=access.token, mcp_scope_binding_hash=access.scope_binding_hash,
-                authorized_operation_ids=access.operation_ids)
+                "execution": work.execution_binding,
+                "mounted_references_summary": mounted_summary,
+                "material_references": inputs.as_dict(),
+                "direct_mcp_operations": direct_mcp,
+                "guidance_files": guidance,
+                "context_files": context_files,
+            })
+            prompt += (
+                "\nYou run directly on the host with full shell/Python tools and granted MCP operations. "
+                "Registered mounted_references_summary / material_references are directly accessible at their host absolute_path "
+                "(read-only originals; never modify originals in place) and also through direct_mcp_operations. "
+                "You may call any listed MCP operation directly via tools.call(operation_id=..., arguments=...) without calling "
+                "tools.catalog.page or tools.contracts.read first. "
+                "Read guidance through guidance_files (exact host paths) and sealed context through context_files "
+                "(keys preserve canonical manifest paths; values are host paths). "
+                "You may freely inspect files directly on the host (ls, head, tail, wc, grep, python, etc.) "
+                "or temporarily copy files into execution.work_directory to run inspection scripts (use-and-discard)."
+            )
+            raw, native_ref, stdout = self._invoke(
+                operation_name=operation_name,
+                prompt=prompt,
+                schema=schema,
+                native_session_ref=native_session_ref,
+                job_ref=request.job_ref,
+                workspace_binding=work.binding,
+                invocation_runner=None,
+                provider_execution_binding=work.execution_binding,
+                mcp_url=access.url,
+                mcp_token=access.token,
+                mcp_scope_binding_hash=access.scope_binding_hash,
+                authorized_operation_ids=access.operation_ids,
+                extra_runtime_conditions=extra_runtime_conditions,
+            )
             work.completed_handoff()
             identity = work.seal()
+            final_outcome = work.request_stop()
             return raw, native_ref, stdout, identity, work
         except (IdeaSkillUnavailable, OwnerConflict) as error:
+            reconciled = self._stop_and_reconcile_target(request.job_ref, is_durable=is_durable)
             outcome = work.request_stop()
-            unknown = not outcome["descendants_ended"] or error.code == "protected_creation_unknown_outcome"
-            work.fail(unknown_outcome=unknown)
+            unknown = (
+                not outcome["descendants_ended"]
+                or not reconciled
+                or error.code in _CREATION_UNKNOWN_OUTCOME_CODES
+            )
+            final_outcome = (
+                {"status": "unknown_outcome", "descendants_ended": False}
+                if unknown
+                else outcome
+            )
+            try:
+                work.fail(unknown_outcome=unknown)
+            finally:
+                work._revoke()
             if unknown:
                 raise IdeaSkillUnavailable("protected_creation_unknown_outcome") from error
             raise IdeaSkillUnavailable(error.code) from error
         except Exception as error:
             # A transport/programming error still owns the granted material
-            # channel. Close only after the exact runtime proves its tree ended.
+            # channel. Close only after the host supervisor/runtime proves its tree ended.
+            reconciled = self._stop_and_reconcile_target(request.job_ref, is_durable=is_durable)
             outcome = work.request_stop()
-            unknown = not outcome["descendants_ended"]
-            work.fail(unknown_outcome=unknown)
+            unknown = not outcome["descendants_ended"] or not reconciled
+            final_outcome = (
+                {"status": "unknown_outcome", "descendants_ended": False}
+                if unknown
+                else outcome
+            )
+            try:
+                work.fail(unknown_outcome=unknown)
+            finally:
+                work._revoke()
             if unknown:
                 raise IdeaSkillUnavailable("protected_creation_unknown_outcome") from error
             raise
         finally:
-            outcome = work.request_stop()
             with self._creation_call_lock:
-                self._creation_outcomes[request.job_ref] = outcome
-                if outcome["descendants_ended"]:
+                self._creation_outcomes[request.job_ref] = final_outcome
+                if final_outcome["descendants_ended"]:
                     self._creation_calls.pop(request.job_ref, None)
 
     def _transport_contract_failure_code(self, operation_name: str) -> str:
@@ -332,16 +463,24 @@ class CodexCompanionAdapter(
         )
         try:
             if request.inputs is not None:
-                prompt = ("Read registered material entrances only through the granted bounded discover/read/copy MCP tools. "
-                    + ("Return the reference understanding schema using actual returned opaque witness_ref citations. "
-                       if request.reassessment is None else "Return the reassessment delta using actual returned opaque witness_ref citations for new reads. ")
-                    + "Preserve unread and partial entrances. Select exact originals, exact work results, both or neither with explicit custody. "
-                    "A directory is never completely read merely because one child was read.\n"
+                prompt = (
+                    "You are performing lightweight initialization-understanding directly on the host. "
+                    "Your sole purpose is to understand what the user has already done and how it relates to the research topic and direction to assist drafting the first Question — do NOT exhaustively read every file. "
+                    "Leave selection empty ([]) by default: do NOT copy or ingest files into RM/RG just for understanding, because all mounted server paths stay persistently accessible throughout the Quest; only populate selection if the user explicitly asks to formally retain or ingest a specific file or artifact. "
+                    "You have full host shell and Python tools plus granted MCP material tools; decide autonomously based on the actual files whether to inspect directly on the host, browse directories, or temporarily copy files into work_directory to run inspection scripts (use-and-discard). "
+                    + (
+                        "Return the reference understanding schema using either an MCP witness_ref or the registered reference_ref (or host:<reference_ref>) with a concrete location such as relative_path:lines. "
+                        if request.reassessment is None
+                        else "Return the reassessment delta using either an MCP witness_ref or the registered reference_ref (or host:<reference_ref>) for new reads. "
+                    )
+                    + "Preserve unread and partial entrances. A directory is never marked read merely because some children were inspected.\n"
                     + _canonical_json({"instruction_bundle": instructions, "draft": request.draft,
                         "reassessment": request.reassessment}))
                 if request.reassessment is not None:
                     prompt += ("\nJudge each prior statement's applicability and conditions. "
-                        "Read only affected content. Explicitly inherit eligible witnesses with their original operation identity. "
+                        "Read only affected content. Explicitly inherit eligible MCP witnesses from evidence_facts with their original operation identity. "
+                        "Host-direct citations (listed in host_cited_references) do not require inherited_evidence entries; "
+                        "for retained statements on unchanged mounted references, preserve their host-direct citation in additions.coverage[ref].read_ranges (partial or read) rather than marking the reference unread. "
                         "Emit each inherited witness once, using eligible live_source for current reuse. Never emit the same witness "
                         "as both live_source and managed_history. Retain its selected exact version separately in inherited_selection_keys; "
                         "managed custody does not require a managed_history entry for a live witness. "
@@ -374,8 +513,8 @@ class CodexCompanionAdapter(
             "proposal_fork_native_session_ref": {"type": "string", "minLength": 1},
             "result": child_schema}, "required": ["proposal_fork_native_session_ref", "result"]}
         child_prompt = (
-            "Read the small exact context projection through its declared input paths. "
-            "Use the granted scoped Readers for selected original sources and literature evidence, and bounded material tools for new original reads. "
+            "Read the small exact context projection through context_files (real host paths). "
+            "Mounted server material_references remain directly accessible read-only on the host and through the granted MCP material tools and scoped Readers. "
             "Preserve the prepared basis and source selection. "
             "Read applicability.json and inherited-literature.json when present. Reuse applicable statements and exact selected versions; "
             "do not repeat unaffected material reads. Inherited literature retains its original snapshot, run and binding. "
