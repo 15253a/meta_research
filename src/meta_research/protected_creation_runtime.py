@@ -24,6 +24,7 @@ from typing import Callable, Literal
 _UID = 65534
 _INPUT_LIMIT = 16 * 1024 * 1024
 _STOP_SECONDS = 12.0
+_STANDARD_NODE_PATHS = (Path("/usr/local/bin/node"), Path("/usr/bin/node"))
 _HELPER = r'''
 import ctypes, errno, json, os, signal, subprocess, sys, time
 
@@ -470,99 +471,104 @@ class ProtectedCreationRuntime:
             return
         if self.jail_root.exists():
             raise ProtectedCreationError("protected_creation_jail_unrecognized")
-        _directory(self.jail_root, 0o755)
-        staged: dict[str, str] = {}
-        file_modes: dict[str, int] = {}
+        try:
+            _directory(self.jail_root, 0o755)
+            staged: dict[str, str] = {}
+            file_modes: dict[str, int] = {}
 
-        def copy(source: Path, target: Path, *, dependencies: bool = False) -> None:
-            relative = target.relative_to(self.jail_root).as_posix()
-            if relative in staged:
-                return
-            resolved = source.resolve(strict=True)
-            _trusted_runtime(resolved)
-            _directory(target.parent, 0o755)
-            with _regular_reader(resolved) as stream:
-                content = stream.read()
-            mode = 0o555 if os.access(resolved, os.X_OK) else 0o444
-            _write_private(target, content, mode)
-            staged[relative] = hashlib.sha256(content).hexdigest()
-            file_modes[relative] = mode
-            if dependencies:
-                completed = subprocess.run(["/usr/bin/ldd", str(resolved)],
-                    env={**os.environ, "PATH": "/usr/bin:/bin", "LANG": "C"}, capture_output=True,
-                    text=True, timeout=30, check=False)
-                if "not found" in completed.stdout:
-                    raise ProtectedCreationError("protected_creation_dependency_unavailable")
-                for name in re.findall(r"(?:=>\s*)?(/[^\s()]+)", completed.stdout):
-                    library = Path(os.path.normpath(name))
-                    if library.is_file():
-                        copy(library, self.jail_root / str(library).lstrip("/"))
-
-        copy(native, self.jail_root / "bin/codex", dependencies=True)
-        if entry.kind == "node_wrapper":
-            for source in entry.files:
-                copy(source, self.jail_root / str(source).lstrip("/"))
-            for source in (native, native.parent / "codex-code-mode-host", native.parent.parent / "codex-path/rg"):
-                copy(source, self.jail_root / str(source).lstrip("/"), dependencies=True)
-            if entry.link_target is not None:
-                target = self.jail_root / str(self.executable).lstrip("/")
+            def copy(source: Path, target: Path, *, dependencies: bool = False) -> None:
+                relative = target.relative_to(self.jail_root).as_posix()
+                if relative in staged:
+                    return
+                resolved = source.resolve(strict=True)
+                _trusted_runtime(resolved)
                 _directory(target.parent, 0o755)
-                target.symlink_to(entry.link_target)
-            copy(Path("/usr/bin/env"), self.jail_root / "usr/bin/env", dependencies=True)
-        if native.name == "codex":
-            for source, target in ((native.parent / "codex-code-mode-host", "bin/codex-code-mode-host"),
-                (native.parent.parent / "codex-path/rg", "bin/rg")):
-                if not source.is_file():
-                    raise ProtectedCreationError("protected_creation_dependency_unavailable")
-                copy(source, self.jail_root / target, dependencies=True)
-        for name in ("bash", "ls", "cat", "cp", "ln", "mkdir", "sleep"):
-            copy(Path("/bin") / name, self.jail_root / "bin" / name, dependencies=True)
-        copy(Path("/bin/bash"), self.jail_root / "bin/sh", dependencies=True)
-        node = next((path for path in (Path("/usr/local/bin/node"), Path("/usr/bin/node")) if path.is_file()), None)
-        if node is None:
-            raise ProtectedCreationError("protected_creation_dependency_unavailable")
-        copy(node, self.jail_root / "bin/node", dependencies=True)
-        python = Path(sys.executable).resolve(strict=True)
-        copy(python, self.jail_root / "python/bin/python3", dependencies=True)
-        stdlib = Path(sysconfig.get_path("stdlib")).resolve(strict=True)
-        for directory, subdirectories, names in os.walk(stdlib, followlinks=False):
-            subdirectories[:] = [name for name in subdirectories if name not in {"site-packages", "__pycache__", "tkinter"}]
-            for name in names:
-                source = Path(directory) / name
-                if source.suffix != ".pyc" and not name.startswith("_tkinter."):
-                    copy(source, self.jail_root / "python/lib" / stdlib.name / source.relative_to(stdlib),
-                        dependencies=source.suffix == ".so")
-        for library in (Path(sys.base_prefix) / "lib").glob("libpython*.so*"):
-            copy(library, self.jail_root / "python/lib" / library.name, dependencies=True)
-        for name in ("python", "python3"):
-            (self.jail_root / "bin" / name).symlink_to("/python/bin/python3")
-        for name in ("resolv.conf", "hosts", "nsswitch.conf", "ssl/certs/ca-certificates.crt"):
-            copy(Path("/etc") / name, self.jail_root / "etc" / name)
-        _write_private(self.jail_root / "etc/passwd", b"nobody:x:65534:65534:creation:/home/creation:/bin/bash\n", 0o444)
-        _write_private(self.jail_root / "etc/group", b"nogroup:x:65534:\n", 0o444)
-        for name in ("workspace", "outputs", "home/creation", "home/creation/.codex", "tmp", "cache"):
-            path = self.jail_root / name
-            _directory(path, 0o700)
-            os.chown(path, _UID, _UID)
-        _directory(self.jail_root / "inputs", 0o755)
-        for name in ("proc", "proc/self", "dev"):
-            _directory(self.jail_root / name, 0o555)
-        (self.jail_root / "proc/self/exe").symlink_to("/bin/codex")
-        for name, minor, mode in (("null", 3, 0o666), ("urandom", 9, 0o444), ("random", 8, 0o444)):
-            os.mknod(self.jail_root / "dev" / name, stat.S_IFCHR | mode, os.makedev(1, minor))
-            _device_mode(self.jail_root / "dev" / name, minor, mode)
-        for name in ("auth.json", "config.toml"):
-            source = self.credentials_home / name
-            if not source.exists():
-                continue
-            with _regular_reader(source) as stream:
-                content = stream.read(_INPUT_LIMIT + 1)
-            if len(content) > _INPUT_LIMIT:
-                raise ProtectedCreationError("protected_creation_credentials_invalid")
-            destination = self.jail_root / "home/creation/.codex" / name
-            _write_private(destination, content)
-            os.chown(destination, _UID, _UID)
-        _write_private(marker, json.dumps({"entry": identity, "files": staged, "file_modes": file_modes}).encode())
+                with _regular_reader(resolved) as stream:
+                    content = stream.read()
+                mode = 0o555 if os.access(resolved, os.X_OK) else 0o444
+                _write_private(target, content, mode)
+                staged[relative] = hashlib.sha256(content).hexdigest()
+                file_modes[relative] = mode
+                if dependencies:
+                    completed = subprocess.run(["/usr/bin/ldd", str(resolved)],
+                        env={**os.environ, "PATH": "/usr/bin:/bin", "LANG": "C"}, capture_output=True,
+                        text=True, timeout=30, check=False)
+                    if "not found" in completed.stdout:
+                        raise ProtectedCreationError("protected_creation_dependency_unavailable")
+                    for name in re.findall(r"(?:=>\s*)?(/[^\s()]+)", completed.stdout):
+                        library = Path(os.path.normpath(name))
+                        if library.is_file():
+                            copy(library, self.jail_root / str(library).lstrip("/"))
+
+            copy(native, self.jail_root / "bin/codex", dependencies=True)
+            if entry.kind == "node_wrapper":
+                for source in entry.files:
+                    copy(source, self.jail_root / str(source).lstrip("/"))
+                for source in (native, native.parent / "codex-code-mode-host", native.parent.parent / "codex-path/rg"):
+                    copy(source, self.jail_root / str(source).lstrip("/"), dependencies=True)
+                if entry.link_target is not None:
+                    target = self.jail_root / str(self.executable).lstrip("/")
+                    _directory(target.parent, 0o755)
+                    target.symlink_to(entry.link_target)
+                copy(Path("/usr/bin/env"), self.jail_root / "usr/bin/env", dependencies=True)
+            if native.name == "codex":
+                for source, target in ((native.parent / "codex-code-mode-host", "bin/codex-code-mode-host"),
+                    (native.parent.parent / "codex-path/rg", "bin/rg")):
+                    if not source.is_file():
+                        raise ProtectedCreationError("protected_creation_dependency_unavailable")
+                    copy(source, self.jail_root / target, dependencies=True)
+            for name in ("bash", "ls", "cat", "cp", "ln", "mkdir", "sleep"):
+                copy(Path("/bin") / name, self.jail_root / "bin" / name, dependencies=True)
+            copy(Path("/bin/bash"), self.jail_root / "bin/sh", dependencies=True)
+            node = _resolve_node_executable()
+            if node is None:
+                raise ProtectedCreationError("protected_creation_dependency_unavailable")
+            copy(node, self.jail_root / "bin/node", dependencies=True)
+            python = Path(sys.executable).resolve(strict=True)
+            copy(python, self.jail_root / "python/bin/python3", dependencies=True)
+            stdlib = Path(sysconfig.get_path("stdlib")).resolve(strict=True)
+            for directory, subdirectories, names in os.walk(stdlib, followlinks=False):
+                subdirectories[:] = [name for name in subdirectories if name not in {"site-packages", "__pycache__", "tkinter"}]
+                for name in names:
+                    source = Path(directory) / name
+                    if source.suffix != ".pyc" and not name.startswith("_tkinter."):
+                        copy(source, self.jail_root / "python/lib" / stdlib.name / source.relative_to(stdlib),
+                            dependencies=source.suffix == ".so")
+            for library in (Path(sys.base_prefix) / "lib").glob("libpython*.so*"):
+                copy(library, self.jail_root / "python/lib" / library.name, dependencies=True)
+            for name in ("python", "python3"):
+                (self.jail_root / "bin" / name).symlink_to("/python/bin/python3")
+            for name in ("resolv.conf", "hosts", "nsswitch.conf", "ssl/certs/ca-certificates.crt"):
+                copy(Path("/etc") / name, self.jail_root / "etc" / name)
+            _write_private(self.jail_root / "etc/passwd", b"nobody:x:65534:65534:creation:/home/creation:/bin/bash\n", 0o444)
+            _write_private(self.jail_root / "etc/group", b"nogroup:x:65534:\n", 0o444)
+            for name in ("workspace", "outputs", "home/creation", "home/creation/.codex", "tmp", "cache"):
+                path = self.jail_root / name
+                _directory(path, 0o700)
+                os.chown(path, _UID, _UID)
+            _directory(self.jail_root / "inputs", 0o755)
+            for name in ("proc", "proc/self", "dev"):
+                _directory(self.jail_root / name, 0o555)
+            (self.jail_root / "proc/self/exe").symlink_to("/bin/codex")
+            for name, minor, mode in (("null", 3, 0o666), ("urandom", 9, 0o444), ("random", 8, 0o444)):
+                os.mknod(self.jail_root / "dev" / name, stat.S_IFCHR | mode, os.makedev(1, minor))
+                _device_mode(self.jail_root / "dev" / name, minor, mode)
+            for name in ("auth.json", "config.toml"):
+                source = self.credentials_home / name
+                if not source.exists():
+                    continue
+                with _regular_reader(source) as stream:
+                    content = stream.read(_INPUT_LIMIT + 1)
+                if len(content) > _INPUT_LIMIT:
+                    raise ProtectedCreationError("protected_creation_credentials_invalid")
+                destination = self.jail_root / "home/creation/.codex" / name
+                _write_private(destination, content)
+                os.chown(destination, _UID, _UID)
+            _write_private(marker, json.dumps({"entry": identity, "files": staged, "file_modes": file_modes}).encode())
+        except BaseException:
+            if not marker.exists() and self.jail_root.exists() and not self.jail_root.is_symlink():
+                shutil.rmtree(self.jail_root, ignore_errors=True)
+            raise
 
     def _refresh_account_credentials(self) -> None:
         """Apply explicit account changes between sealed native calls only.
@@ -918,6 +924,33 @@ def _receipt_value(path: Path) -> dict[str, object]:
     except (OSError, ValueError, ProtectedCreationError):
         pass
     return {}
+
+
+def _resolve_node_executable() -> Path | None:
+    """Resolve the host Node binary from absolute PATH entries, then standard locations."""
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        directory = Path(entry)
+        if not directory.is_absolute():
+            continue
+        candidate = directory / "node"
+        if candidate not in seen:
+            seen.add(candidate)
+            candidates.append(candidate)
+    for candidate in _STANDARD_NODE_PATHS:
+        if candidate not in seen:
+            seen.add(candidate)
+            candidates.append(candidate)
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
 def _runtime_entry(executable: Path) -> _RuntimeEntry:
