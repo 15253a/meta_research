@@ -78,6 +78,11 @@ for line in sys.stdin:
         home.joinpath('auth.json').write_text(json.dumps({'account': {'type': 'chatgpt',
             'email': 'late@example.invalid', 'planType': 'pro'}}))
         emit({'method': 'account/login/completed', 'params': {'loginId': 'login-test', 'success': True}})
+    elif method == 'account/rateLimits/read':
+        if options.get('rate_limits_error'):
+            emit({'id': request['id'], 'error': {'message': 'must-never-be-returned'}})
+            continue
+        result = options.get('rate_limits', {})
     elif method == 'account/logout':
         home.joinpath('auth.json').unlink(missing_ok=True)
     emit({'id': request['id'], 'result': result})
@@ -122,7 +127,7 @@ def test_read_reports_current_provider_account_without_credentials_or_cache(prov
         first = service.read()
         assert first == {'status': 'authenticated', 'account': {'type': 'chatgpt',
                          'email': 'first@example.invalid', 'plan_type': 'plus'},
-                         'login': None, 'error_code': None}
+                         'quota': None, 'login': None, 'error_code': None}
         auth.write_text(json.dumps({'account': {'type': 'apiKey', 'apiKey': 'must-never-be-returned'}}))
         assert service.read()['account'] == {'type': 'apiKey', 'email': None, 'plan_type': None}
         auth.unlink()
@@ -384,5 +389,107 @@ def test_account_read_rechecks_identity_if_credentials_change_during_native_requ
         assert result['status'] == 'unavailable'
         assert result['account'] is None
         assert result['error_code'] == 'codex_account_credentials_changed'
+    finally:
+        service.close()
+
+
+def test_read_reports_sanitized_quota_without_credentials(provider):
+    root, state = provider
+    root.codex_home.joinpath('auth.json').write_text(json.dumps({
+        'account': {'type': 'chatgpt', 'email': 'quota@example.invalid', 'planType': 'pro'},
+    }))
+    state.write_text(json.dumps({
+        'rate_limits': {
+            'ordinaryUsageAllowed': True,
+            'accountId': 'secret-account-id',
+            'access_token': 'must-never-be-returned',
+            'rateLimits': {
+                'accountId': 'nested-secret-account-id',
+                'primary': {
+                    'usedPercent': 61,
+                    'windowDurationMins': 10080,
+                    'resetsAt': 1796000000,
+                    'access_token': 'must-never-be-returned',
+                },
+                'secondary': {
+                    'usedPercent': 24.5,
+                    'resetsAt': 1796100000,
+                },
+                'spendControlReached': False,
+                'rateLimitReachedType': None,
+                'credits': {
+                    'hasCredits': True,
+                    'unlimited': False,
+                    'balance': '42.50',
+                    'secretField': 'must-never-be-returned',
+                },
+            },
+        },
+    }))
+    service = CodexAccountService(root)
+    try:
+        result = service.read()
+        assert result['status'] == 'authenticated'
+        assert result['error_code'] is None
+        assert result['quota'] == {
+            'ordinary_usage_allowed': True,
+            'used_percent': 61.0,
+            'remaining_percent': 39.0,
+            'window_duration_mins': 10080,
+            'resets_at': 1796000000,
+            'secondary_used_percent': 24.5,
+            'secondary_resets_at': 1796100000,
+            'spend_control_reached': False,
+            'rate_limit_reached_type': None,
+            'has_credits': True,
+            'unlimited': False,
+            'balance': '42.50',
+            'exhausted': False,
+        }
+        serialized = json.dumps(result)
+        assert 'secret-account-id' not in serialized
+        assert 'must-never-be-returned' not in serialized
+        assert 'accountId' not in serialized
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize('payload', [
+    {'ordinaryUsageAllowed': False, 'rateLimits': {'primary': {'usedPercent': 40}}},
+    {'ordinaryUsageAllowed': True, 'rateLimits': {'spendControlReached': True, 'primary': {'usedPercent': 40}}},
+    {'ordinaryUsageAllowed': True, 'rateLimits': {'primary': {'usedPercent': 100, 'windowDurationMins': 10080}}},
+    {'ordinaryUsageAllowed': True, 'rateLimits': {'rateLimitReachedType': 'weekly_limit', 'primary': {'usedPercent': 80}}},
+], ids=['ordinary-disallowed', 'spend-control', 'used-100', 'reached-type'])
+def test_read_marks_quota_exhausted_when_limit_reached(provider, payload):
+    root, state = provider
+    root.codex_home.joinpath('auth.json').write_text(json.dumps({
+        'account': {'type': 'chatgpt', 'email': 'exhausted@example.invalid', 'planType': 'plus'},
+    }))
+    state.write_text(json.dumps({'rate_limits': payload}))
+    service = CodexAccountService(root)
+    try:
+        result = service.read()
+        assert result['status'] == 'authenticated'
+        assert result['error_code'] is None
+        assert result['quota'] is not None
+        assert result['quota']['exhausted'] is True
+    finally:
+        service.close()
+
+
+def test_read_degrades_gracefully_when_quota_rpc_fails(provider):
+    root, state = provider
+    root.codex_home.joinpath('auth.json').write_text(json.dumps({
+        'account': {'type': 'chatgpt', 'email': 'first@example.invalid', 'planType': 'plus'},
+    }))
+    state.write_text(json.dumps({'rate_limits_error': True}))
+    service = CodexAccountService(root)
+    try:
+        result = service.read()
+        assert result['status'] == 'authenticated'
+        assert result['account']['email'] == 'first@example.invalid'
+        assert result['quota'] is None
+        assert result['error_code'] is None
+        assert 'must-never-be-returned' not in json.dumps(result)
     finally:
         service.close()

@@ -753,6 +753,22 @@ class CodexAccountIdentity(BaseModel):
     plan_type: str | None = None
 
 
+class CodexQuotaView(BaseModel):
+    ordinary_usage_allowed: bool | None = None
+    used_percent: float | None = None
+    remaining_percent: float | None = None
+    window_duration_mins: int | None = None
+    resets_at: float | None = None
+    secondary_used_percent: float | None = None
+    secondary_resets_at: float | None = None
+    spend_control_reached: bool | None = None
+    rate_limit_reached_type: str | None = None
+    has_credits: bool | None = None
+    unlimited: bool | None = None
+    balance: str | None = None
+    exhausted: bool = False
+
+
 class CodexLoginView(BaseModel):
     id: str
     status: Literal["pending", "completed", "failed", "cancelled"]
@@ -765,6 +781,7 @@ class CodexLoginView(BaseModel):
 class CodexAccountView(BaseModel):
     status: Literal["authenticated", "unauthenticated", "unavailable"]
     account: CodexAccountIdentity | None = None
+    quota: CodexQuotaView | None = None
     login: CodexLoginView | None = None
     error_code: str | None = None
 
