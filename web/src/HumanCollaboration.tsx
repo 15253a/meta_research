@@ -375,6 +375,74 @@ function requestStatusLabel(status: HumanRequestItem["status"]): string {
   }[status];
 }
 
+type RequestReceiptTone = "success" | "warning" | "neutral";
+
+function requestStatusTone(status: HumanRequestItem["status"]): "open" | RequestReceiptTone {
+  if (status === "open") return "open";
+  if (status === "satisfied") return "success";
+  if (status === "unsatisfied" || status === "expired") return "warning";
+  return "neutral";
+}
+
+function humanRequestReceiptPresentation(
+  request: HumanRequestItem,
+  options: { recorded: boolean; retryStatus: "processing" | "succeeded" | null },
+): { tone: RequestReceiptTone; title: string; summary: string } {
+  if (options.retryStatus === "succeeded") {
+    return {
+      tone: "success",
+      title: "原任务已收到重试请求",
+      summary: "重试请求已交回研究流程，系统会继续推进原任务。",
+    };
+  }
+  const prefix = options.recorded || request.responses?.length ? "回应已提交" : "请求状态已更新";
+  const title = `${prefix} · ${requestStatusLabel(request.status)}`;
+  switch (request.status) {
+    case "satisfied":
+      return {
+        tone: "success",
+        title,
+        summary: "你的回应已收到并交回研究流程，系统会继续推进相关研究工作。",
+      };
+    case "unsatisfied":
+      return {
+        tone: "warning",
+        title,
+        summary: "已收到你的回应，但当前条件尚未完全满足，相关任务暂未恢复；请留意后续补充说明或新待办。",
+      };
+    case "expired":
+      return {
+        tone: "warning",
+        title,
+        summary: "这项请求已过期；如仍需协助，系统会在必要时发起新的事项。",
+      };
+    case "declined":
+      return {
+        tone: "neutral",
+        title,
+        summary: "你的决定已收到并交回研究流程，系统会按此调整后续安排。",
+      };
+    case "withdrawn":
+      return {
+        tone: "neutral",
+        title,
+        summary: "这项请求已撤回，无需继续处理。",
+      };
+    case "superseded":
+      return {
+        tone: "neutral",
+        title,
+        summary: "这项请求已有更新版本或后续事项替代，请查看最新待办。",
+      };
+    default:
+      return {
+        tone: "neutral",
+        title,
+        summary: "你的回应已收到并交回研究流程。",
+      };
+  }
+}
+
 type CompanionComposerDraft = { text: string; strength: GuidanceStrength; selection: ServerMaterialSelection | null };
 let companionComposerDrafts: Record<string, CompanionComposerDraft> = {};
 
@@ -2495,7 +2563,7 @@ function HumanRequestList({
                   aria-label={`${requestCopy[kind].list} · ${item.obligation}`}
                 >
                   <span><b>{item.obligation}</b><small>{scopeLabel(item)}</small></span>
-                  <i className={item.status === "open" ? "current" : ""}>{requestStatusLabel(item.status)}</i>
+                  <i className={item.status === "open" ? "current" : item.status === "satisfied" ? "satisfied" : ""}>{requestStatusLabel(item.status)}</i>
                 </button>
               ))}
             </section>
@@ -2547,7 +2615,7 @@ function HumanRequestView({
   useEffect(() => {
     const nav = categoryNav.current;
     const selected = nav?.querySelector<HTMLButtonElement>('[aria-current="page"]');
-    if (!nav || !selected) return;
+    if (!nav || !selected || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => {
       const viewport = nav.getBoundingClientRect();
       const button = selected.getBoundingClientRect();
@@ -2559,31 +2627,56 @@ function HumanRequestView({
   }, [request.kind]);
   const workspace = useRef<HTMLDivElement>(null);
   usePageReadingPosition(`${request.request_ref}:${request.revision}`, workspace);
-  const [reviewing, setReviewing] = useState(false);
   const [selectedReplyRefs, setSelectedReplyRefs] = usePageDraft<string[]>(`hr-replies:${request.request_ref}:${request.revision}`, []);
-  const selectedReplies = (collaboration?.companion.messages ?? []).filter(message =>
-    message.role === "assistant" && message.status === "completed" && !!message.message_ref
-    && selectedReplyRefs.includes(message.message_ref)
+  const scopeRef = collaboration?.companion.scope_ref ?? null;
+  const questRef = typeof request.quest_ref === "string" && request.quest_ref ? request.quest_ref : null;
+  const requestMessages = (collaboration?.companion.messages ?? []).filter((message) =>
+    message.scope_ref === scopeRef
     && message.view_context?.kind === "human_request"
+    && message.view_context.quest_ref === questRef
     && message.view_context.request_ref === request.request_ref
-    && message.view_context.revision === request.revision
-    && message.view_context.quest_ref === request.quest_ref);
+    && message.view_context.revision === request.revision,
+  );
+  const [dialogueOpen, setDialogueOpen] = useState(
+    () => request.status === "open" || requestMessages.length > 0,
+  );
+  const dialogueToggleRef = useRef<HTMLButtonElement>(null);
+  const dialoguePaneId = `hc-dialogue-${request.request_id.replace(/[^a-zA-Z0-9_-]/g, "-")}-r${request.revision}`;
+  const selectedReplies = requestMessages.filter(message =>
+    message.role === "assistant" && message.status === "completed" && !!message.message_ref
+    && selectedReplyRefs.includes(message.message_ref));
+  const populatedKinds = (Object.keys(requestCopy) as HumanRequestItem["kind"][])
+    .map((kind) => {
+      const sameKind = requests.filter((item) => item.kind === kind);
+      return {
+        kind,
+        label: requestCopy[kind].list,
+        count: sameKind.length,
+        next: sameKind.find((item) => item.status === "open") ?? sameKind[0] ?? null,
+      };
+    })
+    .filter((entry) => entry.count > 0);
+  const statusTone = requestStatusTone(request.status);
 
   return (
     <>
       <header className="hc-head">
         <span className="hc-symbol" aria-hidden="true"><MetaTrace variant="signature" /></span>
-        <div>
-          <small>
-            {blocking
-              ? `当前待办 · ${queuePosition} / ${queueSize}`
-              : scopeLabel(request)}
-          </small>
+        <div className="hc-head-summary">
+          <div className="hc-head-meta">
+            <span className="hc-kind-pill">{requestCopy[request.kind].list}</span>
+            <span className={`hc-status-badge hc-status-badge--${statusTone}`}>
+              {requestStatusLabel(request.status)}
+            </span>
+            <span className="hc-head-scope">
+              {blocking ? `待办 ${queuePosition} / ${queueSize}` : scopeLabel(request)}
+            </span>
+          </div>
           <h2>{renderAgentText(request.obligation)}</h2>
-          <p>{renderAgentText(request.business_purpose ?? "")}</p>
+          {request.business_purpose ? <p>{renderAgentText(request.business_purpose)}</p> : null}
         </div>
-        {blocking ? (
-          <div className="hc-head-actions">
+        <div className="hc-head-actions">
+          {blocking && queueSize > 1 ? (
             <nav className="hc-queue-nav" aria-label="当前待办队列">
               <button
                 type="button"
@@ -2603,45 +2696,47 @@ function HumanRequestView({
                 下一个 →
               </button>
             </nav>
-            <button type="button" className="hc-close" onClick={onClose} aria-label="关闭需要你处理的事项">×</button>
-          </div>
-        ) : (
-          <div className="hc-head-actions">
-            <button type="button" onClick={onBack}>返回请求列表</button>
-            <button type="button" className="hc-close" onClick={onClose} aria-label="关闭需要你处理的事项">×</button>
-          </div>
-        )}
+          ) : !blocking ? (
+            <button type="button" className="hc-back-button" onClick={onBack}>返回请求列表</button>
+          ) : null}
+          <button
+            ref={dialogueToggleRef}
+            type="button"
+            className="hc-dialogue-toggle"
+            aria-expanded={dialogueOpen}
+            aria-controls={dialoguePaneId}
+            onClick={() => setDialogueOpen((current) => !current)}
+          >
+            {dialogueOpen
+              ? "收起对话"
+              : requestMessages.length > 0
+                ? `助手对话 (${requestMessages.length})`
+                : "助手对话"}
+          </button>
+          <button type="button" className="hc-close" onClick={onClose} aria-label="关闭需要你处理的事项">×</button>
+        </div>
       </header>
-      <nav ref={categoryNav} className="hc-kind-navigation" aria-label="求助类别">
-        {(["图书馆重连", "线上获取", "现实世界操作", "执行能力授权", "系统故障协助", "预算调整"] as const).map((label, index) => {
-          const kind = (Object.keys(requestCopy) as HumanRequestItem["kind"][])[index];
-          const sameKind = requests.filter(item => item.kind === kind);
-          const next = sameKind.find(item => item.status === "open") ?? sameKind[0];
-          return <button key={kind} type="button" disabled={!next} aria-current={kind === request.kind ? "page" : undefined}
-            onClick={() => { if (next) onSelectRequest(next.request_ref); }}>
-            <span>{index + 1}. {label}</span><small>{sameKind.length ? `${sameKind.length} 项真实请求` : "当前无请求"}</small>
-          </button>;
-        })}
-      </nav>
-      <nav className="workspace-stage-track" aria-label="求助处理阶段">
-        <span aria-current={request.responses?.length || reviewing ? undefined : "step"}>协作处理</span>
-        <span aria-current={reviewing ? "step" : undefined}>审阅回应</span>
-        <span aria-current={request.responses?.length ? "step" : undefined}>{request.responses?.length ? "已交回 · 原根核验" : "交回核对"}</span>
-      </nav>
-      <div className="hc-request-workspace" ref={workspace}>
-        <IntentDraftingSession
-          key={`${request.request_ref}:${request.revision}`}
-          request={request}
-          scopeRef={collaboration?.companion.scope_ref ?? null}
-          companion={collaboration?.companion}
-          messages={collaboration?.companion.messages ?? []}
-          selectedReplyRefs={selectedReplyRefs}
-          onSelectReply={(ref, selected) => setSelectedReplyRefs(current => selected
-            ? [...current.filter(item => item !== ref), ref] : current.filter(item => item !== ref))}
-          onChanged={onChanged}
-        />
+      {populatedKinds.length > 1 ? (
+        <nav ref={categoryNav} className="hc-kind-navigation" aria-label="求助类别">
+          {populatedKinds.map(({ kind, label, count, next }) => (
+            <button
+              key={kind}
+              type="button"
+              aria-current={kind === request.kind ? "page" : undefined}
+              onClick={() => { if (next) onSelectRequest(next.request_ref); }}
+            >
+              <span>{label}</span>
+              <small>{count}</small>
+            </button>
+          ))}
+        </nav>
+      ) : null}
+      <div
+        className="hc-request-workspace"
+        data-dialogue-open={dialogueOpen ? "true" : "false"}
+        ref={workspace}
+      >
         <main className="hc-request-core">
-          <header className="hc-formal-head"><small>请求任务与正式回应</small><b>审阅后明确提交</b><p>助手完成、选入回应、正式提交与原根接纳分别记录。</p></header>
           <RequestHandoff key={`${request.request_ref}:${request.revision}`} request={request} onChanged={onChanged} />
           {request.kind === "research_time_extension" && <>
             <QuestResearchTime questRef={request.quest_ref ?? null} refreshKey={String(request.responses?.length ?? 0)} />
@@ -2652,13 +2747,29 @@ function HumanRequestView({
             request={request}
             selectedReplies={selectedReplies}
             workspacePath={collaboration?.companion.workspace_path ?? undefined}
-            onReviewChange={setReviewing}
             commands={collaboration?.commands.items ?? []}
             authorizations={collaboration?.commands.authorizations ?? []}
             onChanged={onChanged}
           />
           <RequestDetails request={request} otherBlockers={waiting?.other_blockers ?? []} />
         </main>
+        <IntentDraftingSession
+          key={`${request.request_ref}:${request.revision}`}
+          id={dialoguePaneId}
+          hidden={!dialogueOpen}
+          onCollapse={() => {
+            setDialogueOpen(false);
+            window.requestAnimationFrame(() => dialogueToggleRef.current?.focus({ preventScroll: true }));
+          }}
+          request={request}
+          scopeRef={scopeRef}
+          companion={collaboration?.companion}
+          messages={collaboration?.companion.messages ?? []}
+          selectedReplyRefs={selectedReplyRefs}
+          onSelectReply={(ref, selected) => setSelectedReplyRefs(current => selected
+            ? [...current.filter(item => item !== ref), ref] : current.filter(item => item !== ref))}
+          onChanged={onChanged}
+        />
       </div>
     </>
   );
@@ -2790,9 +2901,13 @@ function RequestDetails({
   );
   const responseReceipts = request.responses?.map((response) => {
     const receipt = isRecord(response.receipt) ? response.receipt : undefined;
-    return firstDefined(response, "receipt_ref", "response_receipt_ref")
+    return firstDefined(response, "receipt_ref", "response_receipt_ref", "response_ref")
       ?? firstDefined(receipt ?? {}, "receipt_ref");
   }).filter((value): value is string => typeof value === "string") ?? [];
+  const deliveredResponseRef = humanResponseDeliveryState(request.request_ref)?.result?.response_ref;
+  if (typeof deliveredResponseRef === "string" && deliveredResponseRef && !responseReceipts.includes(deliveredResponseRef)) {
+    responseReceipts.push(deliveredResponseRef);
+  }
   const rejectionReceipts = request.response_rejections?.map((rejection) => {
     const receipt = isRecord(rejection.receipt) ? rejection.receipt : undefined;
     return firstDefined(rejection, "receipt_ref")
@@ -2912,6 +3027,9 @@ function firstDefined(
 }
 
 function IntentDraftingSession({
+  id,
+  hidden = false,
+  onCollapse,
   request,
   scopeRef,
   messages,
@@ -2920,6 +3038,9 @@ function IntentDraftingSession({
   onSelectReply,
   onChanged,
 }: {
+  id?: string;
+  hidden?: boolean;
+  onCollapse?: () => void;
   request: HumanRequestItem;
   scopeRef: string | null;
   messages: CompanionMessage[];
@@ -3009,19 +3130,37 @@ function IntentDraftingSession({
   };
 
   return (
-    <aside className="hc-request-draft" aria-label={`${requestCopy[request.kind].list}相关交流`}>
+    <aside
+      id={id}
+      hidden={hidden}
+      className="hc-request-draft"
+      aria-label={`${requestCopy[request.kind].list}相关交流`}
+    >
       <header>
         <span className="hc-draft-orb" aria-hidden="true"><MetaTrace variant="assistant" /></span>
-        <div><small>独立研究助手</small><b>调查、执行与核验</b><span>按你的要求工作；结果与限制供你审阅</span></div>
+        <div className="hc-draft-head-copy">
+          <b>助手对话</b>
+          <span>可协助调查或核验，不会自动提交回应</span>
+        </div>
+        {onCollapse ? (
+          <button
+            type="button"
+            className="hc-draft-collapse"
+            aria-label="收起助手对话"
+            title="收起助手对话"
+            onClick={onCollapse}
+          >
+            收起
+          </button>
+        ) : null}
       </header>
       <CompanionSessionState companion={sessionSwitch.session} switching={sessionSwitch.switching} busy={sessionSwitch.busy} />
       <div className="hc-draft-transcript" aria-live="polite" ref={transcriptRef}>
         {!scoped.length && !optimisticMessages.length ? (
-          <article>
-            <small>当前事项</small>
-            <p className="hc-draft-obligation">{request.obligation}</p>
-            <p>{request.business_purpose}</p>
-            <p>请说明希望调查、执行或核验的工作。助手可按需读取材料、委派子智能体，产物保留在当前研究工作空间。</p>
+          <article className="hc-draft-empty">
+            <small>助手说明</small>
+            <p>对当前事项有疑问，或需要助手先核对材料、查看背景信息时，可以在这里直接交流。</p>
+            <p>助手回复仅作参考；勾选需要的说明后，请在左侧正式回应区确认提交。</p>
           </article>
         ) : scoped.map((message, index) => (
           <article className={message.role === "user" ? "me" : ""} key={message.message_ref ?? index}>
@@ -3066,8 +3205,7 @@ function IntentDraftingSession({
         </label>
         <small>{error ? `发送失败 · ${error}` : `${draft.length} 字 · Enter 发送 · /new 保留工作空间并更换会话`}</small>
       </form>
-      <div className="hc-draft-status">这里的交流不会提交回应，也不会改变当前事项的处理状态。</div>
-      <div className="hc-draft-boundary">选择助手说明或工作空间中的产物后，在正式回应区明确提交，才会交回本请求原根。</div>
+      <div className="hc-draft-status">这里的交流不会自动提交回应；勾选助手说明后，请在左侧正式回应区确认提交。</div>
     </aside>
   );
 }
@@ -3101,7 +3239,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
   onChanged: () => void;
   selectedReplies: CompanionMessage[];
   workspacePath?: string;
-  onReviewChange: (reviewing: boolean) => void;
+  onReviewChange?: (reviewing: boolean) => void;
 }) {
   const [note, setNote] = usePageDraft(`hr-note:${request.request_ref}`, "");
   const [sealedResponse, setSealedResponse] = useState<HumanRequestResponseBody | null>(null);
@@ -3110,7 +3248,7 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
   const [review, setReview] = useState<HumanRequestResponseBody | null>(null);
   const reviewAction = useRef<(() => Promise<void>) | null>(null);
   const delivering = useRef(false);
-  useEffect(() => { onReviewChange(review !== null); return () => onReviewChange(false); }, [review, onReviewChange]);
+  useEffect(() => { onReviewChange?.(review !== null); return () => onReviewChange?.(false); }, [review, onReviewChange]);
   const [recorded, setRecorded] = useState(() => humanResponseDeliveryState(request.request_ref)?.status === "recorded");
   const [retryStatus, setRetryStatus] = useState<"processing" | "succeeded" | null>(null);
   const [submittedRetry, setSubmittedRetry] = useState<Record<string, unknown>>();
@@ -3258,13 +3396,19 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
     <details><summary>查看重试回执</summary><code>{String(retryReceipt.response_ref ?? "")}</code></details>
   </div> : null;
   if (recoveryReady && !unresolvedResponse && (request.status !== "open" || retryStatus === "succeeded")) {
+    const receipt = humanRequestReceiptPresentation(request, { recorded, retryStatus });
     return (
-      <div className="hc-response-boundary" role="status">
-        <b>{retryStatus === "succeeded" ? "原任务已收到重试请求" : `${recorded || request.responses?.length ? "回应已提交" : "请求状态已更新"} · ${requestStatusLabel(request.status)}`}</b><br />
+      <div
+        className={`hc-response-boundary hc-response-boundary--${receipt.tone}`}
+        data-receipt-tone={receipt.tone}
+        role="status"
+      >
+        <div className="hc-receipt-heading">
+          {receipt.tone === "success" ? <span className="hc-receipt-icon" aria-hidden="true">✓</span> : null}
+          <b className="hc-receipt-title">{receipt.title}</b>
+        </div>
         {retryDetails}
-        <p>本请求的回执与后继状态保留在此。提交不表示原根已恢复，也不表示科学问题已解决。</p>
-        <p>原根核验：{evaluationDecision ?? "尚无确认"}；后续处理：{String(request.disposition?.decision ?? "尚无确认")}。</p>
-        <code>{String(humanResponseDeliveryState(request.request_ref)?.result?.response_ref ?? "")}</code>
+        <p>{receipt.summary}</p>
         {error ? <p role="alert">本地恢复记录暂未清理，系统会继续核对。<code>{error}</code></p> : null}
         <HumanRequestMaterialReferences responses={request.responses ?? []} />
       </div>
@@ -3292,10 +3436,9 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
         <span aria-hidden="true">✓</span>
         <div>
           <h3>回应已提交</h3>
-          <code>{String(humanResponseDeliveryState(request.request_ref)?.result?.response_ref ?? "")}</code>
           {error ? <p role="alert">本地恢复记录暂未清理，系统会继续核对。<code>{error}</code></p> : null}
           <HumanRequestMaterialReferences responses={request.responses ?? []} />
-          <p>回应及原始来源引用已提交到请求原根。材料保留在原服务器路径，原根可按需读取；提交本身不自动入库。只有条件满足且其他阻碍已解除，相关任务才会继续。</p>
+          <p>你的回应已收到并交回研究流程；如有附带服务器路径材料，仍保留在原位置供按需读取。待系统核对完成且无其他阻碍后，相关任务会继续推进。</p>
         </div>
       </section>
     );
@@ -3392,15 +3535,19 @@ function RequestForm({ request, commands, authorizations, onChanged, selectedRep
         )
       ) : null}
       {error || !["library_reconnect", "capability_authorization"].includes(request.kind) ? (
-      <div className="hc-response-boundary" role="status">
+      <div
+        className={`hc-response-boundary ${error ? "hc-response-boundary--warning" : "hc-response-boundary--neutral"}`}
+        data-receipt-tone={error ? "warning" : "neutral"}
+        role={error ? "alert" : "status"}
+      >
         {error ? (
-          <><b>{request.kind === "system_operation_help" ? "重试未成功" : sealedResponse ? "提交结果待确认" : "回应未提交"}</b><br />{sealedResponse ? "已保留本次回应，正在自动核对原提交。" : error}</>
+          <><b className="hc-receipt-title">{request.kind === "system_operation_help" ? "重试未成功" : sealedResponse ? "提交结果待确认" : "回应未提交"}</b><p>{sealedResponse ? "已保留本次回应，正在自动核对原提交。" : error}</p></>
         ) : request.kind === "external_material_api_access" || request.kind === "offline_action" ? (
-          <><b>正式提交将回应交回请求原根</b><br />负责当前请求的 Agent 会解释回应、核验材料并决定下一步。</>
+          <><b className="hc-receipt-title">提交后将交回研究流程</b><p>负责当前任务的智能体会读取你的回应和材料，并决定下一步安排。</p></>
         ) : request.kind === "system_operation_help" ? (
-          <><b>重试当前请求对应的操作</b><br />处理说明随本次重试保存。环境是否恢复，由原任务继续核验。</>
+          <><b className="hc-receipt-title">重试当前请求对应的操作</b><p>处理说明会随本次重试保存，系统会继续核验环境是否已恢复。</p></>
         ) : (
-          <><b>提交回应不会立即代表条件已经满足</b><br />系统会核对当前任务、材料和授权；只有核对通过且没有其他阻碍，相关工作才会继续。</>
+          <><b className="hc-receipt-title">提交后将由系统核对并推进</b><p>系统会核对当前任务、材料和授权；条件满足且无其他阻碍后，相关工作会继续推进。</p></>
         )}
       </div>
       ) : null}
@@ -3440,7 +3587,7 @@ function HumanResponseReview({ request, response, pending, onClose, onConfirm }:
     {response.materials?.map((material, index) => material.kind === "server_reference" ? <p key={index}>
       {material.selection.server.hostname} · {material.selection.absolute_path}<br />{material.selection.description}
     </p> : null)}
-    <p>确认后交回本请求原 Session。送达、原根核验、材料接纳分别记录。</p>
+    <p>确认后将把回应交回当前研究流程，并由系统核对推进。</p>
     <button type="button" className="hc-submit" disabled={pending} onClick={onConfirm}>{pending ? "正在提交…" : "确认提交回应"}</button>
   </dialog>;
 }
@@ -3457,7 +3604,7 @@ function TimeExtensionReceipt({ request }: { request: HumanRequestItem }) {
   return <section aria-label="延时处理结果">
     <p><b>{approval ? "预算已生效" : latest.decision === "declined" ? "已明确拒绝延时，预算保持不变"
       : latest.decision === "deferred" ? "已暂缓决定，预算保持不变" : "回应已记录，尚无预算生效回执"}</b></p>
-    <p>{resumed ? "原研究根已消费回应；后续执行进展请查看研究时间线。" : "尚未确认研究已恢复。"}</p>
+    <p>{resumed ? "研究流程已收到并处理该回应；后续进展请查看研究时间线。" : "尚未确认研究已恢复。"}</p>
     {approval && <details><summary>查看预算变更回执</summary><pre>{JSON.stringify(approval, null, 2)}</pre></details>}
   </section>;
 }
@@ -3561,7 +3708,7 @@ function LibraryForm({
           <i>OA 替代</i><b>跳过，之后只用 OA</b><small>选择更窄的获取路线；无需申请额外权限。</small>
         </button>
         <button type="button" disabled={disabled} onClick={() => setMode("material")}>
-          <i>提供全文</i><b>提供服务器文献来源</b><small>保存服务器原路径及说明，等待原根核对。</small>
+          <i>提供全文</i><b>提供服务器文献来源</b><small>保存服务器原路径及说明，交回研究流程核对。</small>
         </button>
       </section>
       {mode === "oa" ? (
@@ -3577,7 +3724,7 @@ function LibraryForm({
       {mode === "material" ? (
         <section className="hc-choice-panel">
           <MaterialPicker selection={selection} setSelection={setSelection} disabled={disabled} initialPath={workspacePath} />
-          <p>提交仅将原始来源引用交给请求原根。材料留在原服务器路径，原根可按需读取；本次提交不自动入库。</p>
+          <p>提交后会将原始文件位置交给研究流程按需读取，文件仍保留在原服务器路径，不会额外复制。</p>
           <button type="button" disabled={disabled} onClick={() => void submit(
             { route: "provided_material", ...(acquisitionPaperId ? { acquisition_paper_id: acquisitionPaperId } : {}) },
             "provided",
@@ -3655,7 +3802,7 @@ function NaturalLanguageMaterialForm({
           </label>
           <MaterialPicker selection={selection} setSelection={setSelection} disabled={disabled} initialPath={workspacePath} />
         </div>
-        <p className="hc-asset-boundary">提交将回应和原始来源引用交给请求原根。材料留在原服务器路径，可由原根按需读取；提交本身不自动入库。</p>
+        <p className="hc-asset-boundary">提交后会将回应与原始文件位置交给研究流程按需读取，文件仍保留在原服务器路径，不会额外复制。</p>
       </section>
       <button className="hc-submit" type="button" disabled={disabled} onClick={() => void submit(
         {},
@@ -3806,8 +3953,8 @@ function PermissionForm({
         <button type="button" disabled={disabled || authorizationPending} onClick={() => void submit({}, "declined")}>拒绝</button>
         <button type="button" disabled={disabled || authorizationPending} onClick={() => void submit({}, "deferred")}>稍后处理</button>
       </div>
-      {authorizationError ? <p className="hc-response-boundary" role="alert">{authorizationError}</p> : null}
-      {!capability ? <p className="hc-response-boundary">授权范围尚未提供，暂时无法接受。</p> : null}
+      {authorizationError ? <p className="hc-response-boundary hc-response-boundary--warning" data-receipt-tone="warning" role="alert">{authorizationError}</p> : null}
+      {!capability ? <p className="hc-response-boundary hc-response-boundary--warning" data-receipt-tone="warning">授权范围尚未提供，暂时无法接受。</p> : null}
       <details className="hc-permission-note">
         <summary>添加备注（可选）</summary>
         <OptionalNote value={note} onChange={setNote} placeholder="写下限制、疑问或建议的替代方案。" />
