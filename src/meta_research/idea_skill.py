@@ -763,6 +763,7 @@ class IdeaSkillRequest:
     attempt_ref: str | None = None
     fence_ref: str | None = None
     replayable_primary_attempts: tuple[tuple[str, str, int], ...] = ()
+    creation_understanding: dict[str, object] | None = None
 
 
 def stage_operation_input(request, stage: str, *, extra=None) -> dict[str, object]:
@@ -1822,7 +1823,7 @@ class CodexIdeaSkillAdapter:
             f"context_pack_hash={request.context_pack_hash}\n"
             + goal_guidance + "\n"
             f"accepted_question={canonical_json(request.accepted_question_content)}\n"
-            f"provider_context_view={stage_context_json('idea', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash)}"
+            f"provider_context_view={stage_context_json('idea', request.context_pack, context_pack_ref=request.context_pack_ref, context_pack_hash=request.context_pack_hash, extra_required_material=({'creation_understanding': request.creation_understanding} if request.creation_understanding is not None else None))}"
         ) if request.native_session_ref is None else (
             stage_position_prompt(request, "idea") +
             "继续当前原生会话的 Idea 工作。处理本次反馈，交回完整候选。\n"

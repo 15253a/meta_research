@@ -492,14 +492,13 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
             "the source kind is TargetCommit, HumanInput, ScientificOutcome, AssetVersion or LiteratureSnapshot. "
             "Use its evidence_ref in coverage.evidence_uses with the supported claim and support boundary. "
             "Preserve human input scope and distinguish reported opinion from observation or assessment. "
-            "Before returning the final Plan, read the complete current-question evidence page at least once "
-            "with research_graph.plan_evidence.page and check each accepted TargetCommit closure. "
-            "For every accepted TargetCommit, either include the precise binding in selected_evidence_bindings "
-            "and evidence_reuse_set when it supports a current obligation, or explain in notes why it is not adopted "
-            "and which obligation or gap it does not support. "
-            "Also return evidence_accounting with one entry for every current-question TargetCommit you saw, "
-            "using {evidence_ref, target_commit_ref, status, reason}; status is adopted, considered, deferred or "
-            "not_used, and adopted must agree with selected_evidence_bindings. Keep a reason for every entry. "
+            "Before returning the final Plan, browse relevant current-question evidence "
+            "with research_graph.plan_evidence.page or RG indexes as needed. "
+            "For any accepted TargetCommit that supports a current obligation, include the precise binding in "
+            "selected_evidence_bindings and evidence_reuse_set. "
+            "evidence_accounting is optional (pass null or omit unless you want to record explicit dispositions "
+            "for specific TargetCommits); any supplied entry uses {evidence_ref, target_commit_ref, status, reason} "
+            "with status in adopted, considered, deferred or not_used, and adopted must agree with selected_evidence_bindings. "
             "The adapter preserves the complete set unchanged in source_bindings.selected_evidence_bindings. "
             "There is no adoption count tied to a discovery page. Briefs may leave documented gaps "
             "unarranged; explain the insufficiency, reason and limits without claiming them complete. "
@@ -646,8 +645,10 @@ class CodexPlanSkillAdapter(CodexIdeaSkillAdapter):
         schema = _plan_envelope_schema(request)
         file_schema = _compile_codex_output_schema(schema)
         # The provider requires all properties on the wire. A written Brief
-        # may omit its reuse list, which the Plan domain interprets as empty.
-        brief = file_schema["properties"]["plan"]["properties"]["experiment_briefs"]["items"]
+        # may omit its reuse list, and a written Plan may omit optional evidence_accounting.
+        plan_obj = file_schema["properties"]["plan"]
+        plan_obj["required"] = [name for name in plan_obj["required"] if name != "evidence_accounting"]
+        brief = plan_obj["properties"]["experiment_briefs"]["items"]
         brief["required"] = [name for name in brief["required"] if name != "reuse_material_refs"]
         validator = Draft202012Validator(file_schema)
         try:
@@ -1066,20 +1067,25 @@ def _plan_document_schema(request: PlanSkillRequest) -> dict[str, object]:
     }
     schema["required"].append("selected_evidence_bindings")
     schema["properties"]["evidence_accounting"] = {
-        "type": "array",
-        "items": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "evidence_ref": text,
-                "target_commit_ref": text,
-                "status": {"type": "string", "enum": [
-                    "adopted", "considered", "deferred", "not_used",
-                ]},
-                "reason": text,
+        "anyOf": [
+            {"type": "null"},
+            {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "evidence_ref": text,
+                        "target_commit_ref": text,
+                        "status": {"type": "string", "enum": [
+                            "adopted", "considered", "deferred", "not_used",
+                        ]},
+                        "reason": text,
+                    },
+                    "required": ["evidence_ref", "target_commit_ref", "status", "reason"],
+                },
             },
-            "required": ["evidence_ref", "target_commit_ref", "status", "reason"],
-        },
+        ],
     }
     schema["required"].append("evidence_accounting")
     return schema
@@ -1090,6 +1096,8 @@ def _with_derived_answer_contract_hash(
 ) -> dict[str, object]:
     if request is not None:
         plan = dict(plan)
+        if "evidence_accounting" in plan and plan["evidence_accounting"] is None:
+            plan.pop("evidence_accounting")
         coverage = plan.get("coverage")
         contract = plan.get("answer_contract")
         obligations = contract.get("obligations") if isinstance(contract, dict) else None

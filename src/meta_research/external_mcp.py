@@ -292,6 +292,8 @@ def compose_external_mcp_prompt(prompt: str, snapshot: ExternalMcpOperationSnaps
     context = []
     for frozen in snapshot.services:
         context.append(_external_service_overview(frozen))
+    if not resume and not context:
+        return prompt
     value = {"services": context, "guidance": _TOOL_GUIDANCE}
     if snapshot.services:
         value["availability"] = ("Frozen service context for the original logical operation, not a current permission promise. "

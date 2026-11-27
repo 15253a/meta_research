@@ -443,16 +443,6 @@ def _validate_evidence_accounting(
             )
         seen_target_refs.add(target_ref_value)
         seen_evidence_refs.add(evidence_ref)
-    missing_target_refs = sorted(required_target_refs - seen_target_refs)
-    if missing_target_refs:
-        raise PlanContractError(
-            "plan_evidence_accounting_incomplete",
-            diagnostic=(
-                "Missing evidence_accounting disposition for TargetCommit(s): "
-                + ", ".join(missing_target_refs)
-                + "."
-            ),
-        )
 
 
 def validate_current_plan_evidence_accounting(
@@ -462,16 +452,12 @@ def validate_current_plan_evidence_accounting(
     selected_catalog: list[dict[str, object]],
     additional_known_catalog: Sequence[dict[str, object]] = (),
 ) -> None:
-    """Require a new accounting ledger to cover the current TargetCommit set.
+    """Validate optional evidence_accounting entries when explicitly provided.
 
-    The Plan request may start with an empty frozen catalog and discover a later
-    evidence page during the model turn.  Formal acceptance still needs a
-    durable disposition for every TargetCommit current at that boundary, so a
-    source seen during discovery cannot disappear silently between stages.
-    Older Plan documents without ``evidence_accounting`` retain their existing
-    frozen-page compatibility. An explicitly empty field is still a claim that
-    the current TargetCommit set was considered, so it is rejected when that
-    set is non-empty.
+    ``evidence_accounting`` is optional and may be omitted or partial; actual
+    adoptions are governed by ``selected_evidence_bindings``.  When entries are
+    supplied, each entry is verified against known TargetCommits and must agree
+    with ``selected_evidence_bindings``.
     """
 
     accounting = document.get("evidence_accounting")

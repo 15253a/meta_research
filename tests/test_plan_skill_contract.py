@@ -346,21 +346,21 @@ def test_plan_evidence_accounting_binds_target_commit_disposition() -> None:
     )
 
 
-def test_plan_evidence_accounting_rejects_silent_target_commit_omission() -> None:
+def test_plan_evidence_accounting_allows_empty_or_partial_accounting() -> None:
     document = _plan_document()
     document["evidence_accounting"] = []
 
-    with pytest.raises(PlanContractError, match="plan_evidence_accounting_incomplete"):
-        validate_plan_document(
-            document,
-            question_ref="question_1",
-            idea_set_ref="idea_set_1",
-            context_pack_ref="plan_context_1",
-            context_pack_hash="6" * 64,
-            accepted_idea_set=_IDEA_SET,
-            evidence_by_ref={"evidence_1": _EVIDENCE_REF},
-            evidence_reference_revision=1,
-        )
+    validated = validate_plan_document(
+        document,
+        question_ref="question_1",
+        idea_set_ref="idea_set_1",
+        context_pack_ref="plan_context_1",
+        context_pack_hash="6" * 64,
+        accepted_idea_set=_IDEA_SET,
+        evidence_by_ref={"evidence_1": _EVIDENCE_REF},
+        evidence_reference_revision=1,
+    )
+    assert validated == canonical_hash(document)
 
 
 def test_plan_evidence_accounting_rejects_null() -> None:

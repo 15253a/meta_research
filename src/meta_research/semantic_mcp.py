@@ -117,6 +117,29 @@ _ROLE_ONLY_OPERATION_OWNERS: dict[str, frozenset[RootAgentKind]] = {
     if operation_id not in ROOT_AGENT_COMMON_OPERATION_IDS
 }
 
+_CATALOG_DEFAULT_HIDDEN_OPERATION_IDS: frozenset[str] = frozenset(
+    {
+        # Legacy zero-production-call Bundle plumbing (backend registration stays intact)
+        "advancement_engine.bundle_stage_run.observe",
+        "agent_runtime.bundle_run_binding.observe",
+        "research_graph.target_launch_request.read",
+        "agent_runtime.target_frontier.read",
+        "agent_runtime.bundle_inbox.read",
+        "agent_runtime.target_work.request",
+        "advancement_engine.bundle_exhaustion.submit",
+        "research_memory.implementation_content.accept",
+        "research_memory.implementation_content.read",
+        # Harness conformance snapshot & host-probe tools
+        "advancement_engine.snapshot.read",
+        "agent_runtime.snapshot.read",
+        "human_collaboration.snapshot.read",
+        "research_graph.snapshot.read",
+        "research_memory.snapshot.read",
+        "agent_runtime.host_compute.observe",
+        "research_graph.quest_receipt.verify",
+    }
+)
+
 
 class SemanticMcpError(RuntimeError):
     def __init__(self, code: str, details: dict[str, object] | None = None) -> None:
@@ -753,7 +776,12 @@ class SemanticMcpGateway:
                 {"type": "object", "additionalProperties": False, "properties": {
                     "purpose": {"type": "string", "enum": list(PURPOSES), "description": "Research purpose from the overview; expands only this purpose's registered operations."},
                     "topic": {"type": "string", "minLength": 1, "description": "Exact topic from a purpose page, e.g. Human Interact or Literature."},
-                    "view": {"type": "string", "enum": ["overview", "operations"], "description": "Default overview without filters; operations explicitly enumerates all granted operations."},
+                    "view": {"type": "string", "enum": ["overview", "operations", "all_contracts"],
+                             "description": "Default overview without filters; operations enumerates callable non-reconcile operations; all_contracts inspects all granted contracts including cross-role and reconcile twins."},
+                    "callable_only": {"type": "boolean", "default": True,
+                                      "description": "Default true: list only operations callable in the current session. Pass false (or view=all_contracts) to inspect cross-role contracts."},
+                    "include_reconcile": {"type": "boolean", "default": False,
+                                          "description": "Default false: hide .reconcile recovery twins and internal plumbing from default discovery. Pass true (or view=all_contracts) to include them."},
                     "offset": {"type": "integer", "minimum": 0, "default": 0,
                                "description": "Entry offset. A nonzero offset requires this filtered page's catalog_hash."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20,
@@ -836,8 +864,40 @@ class SemanticMcpGateway:
             or reason.endswith("_unauthorized")
         )
 
-    def _overview(self, context: SemanticCallContext) -> dict[str, object]:
+    def _filtered_catalog_operations(
+        self,
+        context: SemanticCallContext,
+        *,
+        callable_only: bool = True,
+        include_reconcile: bool | None = None,
+        include_internal: bool = False,
+    ):
         operations = self._catalog_operations(context)
+        if callable_only:
+            operations = [
+                op
+                for op in operations
+                if self._unavailable_reason(op.semantic_operation_id, context) is None
+            ]
+        if not include_internal:
+            operations = [
+                op
+                for op in operations
+                if op.semantic_operation_id not in _CATALOG_DEFAULT_HIDDEN_OPERATION_IDS
+            ]
+        if include_reconcile is False:
+            operations = [op for op in operations if op.access_mode != "reconcile"]
+        elif include_reconcile is None:
+            non_reconcile = [op for op in operations if op.access_mode != "reconcile"]
+            if any(
+                op.semantic_operation_id not in TOOL_DISCOVERY_OPERATION_IDS
+                for op in non_reconcile
+            ):
+                operations = non_reconcile
+        return operations
+
+    def _overview(self, context: SemanticCallContext) -> dict[str, object]:
+        operations = self._filtered_catalog_operations(context)
         if not set(TOOL_DISCOVERY_OPERATION_IDS) <= {op.semantic_operation_id for op in operations}:
             return {}
         return {
@@ -860,16 +920,40 @@ class SemanticMcpGateway:
         query = str(arguments.get("query", "")).casefold()
         module = arguments.get("owning_module")
         purpose, topic = arguments.get("purpose"), arguments.get("topic")
-        available = self._catalog_operations(context)
+        raw_view = arguments.get("view")
+        all_contracts = raw_view == "all_contracts"
+        callable_only = bool(arguments.get("callable_only", not all_contracts))
+        raw_include_reconcile = arguments.get("include_reconcile")
+        if raw_include_reconcile is None:
+            include_reconcile: bool | None = (
+                True
+                if (all_contracts or topic == "Unknown outcomes and recovery")
+                else None
+            )
+        else:
+            include_reconcile = bool(raw_include_reconcile)
+        include_internal = (
+            all_contracts
+            or raw_include_reconcile is True
+            or arguments.get("callable_only") is False
+        )
+        available = self._filtered_catalog_operations(
+            context,
+            callable_only=callable_only,
+            include_reconcile=include_reconcile,
+            include_internal=include_internal,
+        )
         operations = [operation for operation in available
                       if (purpose is None or any(p == purpose for p, _ in purpose_paths(operation.semantic_operation_id, operation.owning_module, operation.access_mode)))
                       and (topic is None or any(t == topic and (purpose is None or p == purpose)
                            for p, t in purpose_paths(operation.semantic_operation_id, operation.owning_module, operation.access_mode)))
                       and (module is None or operation.owning_module == module)
                       and query in (operation.semantic_operation_id + " " + operation.owning_module + " " + operation.description).casefold()]
-        view = arguments.get("view", "operations" if purpose or topic or query or module else "overview")
+        view = "operations" if all_contracts else (raw_view or ("operations" if purpose or topic or query or module else "overview"))
         catalog_hash = canonical_hash({"grant": context.channel_grant_ref, "query": query, "owning_module": module,
-            "purpose": purpose, "topic": topic, "view": view,
+            "purpose": purpose, "topic": topic, "view": raw_view or view,
+            "callable_only": callable_only, "include_reconcile": include_reconcile,
+            "include_internal": include_internal,
             "registered_catalog": self._catalog_hash,
             "operations": [operation.semantic_operation_id for operation in operations]})
         offset, limit = int(arguments.get("offset", 0)), int(arguments.get("limit", 20))

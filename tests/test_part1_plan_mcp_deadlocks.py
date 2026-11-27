@@ -633,29 +633,23 @@ def test_plan_cycle2_adopts_one_and_declines_one_target_commit_with_empty_frozen
 
 
 def test_plan_evidence_accounting_boundary_diagnostics(tmp_path: Path) -> None:
-    # Case A: omitted TargetCommit 2 -> RG rejects as incomplete and names missing ref.
+    # Case A: omitted TargetCommit 2 -> RG accepts partial evidence_accounting (optional).
     runtime_omit, plan_omit, _q1, fg1, (c1, c2) = _advance_to_cycle2_plan_request(
         tmp_path / "case-omit", mode="omit_second"
     )
     try:
-        decision = None
         for _step in range(16):
             runtime_omit.plan_stage.process_once()
             current = runtime_omit.plan_stage.query_current()
             run_info = current.get("run") or {}
             assert not run_info.get("completion_rejection"), run_info.get("completion_rejection")
-            acceptance = current["plan_acceptance"]
-            if (acceptance.get("domain") or {}).get("status") == "rejected":
-                decision = acceptance
+            if current.get("stage_commit") is not None:
                 break
-        assert decision is not None
-        assert decision["domain"]["reason"]["code"] == "plan_evidence_accounting_incomplete"
-        feedback_text = " ".join(decision["rejection"]["feedback"])
-        omitted_ref = str(plan_omit.discovered_entries[1]["target_commit_root_ref"])
+        current = runtime_omit.plan_stage.query_current()
+        assert (current["plan_acceptance"].get("domain") or {}).get("status") == "accepted"
         assert {c1, c2} == {
             str(item["target_commit_root_ref"]) for item in plan_omit.discovered_entries
         }
-        assert omitted_ref in feedback_text
     finally:
         runtime_omit.close()
 
@@ -1323,9 +1317,26 @@ def test_tools_catalog_overview_exposes_session_call_permissions(tmp_path: Path)
             overview = resp["result"]["structuredContent"]
             assert overview["current_root_kind"] == role
             assert isinstance(overview["callable_total"], int)
-            assert 0 < overview["callable_total"] < overview["total"]
-            assert all(isinstance(item.get("callable_in_current_session"), bool) for item in overview["items"])
-            by_purpose = {entry["purpose"]: entry for entry in overview["purposes"]}
+            assert 0 < overview["callable_total"] == overview["total"]
+            assert all(item.get("callable_in_current_session") is True for item in overview["items"])
+            _, all_resp = gateway.dispatch(
+                conn.token,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "tools.catalog.page",
+                        "arguments": {"view": "overview", "callable_only": False},
+                    },
+                },
+            )
+            assert all_resp is not None and all_resp["result"]["isError"] is False
+            all_overview = all_resp["result"]["structuredContent"]
+            assert all_overview["current_root_kind"] == role
+            assert 0 < all_overview["callable_total"] < all_overview["total"]
+            assert all(isinstance(item.get("callable_in_current_session"), bool) for item in all_overview["items"])
+            by_purpose = {entry["purpose"]: entry for entry in all_overview["purposes"]}
             for entry in by_purpose.values():
                 assert isinstance(entry["callable_in_current_session"], bool)
                 assert entry["callable_operations"] + entry["inspectable_only_operations"] == entry["total_operations"]

@@ -320,10 +320,15 @@ def test_late_notes_survive_real_stage_commit_and_reasoning_request(tmp_path, mo
             frozen_evidence_closure=_frozen_evidence_closure(requested.context_pack))
         with pytest.raises(PromptReceived) as received:
             adapter.generate_draft(request)
-        sections = _context_sections(received.value.args[0], request.context_pack_hash,
-            complete_sections=("upstream_stage_closure",))
-        delivered = _preview_rows(sections["upstream_stage_closure"])[-1]
-        assert delivered["commit_ref"] == commit.commit_ref
-        assert delivered["closure"]["notes"] == LATE_NOTE
+        _context_sections(received.value.args[0], request.context_pack_hash,
+            complete_sections=())
+        view_line = next(line for line in received.value.args[0].splitlines() if line.startswith("provider_context_view="))
+        view = json.loads(view_line.split("=", 1)[1])
+        delivered = next(
+            item for item in view["current_handoff_notes"]
+            if item.get("source_commit_ref") == commit.commit_ref
+        )
+        assert delivered["notes"]["text"] == LATE_NOTE
+        assert delivered["notes"]["truncated"] is False
     finally:
         fixture.close()

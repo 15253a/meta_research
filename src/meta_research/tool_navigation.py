@@ -1,6 +1,13 @@
 """Research-purpose labels over registered operations, never an authority source."""
 from __future__ import annotations
 
+import re
+
+_SUMMARY_MAX_CHARS = 160
+_COMPANION_LEAD_RE = re.compile(r"^(?:Companion\s+may\b[^.。]*[.。]\s*)+")
+_COMPANION_CLAUSE_RE = re.compile(r"\s*Companion\s+may\b[^.。]*[.。]?")
+_SENTENCE_SPLIT_RE = re.compile(r"(?:\.(?=\s|$)|[。；]|;\s)")
+
 PURPOSES = {
     "RG": "Find research history, relationships and exact readers through six research views.",
     "RM": "Read exact retained content and versions; preserve materials and manage their lifecycle.",
@@ -63,12 +70,28 @@ def _primary_paths(name: str, owner: str) -> tuple[tuple[str, str], ...]:
     return (("Other", owner),)
 
 
+def _clean_summary(description: str, *, max_chars: int = _SUMMARY_MAX_CHARS) -> str:
+    text = " ".join(str(description).split())
+    cleaned = _COMPANION_LEAD_RE.sub("", text).strip() or text
+    first = _SENTENCE_SPLIT_RE.split(cleaned, maxsplit=1)[0].strip()
+    first = _COMPANION_CLAUSE_RE.sub("", first).strip() or cleaned
+    if len(first) <= max_chars:
+        return first
+    clipped = first[: max_chars - 1].rstrip()
+    for sep in (" ", "，", ",", "、", "：", ":"):
+        pos = clipped.rfind(sep)
+        if pos >= max_chars - 40:
+            clipped = clipped[:pos].rstrip(" ,，、：:")
+            break
+    return clipped + "…"
+
+
 def operation_summary(operation) -> dict[str, object]:
     return {
         "operation_id": operation.semantic_operation_id,
         "owning_module": operation.owning_module,
         "access_mode": operation.access_mode,
-        "summary": operation.description.split(". ", 1)[0],
+        "summary": _clean_summary(operation.description),
         "required_arguments": list(operation.input_schema.get("required", [])),
         "contract_reader": {"operation": "tools.contracts.read", "arguments": {"operation_id": operation.semantic_operation_id}},
         "reconciliation_operation_id": operation.reconciliation_operation_id,
@@ -83,7 +106,15 @@ def purpose_overview(operations) -> list[dict[str, object]]:
 
 
 def common_operations(operations):
-    priority = ("research_memory.content.read", "research_graph.questions.page", "human_request.read")
+    priority = (
+        "research_memory.content.read",
+        "research_graph.questions.page",
+        "research_graph.baselines.page",
+        "research_graph.datasets.page",
+        "research_graph.environments.page",
+        "research_graph.literature.page",
+        "human_request.read",
+    )
     by_name = {op.semantic_operation_id: op for op in operations}
     return [operation_summary(by_name[name]) for name in priority if name in by_name]
 

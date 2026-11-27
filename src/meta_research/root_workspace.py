@@ -484,6 +484,79 @@ class RootWorkspaces:
         """Resolve authorized directory roots only; never create or walk old work."""
         return self._native_directories(binding.location)
 
+    @staticmethod
+    def _first_sentence(text_value: str, *, max_chars: int = 120) -> str:
+        import re
+        cleaned = " ".join(str(text_value).split())
+        if not cleaned:
+            return ""
+        first = re.split(r"(?:\.(?=\s|$)|[。；]|;\s)", cleaned, maxsplit=1)[0].strip()
+        if len(first) <= max_chars:
+            return first
+        return first[: max_chars - 1].rstrip() + "…"
+
+    @staticmethod
+    def _workspace_kind(root_kind: str) -> str:
+        if root_kind == "target":
+            return "target_workspace"
+        if root_kind in {"idea", "plan", "bundle", "reasoning"}:
+            return "stage_workspace"
+        return "supporting_workspace"
+
+    def _workspace_purpose(self, source: WorkspaceLocation) -> str:
+        if source.root_kind == "target" and source.target_ref:
+            rg = getattr(self, "_rg", None)
+            db = getattr(rg, "_database", None) if rg is not None else None
+            if db is not None:
+                from sqlalchemy import text
+                try:
+                    with db.read() as connection:
+                        row = connection.execute(
+                            text("SELECT target_key, spec_json FROM rg_targets WHERE target_ref=:ref"),
+                            {"ref": source.target_ref},
+                        ).first()
+                    if row is not None:
+                        spec = json.loads(row.spec_json)
+                        inputs = spec.get("semantic_inputs") if isinstance(spec, dict) else None
+                        if isinstance(inputs, list):
+                            for item in inputs:
+                                if isinstance(item, dict) and isinstance(item.get("goal"), str) and item["goal"].strip():
+                                    sentence = self._first_sentence(item["goal"])
+                                    if sentence:
+                                        return sentence
+                        if isinstance(row.target_key, str) and row.target_key.strip():
+                            return f"Target execution: {row.target_key.strip()}"
+                except Exception:
+                    pass
+            return f"Target execution workspace ({source.target_ref})"
+        stage_labels = {
+            "idea": "Idea",
+            "plan": "Plan",
+            "bundle": "Bundle",
+            "reasoning": "Reasoning",
+        }
+        if source.root_kind in stage_labels:
+            label = stage_labels[source.root_kind]
+            ae = getattr(self, "_ae", None)
+            query_pos = getattr(ae, "query_cycle_position", None) if ae is not None else None
+            if source.cycle_ref and callable(query_pos):
+                try:
+                    position = query_pos(source.cycle_ref)
+                    focus = position.get("cycle_focus") if isinstance(position, dict) else None
+                    if isinstance(focus, str) and focus.strip():
+                        sentence = self._first_sentence(focus, max_chars=100)
+                        if sentence:
+                            return f"{label}: {sentence}"
+                except Exception:
+                    pass
+            return f"{label} stage workspace"
+        supporting_labels = {
+            "companion": "Companion creation and collaboration workspace",
+            "deepfetch": "DeepFetch literature discovery workspace",
+            "acquisition": "Literature acquisition workspace",
+        }
+        return supporting_labels.get(source.root_kind, f"{source.root_kind} workspace")
+
     def _native_directories(self, current: WorkspaceLocation) -> tuple[dict, ...]:
         result = []
         for source in self._visible_locations(current):
@@ -492,8 +565,13 @@ class RootWorkspaces:
                     or not os.access(directory, os.R_OK | os.X_OK)):
                 continue
             writable = source == current and os.access(directory, os.W_OK)
-            result.append({**source.source(), "directory": str(directory),
-                           "access": "read_write" if writable else "read"})
+            result.append({
+                **source.source(),
+                "workspace_kind": self._workspace_kind(source.root_kind),
+                "purpose": self._workspace_purpose(source),
+                "directory": str(directory),
+                "access": "read_write" if writable else "read",
+            })
         return tuple(result)
 
     def target_directory_prompt(self, target_ref: str, workspace_ref: str, directory: Path) -> str:
@@ -503,12 +581,38 @@ class RootWorkspaces:
             raise OwnerConflict("workspace_scope_stale")
         return self.native_directory_prompt(current)
 
-    def _mounted_material_references(self, current: WorkspaceLocation) -> tuple[dict[str, object], ...]:
+    def _mounted_material_page(
+        self, current: WorkspaceLocation, *, offset: int = 0, limit: int = 8
+    ) -> dict[str, object]:
+        if type(offset) is not int or offset < 0 or type(limit) is not int or limit < 1:
+            raise OwnerConflict("mounted_materials_page_invalid")
         if self._hc is None or getattr(self._hc, "_database", None) is None:
-            return ()
+            return {"items": (), "total_count": 0, "offset": offset, "limit": limit, "next_offset": None}
         quest_ref = current.quest_ref
         init_id = current.initialization_id
         from sqlalchemy import text
+        where_clause = (
+            "FROM hc_work_material_references r "
+            "JOIN hc_work_material_submissions s USING(submission_ref) "
+            "WHERE s.state='ready' AND s.anchor_kind IN ('creation','manual','guidance','input','request','acquired') "
+            "AND ("
+            "(:quest IS NOT NULL AND ("
+            "json_extract(s.receiver_json,'$.quest_ref')=:quest OR "
+            "EXISTS (SELECT 1 FROM json_each(s.receiver_json,'$.roots') root "
+            "WHERE json_extract(root.value,'$.quest_ref')=:quest)"
+            ")) OR "
+            "(:init IS NOT NULL AND ("
+            "(s.anchor_kind='creation' AND s.anchor_ref=:init) OR "
+            "(s.anchor_kind IN ('request','acquired') AND ("
+            "EXISTS (SELECT 1 FROM json_each(s.receiver_json,'$.roots') root "
+            "WHERE json_extract(root.value,'$.initialization_id')=:init) OR "
+            "EXISTS (SELECT 1 FROM json_each(s.receiver_json,'$.roots') root "
+            "JOIN ar_deepfetch_runs dr ON dr.run_ref=json_extract(root.value,'$.work_ref') "
+            "JOIN hc_deepfetch_requests d ON d.request_ref=dr.request_ref "
+            "WHERE d.initialization_id=:init)"
+            "))))"
+            ")"
+        )
         with self._hc._database.read() as connection:
             if init_id is None and quest_ref is not None:
                 init_id = connection.execute(
@@ -521,36 +625,26 @@ class RootWorkspaces:
                     {"i": init_id},
                 ).scalar_one_or_none()
             if quest_ref is None and init_id is None:
-                return ()
+                return {"items": (), "total_count": 0, "offset": offset, "limit": limit, "next_offset": None}
+            params = {"quest": quest_ref, "init": init_id, "limit": limit + 1, "offset": offset}
+            total_count = int(
+                connection.execute(
+                    text("SELECT COUNT(DISTINCT r.reference_ref) " + where_clause),
+                    {"quest": quest_ref, "init": init_id},
+                ).scalar_one()
+            )
             rows = connection.execute(
                 text(
                     "SELECT r.reference_ref, r.selection_json, s.command_json, s.anchor_kind "
-                    "FROM hc_work_material_references r "
-                    "JOIN hc_work_material_submissions s USING(submission_ref) "
-                    "WHERE s.state='ready' AND s.anchor_kind IN ('creation','manual','guidance','input','request','acquired') "
-                    "AND ("
-                    "(:quest IS NOT NULL AND ("
-                    "json_extract(s.receiver_json,'$.quest_ref')=:quest OR "
-                    "EXISTS (SELECT 1 FROM json_each(s.receiver_json,'$.roots') root "
-                    "WHERE json_extract(root.value,'$.quest_ref')=:quest)"
-                    ")) OR "
-                    "(:init IS NOT NULL AND ("
-                    "(s.anchor_kind='creation' AND s.anchor_ref=:init) OR "
-                    "(s.anchor_kind IN ('request','acquired') AND ("
-                    "EXISTS (SELECT 1 FROM json_each(s.receiver_json,'$.roots') root "
-                    "WHERE json_extract(root.value,'$.initialization_id')=:init) OR "
-                    "EXISTS (SELECT 1 FROM json_each(s.receiver_json,'$.roots') root "
-                    "JOIN ar_deepfetch_runs dr ON dr.run_ref=json_extract(root.value,'$.work_ref') "
-                    "JOIN hc_deepfetch_requests d ON d.request_ref=dr.request_ref "
-                    "WHERE d.initialization_id=:init)"
-                    "))))"
-                    ") ORDER BY s.created_at ASC, r.ordinal ASC, r.reference_ref ASC"
+                    + where_clause
+                    + " ORDER BY s.created_at ASC, r.ordinal ASC, r.reference_ref ASC "
+                    "LIMIT :limit OFFSET :offset"
                 ),
-                {"quest": quest_ref, "init": init_id},
+                params,
             ).all()
         mounted: list[dict[str, object]] = []
         seen: set[str] = set()
-        for row in rows:
+        for row in rows[:limit]:
             if row.reference_ref in seen:
                 continue
             seen.add(row.reference_ref)
@@ -566,17 +660,31 @@ class RootWorkspaces:
             if isinstance(description, str) and description.strip():
                 entry["description"] = description
             mounted.append(entry)
-        return tuple(mounted)
+        next_offset = offset + limit if len(rows) > limit else None
+        return {
+            "items": tuple(mounted),
+            "total_count": total_count,
+            "offset": offset,
+            "limit": limit,
+            "next_offset": next_offset,
+        }
+
+    def _mounted_material_references(
+        self, current: WorkspaceLocation, *, offset: int = 0, limit: int = 8
+    ) -> tuple[dict[str, object], ...]:
+        return tuple(self._mounted_material_page(current, offset=offset, limit=limit)["items"])
 
     def native_directory_prompt(self, current: WorkspaceLocation) -> str:
         scope = (
             "For Cycle work, the current and previous two Cycles follow the Quest research sequence; "
             "listed paths are limited to this root's scope. "
+            "Stage workspaces (workspace_kind=stage_workspace) hold stage scratch and analysis files; "
+            "Target workspaces (workspace_kind=target_workspace) hold formal execution desks (inputs/ frozen read-only, implementation/, outputs/, research-note.md) and are cleaned up after the 3-Cycle window unless retained in RM. "
             if current.cycle_ref is not None else
             "This work follows its own workspace lifecycle, outside the three-Cycle window. "
         )
-        fields = ("workspace_ref", "work_ref", "root_kind", "quest_ref", "cycle_ref",
-                  "target_ref", "context_generation", "directory", "access")
+        fields = ("workspace_ref", "work_ref", "workspace_kind", "root_kind", "purpose",
+                  "quest_ref", "cycle_ref", "target_ref", "context_generation", "directory", "access")
         directories = [
             {key: entry[key] for key in fields if entry.get(key) is not None}
             for entry in self._native_directories(current)
@@ -589,13 +697,29 @@ class RootWorkspaces:
                   "Do not traverse parent directories, private spools or authority stores. "
                   "Presence does not admit a formal asset. Work directories: "
                   + canonical_json(directories))
-        mounted = self._mounted_material_references(current)
+        mounted_page = self._mounted_material_page(current, offset=0, limit=8)
+        mounted = mounted_page["items"]
         if mounted:
             prompt += (
                 "\nMounted server materials (persistent read-only references, directly accessible on host "
                 "or via research_workspace.materials.*): "
                 + canonical_json(list(mounted))
             )
+            if mounted_page["next_offset"] is not None:
+                prompt += (
+                    "\nMounted server materials page: "
+                    + canonical_json({
+                        "shown_count": len(mounted),
+                        "total_count": mounted_page["total_count"],
+                        "offset": mounted_page["offset"],
+                        "limit": mounted_page["limit"],
+                        "next_offset": mounted_page["next_offset"],
+                        "reader": {
+                            "operation": "research_workspace.materials.discover",
+                            "arguments": {"offset": mounted_page["next_offset"], "limit": mounted_page["limit"]},
+                        },
+                    })
+                )
         return prompt
 
     def list_companion_files(self, scope_ref: str, root_session_ref: str, *, offset=0, limit=50):

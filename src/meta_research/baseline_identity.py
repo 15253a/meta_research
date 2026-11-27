@@ -32,33 +32,46 @@ BASELINE_METHOD_REJECTION_FEEDBACK = {
 }
 
 
-def _ref(value, code):
+def _ref(value, code, *, path=None):
     if (not isinstance(value, str) or not value.strip() or value != value.strip()
             or len(value) > 1024 or any(char in value for char in ("\x00", "\r", "\n"))):
-        raise OwnerConflict(code)
+        raise OwnerConflict(code, {"path": path} if path else None)
     return value
 
 
-def _method_envelope(forward):
+def _method_envelope(forward, *, allow_extra_keys: bool = False):
     # Historical free-form contracts already used method_key without an explicit
     # version envelope. Preserve that original byte-addressed meaning on replay.
     if not {"baseline_ref", "method_version", "method_contract"}.intersection(forward):
         return None
-    if set(forward) - _ENVELOPE_KEYS:
-        raise OwnerConflict("baseline_method_envelope_invalid")
+    extra = sorted(set(forward) - _ENVELOPE_KEYS)
+    if extra and not allow_extra_keys:
+        raise OwnerConflict(
+            "baseline_method_envelope_invalid",
+            {"path": f"baseline_forward_contract.{extra[0]}", "unexpected_keys": extra},
+        )
     if "baseline_ref" in forward:
-        _ref(forward["baseline_ref"], "baseline_reference_invalid")
+        _ref(forward["baseline_ref"], "baseline_reference_invalid", path="baseline_forward_contract.baseline_ref")
     named = "method_key" in forward or "method_version" in forward
     if named:
-        _ref(forward.get("method_key"), "baseline_method_key_required")
-        _ref(forward.get("method_version"), "baseline_method_version_required")
+        _ref(forward.get("method_key"), "baseline_method_key_required", path="baseline_forward_contract.method_key")
+        _ref(forward.get("method_version"), "baseline_method_version_required", path="baseline_forward_contract.method_version")
     if "baseline_ref" not in forward and not named:
-        raise OwnerConflict("baseline_method_identity_required")
+        raise OwnerConflict(
+            "baseline_method_identity_required",
+            {"path": "baseline_forward_contract", "missing_keys": ["baseline_ref", "method_key", "method_version"]},
+        )
     if "method_contract" in forward:
         if not isinstance(forward["method_contract"], dict) or not forward["method_contract"]:
-            raise OwnerConflict("baseline_method_contract_required")
+            raise OwnerConflict(
+                "baseline_method_contract_required",
+                {"path": "baseline_forward_contract.method_contract"},
+            )
     elif "baseline_ref" not in forward:
-        raise OwnerConflict("baseline_method_contract_required")
+        raise OwnerConflict(
+            "baseline_method_contract_required",
+            {"path": "baseline_forward_contract.method_contract"},
+        )
     return forward
 
 
@@ -71,10 +84,13 @@ def _stored_method(forward):
     }
 
 
-def verify_baseline_method_identity(forward, baseline_row, method_row=None):
+def verify_baseline_method_identity(forward, baseline_row, method_row=None, *, draft: bool = False):
     """Verify immutable native bytes and the selected identity independently."""
     if baseline_row is None:
-        raise OwnerConflict("baseline_reference_not_found")
+        raise OwnerConflict(
+            "baseline_reference_not_found",
+            {"path": "baseline_forward_contract.baseline_ref", "baseline_ref": forward.get("baseline_ref")},
+        )
     try:
         stored = json.loads(baseline_row.forward_contract_json)
     except (ValueError, TypeError) as error:
@@ -100,25 +116,47 @@ def verify_baseline_method_identity(forward, baseline_row, method_row=None):
         raise OwnerConflict("baseline_method_version_integrity_invalid")
     if method_row is None and forward == stored:
         return
-    envelope = _method_envelope(forward)
+    envelope = _method_envelope(forward, allow_extra_keys=draft)
     if envelope is None:
         # The exact original contract remains authoritative for historical rows.
         if stored != forward:
             raise OwnerConflict("target_measurement_native_identity_integrity_invalid")
         return
     if "baseline_ref" in forward and forward["baseline_ref"] != baseline_row.baseline_ref:
-        raise OwnerConflict("baseline_reference_invalid")
+        raise OwnerConflict(
+            "baseline_reference_invalid",
+            {"path": "baseline_forward_contract.baseline_ref"},
+        )
     if "method_key" in forward and (method_row is None
             or forward["method_key"] != method_row.method_key
             or forward["method_version"] != method_row.method_version):
-        raise OwnerConflict("baseline_method_version_conflict")
-    if "method_contract" in forward:
+        raise OwnerConflict(
+            "baseline_method_version_conflict",
+            {"path": "baseline_forward_contract.method_version"},
+        )
+    if "method_contract" in forward and not draft:
         semantic = stored if method_row is None else json.loads(method_row.method_contract_json)
         if semantic != forward["method_contract"]:
-            raise OwnerConflict("baseline_method_version_content_conflict")
+            diff_keys = sorted(
+                (set(semantic) ^ set(forward["method_contract"]))
+                | {
+                    key
+                    for key in set(semantic) & set(forward["method_contract"])
+                    if semantic[key] != forward["method_contract"][key]
+                }
+            )
+            first_path = (
+                f"baseline_forward_contract.method_contract.{diff_keys[0]}"
+                if diff_keys
+                else "baseline_forward_contract.method_contract"
+            )
+            raise OwnerConflict(
+                "baseline_method_version_content_conflict",
+                {"path": first_path, "diff_keys": diff_keys},
+            )
 
 
-def resolve_baseline_method_identity(connection, *, forward, quest_ref, accepted_at):
+def resolve_baseline_method_identity(connection, *, forward, quest_ref, accepted_at, draft: bool = False):
     """Register or select a Baseline inside the caller's RG transaction."""
     exact = connection.execute(text(
         "SELECT * FROM rg_experiment_baselines WHERE forward_contract_hash = :hash"),
@@ -127,13 +165,19 @@ def resolve_baseline_method_identity(connection, *, forward, quest_ref, accepted
         method = connection.execute(text(
             "SELECT * FROM rg_baseline_method_versions WHERE baseline_ref = :ref"),
             {"ref": exact.baseline_ref}).first()
-        verify_baseline_method_identity(forward, exact, method)
+        verify_baseline_method_identity(forward, exact, method, draft=draft)
         return exact.baseline_ref, False
-    envelope = _method_envelope(forward)
+    envelope = _method_envelope(forward, allow_extra_keys=draft)
     if envelope is None:
         # Only an already registered, byte-identical historical contract may use
         # legacy identity. Every new method must declare its identity explicitly.
-        raise OwnerConflict("baseline_method_identity_required")
+        raise OwnerConflict(
+            "baseline_method_identity_required",
+            {
+                "path": "baseline_forward_contract",
+                "missing_keys": ["baseline_ref", "method_key", "method_version", "method_contract"],
+            },
+        )
     method_row = None
     if "baseline_ref" in envelope:
         baseline_row = connection.execute(text(
@@ -142,7 +186,7 @@ def resolve_baseline_method_identity(connection, *, forward, quest_ref, accepted
         method_row = connection.execute(text(
             "SELECT * FROM rg_baseline_method_versions WHERE baseline_ref = :ref"),
             {"ref": envelope["baseline_ref"]}).first()
-        verify_baseline_method_identity(forward, baseline_row, method_row)
+        verify_baseline_method_identity(forward, baseline_row, method_row, draft=draft)
         return baseline_row.baseline_ref, False
     method_row = connection.execute(text(
         "SELECT * FROM rg_baseline_method_versions WHERE method_key = :method_key "
@@ -151,7 +195,7 @@ def resolve_baseline_method_identity(connection, *, forward, quest_ref, accepted
         baseline_row = connection.execute(text(
             "SELECT * FROM rg_experiment_baselines WHERE baseline_ref = :ref"),
             {"ref": method_row.baseline_ref}).one()
-        verify_baseline_method_identity(forward, baseline_row, method_row)
+        verify_baseline_method_identity(forward, baseline_row, method_row, draft=draft)
         return baseline_row.baseline_ref, False
     stored = _stored_method(envelope)
     digest = canonical_hash(stored)
@@ -159,7 +203,7 @@ def resolve_baseline_method_identity(connection, *, forward, quest_ref, accepted
         "SELECT * FROM rg_experiment_baselines WHERE forward_contract_hash = :hash"),
         {"hash": digest}).first()
     if existing is not None:
-        verify_baseline_method_identity(forward, existing, method_row)
+        verify_baseline_method_identity(forward, existing, method_row, draft=draft)
         return existing.baseline_ref, False
     baseline_ref = new_ref("baseline")
     connection.execute(text(

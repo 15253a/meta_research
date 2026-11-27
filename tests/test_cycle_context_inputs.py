@@ -31,8 +31,10 @@ def test_reasoning_receives_complete_plan_reports_and_target_limits():
             "upstream_stage_closure": [{"stage": "bundle", "closure": {"bundle_report": {"failures": targets}, "notes": "late" * 10000}}]}
     before = deepcopy(pack)
     view = stage_context_view("reasoning", pack, context_pack_ref="ctx", context_pack_hash="b" * 64)
-    for key in pack:
-        assert view["sections"][key] == pack[key]
+    assert view["section_delivery"]["plan_evidence_input"] == "complete"
+    assert view["sections"]["plan_evidence_input"] == pack["plan_evidence_input"]
+    for key in ("accepted_target_commit_closures", "upstream_stage_closure"):
+        assert view["section_delivery"][key] == "preview"
     assert pack == before
 
 

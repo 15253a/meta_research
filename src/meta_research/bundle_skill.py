@@ -2500,7 +2500,7 @@ def _formal_target_candidate_schema(
                         "uniqueItems": True,
                         "items": _held_fixed_binding_schema(),
                     },
-                    "implementation_revision_ref": text,
+                    "implementation_revision_ref": {"anyOf": [{"type": "null"}, text]},
                     "code_changed": {"type": "boolean"},
                     "routes": {
                         "type": "array",

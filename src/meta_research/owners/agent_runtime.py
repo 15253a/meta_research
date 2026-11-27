@@ -27535,7 +27535,9 @@ def _bundle_report_target_evidence(
                 ),
                 expected_review_scopes=context.review_scopes,
                 expected_initial_implementation_revision_ref=(
-                    "goal-work-disposition"
+                    handoff.terminal.implementation_revision_ref
+                    if root_completion
+                    else "goal-work-disposition"
                     if goal_disposition or root_interruption
                     else context.candidate.implementation_revision_ref
                 ),

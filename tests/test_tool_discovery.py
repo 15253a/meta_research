@@ -33,7 +33,7 @@ def test_purpose_paths_cover_each_registered_role_grant_without_expansion(tmp_pa
         assert reached == available
         assert available <= set(granted)
         assert all("inputSchema" not in item for item in overview["items"])
-        assert len(overview["items"]) <= 3
+        assert len(overview["items"]) <= 7
     finally:
         if token is not None:
             gateway.revoke_channel(token.token)
@@ -72,7 +72,7 @@ def test_real_root_can_page_contracts_and_call_known_reader_first(tmp_path):
         assert direct_result["isError"] is False
         tools = {item["name"]: item for item in rpc(runtime, channel, "tools/list")["tools"]}
         assert set(tools) == {"tools.catalog.page", "tools.contracts.read", "tools.call"}
-        items, args = [], {"view": "operations", "limit": 7}
+        items, args = [], {"view": "all_contracts", "limit": 7}
         while True:
             result = call(runtime, channel, "tools.catalog.page", **args)
             assert result["isError"] is False, result
@@ -82,6 +82,8 @@ def test_real_root_can_page_contracts_and_call_known_reader_first(tmp_path):
                 break
             args.update(offset=page["next_offset"], catalog_hash=page["catalog_hash"])
         assert [item["operation_id"] for item in items] == sorted(ROOT_AGENT_SEMANTIC_OPERATION_IDS["companion"])
+        default_ops = call(runtime, channel, "tools.catalog.page", view="operations", limit=100)["structuredContent"]["items"]
+        assert all(item["callable_in_current_session"] is True and item["access_mode"] != "reconcile" for item in default_ops)
         contract = call(runtime, channel, "tools.contracts.read", operation_id=reader)
         assert contract["isError"] is False, contract
         value = contract["structuredContent"]

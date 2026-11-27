@@ -28,9 +28,8 @@ _STAGE_SCIENTIFIC_INPUTS = {
     "idea": frozenset({"prior_accepted_bindings", "goal_revision_ref", "quest_goal_revision"}),
     "plan": frozenset({"prior_accepted_bindings", "goal_revision_ref", "quest_goal_revision"}),  # The adapter supplies the exact IdeaSet once.
     "bundle": frozenset({"accepted_formal_plan_binding", "goal_revision_ref", "quest_goal_revision"}),
-    "reasoning": frozenset({"prior_accepted_bindings", "plan_evidence_input", "upstream_stage_closure",
-                            "typed_skip_basis_refs_by_stage", "accepted_target_commit_closures",
-                            "current_target_evidence_closure"}),
+    "reasoning": frozenset({"prior_accepted_bindings", "plan_evidence_input",
+                            "typed_skip_basis_refs_by_stage"}),
 }
 _REQUIRED_CURRENT_MATERIAL = frozenset({
     "execution_contract", "measurement_contract", "selected_input_manifest",
@@ -114,8 +113,27 @@ def literature_reference(binding: dict | None) -> dict | None:
                                        "source": "literature_records"})}
 
 
+def _frozen_goal_text(context_pack: dict) -> str | None:
+    qgr = context_pack.get("quest_goal_revision")
+    if not isinstance(qgr, dict):
+        research = context_pack.get("research_context")
+        if isinstance(research, dict):
+            qgr = research.get("quest_goal_revision")
+    if not isinstance(qgr, dict):
+        return None
+    goal = qgr.get("goal")
+    if not isinstance(goal, dict):
+        return None
+    for key in ("goal", "statement"):
+        value = goal.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
 def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
-                       context_pack_hash: str, _observe: bool = True) -> dict[str, object]:
+                       context_pack_hash: str, _observe: bool = True,
+                       extra_required_material: dict[str, object] | None = None) -> dict[str, object]:
     """Deliver exact current science and label each optional section's completeness."""
     previewed_sections: set[str] = set()
 
@@ -182,12 +200,21 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
         return value
 
     sections = {}
-    required_material = {}
+    required_material = dict(extra_required_material) if extra_required_material else {}
+    frozen_goal = _frozen_goal_text(context_pack)
     scientific_inputs = _STAGE_SCIENTIFIC_INPUTS.get(stage, frozenset()) | {"cycle_position"}
     for name, value in context_pack.items():
         if name in _REQUIRED_CURRENT_MATERIAL:
             required_material[name] = value
             continue
+        if name == "cycle_position" and isinstance(value, dict) and frozen_goal is not None:
+            focus = value.get("cycle_focus")
+            if isinstance(focus, str) and focus.strip() == frozen_goal.strip():
+                sections[name] = {
+                    **{k: v for k, v in value.items() if k != "cycle_focus"},
+                    "cycle_focus_same_as_goal": True,
+                }
+                continue
         if name in scientific_inputs or name in {"schema_ref", "cycle_ref", "foreground_epoch"}:
             sections[name] = value
         else:
@@ -331,10 +358,12 @@ def stage_context_view(stage: str, context_pack: dict, *, context_pack_ref: str,
 
 
 def stage_context_json(stage: str, context_pack: dict, *, context_pack_ref: str,
-                       context_pack_hash: str) -> str:
+                       context_pack_hash: str,
+                       extra_required_material: dict[str, object] | None = None) -> str:
     """Render once and reuse its actual byte representation for diagnostics."""
     view = stage_context_view(stage, context_pack, context_pack_ref=context_pack_ref,
-                              context_pack_hash=context_pack_hash, _observe=False)
+                              context_pack_hash=context_pack_hash, _observe=False,
+                              extra_required_material=extra_required_material)
     rendered, section_sizes, required_size = _encode_context_view(view,
         measure=LOGGER.isEnabledFor(logging.INFO))
     _observe_context_projection(stage, context_pack, view, context_pack_ref, context_pack_hash,
@@ -480,8 +509,19 @@ def reasoning_handoff_reference(binding: dict) -> dict[str, object]:
 def stage_position_prompt(request, stage: str) -> str:
     """Render only the immutable position bound to this exact request."""
     from meta_research.cycle_position import format_cycle_position_line
+    position = request.context_pack.get("cycle_position")
+    focus_same_as_goal = False
+    if (
+        getattr(request, "native_session_ref", None) is None
+        and isinstance(position, dict)
+        and isinstance(position.get("cycle_focus"), str)
+    ):
+        frozen_goal = _frozen_goal_text(request.context_pack)
+        if frozen_goal is not None and position["cycle_focus"].strip() == frozen_goal.strip():
+            focus_same_as_goal = True
     return format_cycle_position_line(
-        request.context_pack.get("cycle_position"),
+        position,
         stage=stage,
         cycle_ref=request.context_pack["cycle_ref"],
+        focus_same_as_goal=focus_same_as_goal,
     )

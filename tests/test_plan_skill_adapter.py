@@ -577,8 +577,8 @@ def test_production_adapter_uses_one_native_root_with_advisory_finalization(
     assert "完整 IdeaSet" in primary_prompt
     assert "EvidenceRef" in primary_prompt
     assert "research_graph.plan_evidence.page" in primary_prompt
-    assert "accepted TargetCommit closure" in primary_prompt
-    assert "which obligation or gap it does not support" in primary_prompt
+    assert "accepted TargetCommit" in primary_prompt
+    assert "evidence_accounting is optional" in primary_prompt
     assert primary_schema["properties"]["plan"]["properties"]["answer_contract"]
 
 

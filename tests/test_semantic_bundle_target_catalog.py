@@ -411,7 +411,7 @@ def test_every_native_session_can_page_the_complete_live_catalog(root_kind):
     catalog_hash = None
     seen = set()
     while True:
-        arguments = {"view": "operations", "offset": offset, "limit": 7}
+        arguments = {"view": "all_contracts", "offset": offset, "limit": 7}
         if catalog_hash is not None:
             arguments["catalog_hash"] = catalog_hash
         page = _call(gateway, connection, "tools.catalog.page", arguments)
@@ -429,6 +429,11 @@ def test_every_native_session_can_page_the_complete_live_catalog(root_kind):
     if root_kind == "deepfetch":
         expected.remove("deepfetch_source_action")
     assert seen == expected
+    default_page = _call(gateway, connection, "tools.catalog.page", {"view": "operations", "limit": 100})
+    assert default_page["isError"] is False
+    default_items = default_page["structuredContent"]["items"]
+    assert all(item["callable_in_current_session"] is True for item in default_items)
+    assert all(item["access_mode"] != "reconcile" for item in default_items)
 
 
 def test_live_bundle_channel_gates_other_role_effect_and_reconcile():
@@ -502,11 +507,19 @@ def test_role_only_readers_report_owner_scope_before_handler(
         )
         assert owner_contract["structuredContent"]["callable_in_current_session"] is True
 
-    listed = _call(
+    default_listed = _call(
         gateway,
         connection,
         "tools.catalog.page",
         {"view": "operations", "query": operation_id},
+    )
+    assert all(item["operation_id"] != operation_id for item in default_listed["structuredContent"]["items"])
+
+    listed = _call(
+        gateway,
+        connection,
+        "tools.catalog.page",
+        {"view": "all_contracts", "query": operation_id},
     )
     item = next(item for item in listed["structuredContent"]["items"] if item["operation_id"] == operation_id)
     assert item["callable_in_current_session"] is False
@@ -748,8 +761,11 @@ def test_bundle_inbox_read_uses_owner_cursor_and_exact_call_scope():
         for item in listed["result"]["tools"]
         if item["name"] == operation_id
     )
-    assert tool["inputSchema"]["required"] == ["limit"]
+    assert tool["inputSchema"]["required"] == []
+    assert tool["inputSchema"]["properties"]["limit"]["default"] == 32
     assert set(tool["inputSchema"]["properties"]) == {"limit"}
+    default_result = _call(gateway, connection, operation_id, {})
+    assert default_result["isError"] is False
 
     result = _call(gateway, connection, operation_id, {"limit": 64})
     assert result["isError"] is False
@@ -767,8 +783,14 @@ def test_bundle_inbox_read_uses_owner_cursor_and_exact_call_scope():
             "run_ref": "bundle-run:1",
             "attempt_ref": "bundle-attempt:1",
             "fence_ref": "bundle-fence:1",
+            "limit": 32,
+        },
+        {
+            "run_ref": "bundle-run:1",
+            "attempt_ref": "bundle-attempt:1",
+            "fence_ref": "bundle-fence:1",
             "limit": 64,
-        }
+        },
     ]
 
 

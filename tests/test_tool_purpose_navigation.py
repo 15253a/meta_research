@@ -35,6 +35,9 @@ def test_provider_starts_with_purposes_and_loads_only_the_selected_contract():
     assert len(overview["items"]) <= 3
     wf = call(gateway, channel, "tools.catalog.page", purpose="WF")["structuredContent"]
     assert {item["operation_id"] for item in wf["items"]} == {
+        "advancement_engine.bundle_report.read"}
+    wf_all = call(gateway, channel, "tools.catalog.page", purpose="WF", callable_only=False)["structuredContent"]
+    assert {item["operation_id"] for item in wf_all["items"]} == {
         "agent_runtime.target_run.observe", "advancement_engine.bundle_report.read"}
     history = call(gateway, channel, "tools.catalog.page", purpose="RG", topic="Human Interact")["structuredContent"]
     assert [item["operation_id"] for item in history["items"]] == ["human_request.read"]

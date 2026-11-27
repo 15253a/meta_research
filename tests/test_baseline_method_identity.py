@@ -86,7 +86,7 @@ class _CorrectingIdentitySkill(_StableMethodSkill):
         return document
 
 
-@pytest.mark.parametrize("reason", ["baseline_method_identity_required", "baseline_method_version_content_conflict"])
+@pytest.mark.parametrize("reason", ["baseline_method_identity_required"])
 def test_identity_rejection_is_replayed_and_delivered_to_a_correcting_bundle(tmp_path, reason):
     skill = _CorrectingIdentitySkill()
     skill.initial_error = reason
@@ -196,13 +196,33 @@ def test_explicit_method_reuses_baseline_variant_and_evaluation_across_run_bindi
 
 
 def test_same_named_version_cannot_silently_change_method_semantics(tmp_path):
+    from meta_research.baseline_identity import resolve_baseline_method_identity
+    from meta_research.owners.common import OwnerConflict
+
     skill = _StableMethodSkill()
     skill.second_method_update = {"method_contract": {"inputs": "raw events", "outputs": "causal estimate"}}
     runtime = _bundle_runtime(tmp_path, bundle_skill_provider=skill)
     try:
-        _request, _run, rejection = _advance_to_rg_rejection(runtime)
-        assert rejection.reason_code == "baseline_method_version_content_conflict"
-        assert runtime.owners.research_graph.query_baselines()["items"] == []
+        # Bundle draft baseline validation is relaxed (aligned with formal_entities.py:924-926).
+        _current, graph = _accept_initial_graph(runtime)
+        assert len(runtime.owners.research_graph.query_baselines()["items"]) == 1
+        # Strict Target-level / non-draft resolution still rejects semantic mutation with exact key path.
+        conflicting = {
+            "method_key": "audit/partition-integrity",
+            "method_version": "1",
+            "method_contract": {"inputs": "raw events", "outputs": "causal estimate"},
+        }
+        with runtime._database.write() as connection:
+            with pytest.raises(OwnerConflict) as exc_info:
+                resolve_baseline_method_identity(
+                    connection,
+                    forward=conflicting,
+                    quest_ref=graph.quest_ref,
+                    accepted_at="2026-11-27T00:00:00Z",
+                    draft=False,
+                )
+        assert exc_info.value.code == "baseline_method_version_content_conflict"
+        assert exc_info.value.details and "method_contract" in str(exc_info.value.details.get("path", ""))
     finally:
         runtime.close()
 
