@@ -118,6 +118,8 @@ def test_research_provider_observes_shared_clock_at_new_operation_only(tmp_path,
         assert first_snapshot["used_seconds"] == 60.0
         assert first_snapshot["remaining_seconds"] == 2591940.0
         assert first_snapshot["budget_policy"] == "advisory"
+        assert "1200 秒" in first_conditions
+        assert "不强制停止、收口或先申请延期" in first_conditions
 
         now[0] = 1120.0
         assert invoke("clock:first") == first
@@ -130,8 +132,8 @@ def test_research_provider_observes_shared_clock_at_new_operation_only(tmp_path,
         assert next_snapshot["budget_revision"] == first_snapshot["budget_revision"]
         assert next_snapshot["observed_at"] == 1120.0
         assert next_snapshot["budget_policy"] == "advisory"
-        assert "1200 秒" in next_conditions
-        assert "不强制停止、收口或先申请延期" in next_conditions
+        assert "1200 秒" not in next_conditions
+        assert "不强制停止、收口或先申请延期" not in next_conditions
         assert next_business == business
     finally:
         runtime.close()

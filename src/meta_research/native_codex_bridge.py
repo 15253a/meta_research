@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -23,6 +24,119 @@ from meta_research.human_guidance import live_guidance_prompt
 from meta_research.provider_supervisor import (
     read_transport_key_for_operation, read_transport_envelope, write_transport_envelope, read_supervisor_request,
 )
+
+
+MAX_STDOUT_BYTES = 64 * 1024 * 1024
+MAX_STDOUT_LINE_BYTES = 64 * 1024 * 1024
+DEFAULT_TURN_IDLE_TIMEOUT_SECONDS = 900.0
+_READ_CHUNK_BYTES = 65536
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def classify_native_error(error_payload, *, will_retry: bool | None = None) -> str | None:
+    """Classify structured or text Codex app-server errors for upstream backoff."""
+    if isinstance(error_payload, dict) and "error" in error_payload and isinstance(error_payload.get("error"), (dict, str)):
+        inner = error_payload["error"]
+        if will_retry is None and isinstance(error_payload.get("willRetry"), bool):
+            will_retry = error_payload["willRetry"]
+        error_payload = inner
+
+    texts: list[str] = []
+    if isinstance(error_payload, dict):
+        info = error_payload.get("codexErrorInfo")
+        if isinstance(info, str):
+            norm = info.strip().lower().replace("-", "_")
+            if norm in {"usagelimitexceeded", "usage_limit_exceeded"}:
+                return "usage_limit"
+            if norm in {
+                "modelcap", "model_cap", "serveroverloaded", "server_overloaded",
+                "ratelimitexceeded", "rate_limit_exceeded", "capacity", "overloaded",
+            }:
+                return "upstream_capacity"
+            if norm in {
+                "responsestreamdisconnected", "response_stream_disconnected",
+                "responsetoomanyfailedattempts", "response_too_many_failed_attempts",
+                "internalservererror", "internal_server_error", "upstreamtransient",
+            }:
+                return "upstream_transient"
+        elif isinstance(info, dict):
+            candidates = [info]
+            if isinstance(info.get("httpConnectionFailed"), dict):
+                candidates.append(info["httpConnectionFailed"])
+            for candidate in candidates:
+                for key in ("httpStatusCode", "statusCode", "status"):
+                    status = candidate.get(key)
+                    if isinstance(status, int) and not isinstance(status, bool):
+                        if status in {429, 529}:
+                            return "upstream_capacity"
+                        if status in {500, 502, 503, 504}:
+                            return "upstream_transient"
+        for field in ("message", "additionalDetails", "code", "reason"):
+            val = error_payload.get(field)
+            if isinstance(val, str) and val.strip():
+                texts.append(val)
+    elif isinstance(error_payload, str) and error_payload.strip():
+        texts.append(error_payload)
+
+    combined = " ".join(texts).replace("\u2019", "'").lower()
+    if combined:
+        if "you've hit your usage limit" in combined or "usage limit exceeded" in combined:
+            return "usage_limit"
+        if any(
+            token in combined
+            for token in (
+                "at capacity",
+                "overloaded",
+                "too many requests",
+                "rate limit",
+                "rate_limit",
+                "capacity exceeded",
+                "status 429",
+                "status 529",
+            )
+        ) or re.search(r"\b(?:429|529)\b", combined):
+            return "upstream_capacity"
+        if any(
+            token in combined
+            for token in (
+                "temporarily unavailable",
+                "service unavailable",
+                "bad gateway",
+                "gateway timeout",
+                "connection reset",
+                "stream disconnected",
+                "reconnecting",
+                "upstream",
+                "status 502",
+                "status 503",
+                "status 504",
+            )
+        ) or re.search(r"\b(?:502|503|504)\b", combined):
+            return "upstream_transient"
+    if will_retry is True:
+        return "upstream_transient"
+    return None
 
 
 def _emit(value):
@@ -93,7 +207,16 @@ class NativeTerminalTurnError(RuntimeError):
 
 
 class NativeCodexBridge:
-    def __init__(self, argv, directory, prompt):
+    def __init__(
+        self,
+        argv,
+        directory,
+        prompt,
+        *,
+        turn_idle_timeout_seconds: float | None = None,
+        max_stdout_bytes: int | None = None,
+        max_stdout_line_bytes: int | None = None,
+    ):
         self.directory = Path(directory)
         self.key_path, self.key = read_transport_key_for_operation(self.directory)
         self.command, self.options = _settings(argv)
@@ -102,29 +225,77 @@ class NativeCodexBridge:
         self.thread_id = self.turn_id = None
         self.terminal = None
         self.last_message = None
+        self.last_error = None
+        self.last_error_classification = None
         self._next_id = 0
         self._records = queue.Queue(maxsize=64)
+        self._reader_stop = threading.Event()
         self._seen = set()
         self._next_reconcile = {}
         self.process = None
         self.usage = None
+        self.turn_idle_timeout_seconds = (
+            _env_positive_float(
+                "META_RESEARCH_NATIVE_TURN_IDLE_TIMEOUT_SECONDS",
+                DEFAULT_TURN_IDLE_TIMEOUT_SECONDS,
+            )
+            if turn_idle_timeout_seconds is None
+            else turn_idle_timeout_seconds
+        )
+        self.max_stdout_bytes = (
+            _env_positive_int("META_RESEARCH_NATIVE_MAX_STDOUT_BYTES", MAX_STDOUT_BYTES)
+            if max_stdout_bytes is None
+            else max_stdout_bytes
+        )
+        default_line_limit = min(MAX_STDOUT_LINE_BYTES, self.max_stdout_bytes)
+        self.max_stdout_line_bytes = (
+            min(
+                _env_positive_int("META_RESEARCH_NATIVE_MAX_STDOUT_LINE_BYTES", default_line_limit),
+                self.max_stdout_bytes,
+            )
+            if max_stdout_line_bytes is None
+            else min(max_stdout_line_bytes, self.max_stdout_bytes)
+        )
+        self._last_activity = time.monotonic()
 
     def _send(self, value):
         self.process.stdin.write((json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8"))
         self.process.stdin.flush()
 
+    def _put_record(self, value):
+        while not self._reader_stop.is_set():
+            try:
+                self._records.put(value, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
     def _reader(self):
         try:
             total = 0
-            while line := self.process.stdout.readline(64 * 1024 * 1024 + 1):
-                total += len(line)
-                if total > 64 * 1024 * 1024:
+            line_buffer = bytearray()
+            while not self._reader_stop.is_set():
+                remaining_total = self.max_stdout_bytes - total
+                remaining_line = self.max_stdout_line_bytes - len(line_buffer)
+                step = min(_READ_CHUNK_BYTES, remaining_total + 1, remaining_line + 1)
+                if step <= 0:
                     raise ValueError("native_provider_stream_limit")
-                self._records.put(json.loads(line))
+                chunk = self.process.stdout.readline(step)
+                if not chunk:
+                    if line_buffer:
+                        self._put_record(json.loads(bytes(line_buffer)))
+                    break
+                total += len(chunk)
+                line_buffer.extend(chunk)
+                if total > self.max_stdout_bytes or len(line_buffer) > self.max_stdout_line_bytes:
+                    raise ValueError("native_provider_stream_limit")
+                if chunk.endswith(b"\n"):
+                    self._put_record(json.loads(bytes(line_buffer)))
+                    line_buffer.clear()
         except Exception as error:
-            self._records.put(error)
+            self._put_record(error)
         finally:
-            self._records.put(EOFError("native_provider_stream_closed"))
+            self._put_record(EOFError("native_provider_stream_closed"))
 
     def _next(self, timeout=0.1):
         value = self._records.get(timeout=timeout)
@@ -185,6 +356,40 @@ class NativeCodexBridge:
                    "delta": params.get("delta")})
         elif method == "thread/tokenUsage/updated":
             self.usage = params.get("tokenUsage")
+        elif method == "error":
+            error_info = params.get("error")
+            will_retry = params.get("willRetry")
+            if isinstance(error_info, dict) and isinstance(error_info.get("message"), str):
+                message = error_info["message"]
+            elif isinstance(error_info, str):
+                message = error_info
+            elif isinstance(params.get("message"), str):
+                message = params["message"]
+            else:
+                message = None
+            classification = classify_native_error(
+                error_info if error_info is not None else params,
+                will_retry=will_retry if isinstance(will_retry, bool) else None,
+            )
+            error_obj = (
+                error_info
+                if isinstance(error_info, dict)
+                else ({"message": message} if message is not None else {})
+            )
+            event = {
+                "type": "error",
+                "thread_id": params.get("threadId", self.thread_id),
+                "turn_id": params.get("turnId", self.turn_id),
+                "message": message,
+                "error": error_obj,
+                "will_retry": bool(will_retry) if isinstance(will_retry, bool) else False,
+            }
+            if classification is not None:
+                event["classification"] = classification
+            self.last_error = event
+            if classification is not None:
+                self.last_error_classification = classification
+            _emit(event)
 
     def _save_state(self, path, value):
         write_transport_envelope(path, value, self.key)
@@ -273,6 +478,7 @@ class NativeCodexBridge:
                 continue
             self._save_state(result_path, {**sent, "status": "accepted", "reconciled": False})
             self._seen.add(command_id)
+            self._last_activity = time.monotonic()
             _emit({"type": "turn.steered", "thread_id": self.thread_id,
                    "turn_id": self.turn_id, "input_ref": command_id})
 
@@ -283,8 +489,10 @@ class NativeCodexBridge:
                 "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME") if name in os.environ})
         self.process = subprocess.Popen(self.command, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=sys.stderr.buffer, bufsize=0)
+        self._reader_stop.clear()
         reader = threading.Thread(target=self._reader, daemon=True)
         reader.start()
+        aborted = False
         try:
             self.request("initialize", {"clientInfo": {"name": "meta_research", "version": "1.0"},
                 "capabilities": {"experimentalApi": True}})
@@ -334,33 +542,97 @@ class NativeCodexBridge:
                 raise ValueError("native_turn_identity_missing")
             self._save_state(self.directory / "native-turn-id.json", {"thread_id": self.thread_id,
                 "turn_id": self.turn_id, "client_user_message_id": input_id})
+            self._last_activity = time.monotonic()
             while self.terminal is None:
                 self.poll_guidance()
                 try:
-                    self.notification(self._next())
+                    record = self._next()
                 except queue.Empty:
-                    continue
+                    record = None
+                if record is not None:
+                    if record.get("method") != "error":
+                        self._last_activity = time.monotonic()
+                    self.notification(record)
+                if (
+                    self.terminal is None
+                    and self.turn_idle_timeout_seconds is not None
+                    and (time.monotonic() - self._last_activity) >= self.turn_idle_timeout_seconds
+                ):
+                    aborted = True
+                    _emit({
+                        "type": "error",
+                        "thread_id": self.thread_id,
+                        "turn_id": self.turn_id,
+                        "message": (
+                            f"Native turn idle timeout after {self.turn_idle_timeout_seconds:.1f}s without activity"
+                        ),
+                        "error": {
+                            "code": "native_turn_idle_timeout",
+                            "idle_timeout_seconds": self.turn_idle_timeout_seconds,
+                        },
+                        "will_retry": False,
+                        "classification": "upstream_transient",
+                    })
+                    raise TimeoutError("native_turn_idle_timeout")
             success = self.terminal.get("status") == "completed"
             last_usage = self.usage.get("last") if isinstance(self.usage, dict) else None
             usage = ({"input_tokens": last_usage.get("inputTokens"),
                 "cached_input_tokens": last_usage.get("cachedInputTokens"),
                 "output_tokens": last_usage.get("outputTokens")}
                 if isinstance(last_usage, dict) else None)
+            terminal_error = self.terminal.get("error")
+            if not success and terminal_error is None and isinstance(self.last_error, dict):
+                terminal_error = self.last_error.get("error") or {"message": self.last_error.get("message")}
+            classification = (
+                None
+                if success
+                else (classify_native_error(terminal_error) or self.last_error_classification)
+            )
             _emit({"type": "turn.completed" if success else "turn.failed",
-                   "turn_id": self.turn_id, "error": self.terminal.get("error"),
+                   "turn_id": self.turn_id, "error": terminal_error,
+                   **({"classification": classification} if classification is not None else {}),
                    **({"usage": usage, "native_token_usage": self.usage} if usage is not None else {})})
             if success and "--output-last-message" in self.options:
                 if not isinstance(self.last_message, str):
                     raise ValueError("native_final_message_missing")
                 Path(self.options["--output-last-message"]).write_text(self.last_message, encoding="utf-8")
             return 0 if success else 1
+        except ValueError as error:
+            aborted = True
+            if str(error) == "native_provider_stream_limit":
+                _emit({
+                    "type": "error",
+                    "thread_id": self.thread_id,
+                    "turn_id": self.turn_id,
+                    "message": f"Native provider stdout exceeded {self.max_stdout_bytes} byte cap",
+                    "error": {
+                        "code": "native_provider_stream_limit",
+                        "max_stdout_bytes": self.max_stdout_bytes,
+                    },
+                    "will_retry": False,
+                })
+            raise
+        except BaseException:
+            aborted = True
+            raise
         finally:
-            self.process.stdin.close()
+            self._reader_stop.set()
+            try:
+                if self.process.stdin is not None and not self.process.stdin.closed:
+                    self.process.stdin.close()
+            except OSError:
+                pass
+            if aborted and self.process.poll() is None:
+                self.process.terminate()
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.process.terminate()
-                self.process.wait(timeout=5)
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
 
     def read_original_turn(self):
         start = read_transport_envelope(self.directory / "native-turn-start.json", self.key)
@@ -368,6 +640,7 @@ class NativeCodexBridge:
         known = read_transport_envelope(known_path, self.key) if known_path.exists() else None
         self.process = subprocess.Popen(self.command, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=sys.stderr.buffer, bufsize=0)
+        self._reader_stop.clear()
         threading.Thread(target=self._reader, daemon=True).start()
         try:
             self.request("initialize", {"clientInfo": {"name": "meta_research", "version": "1.0"},
@@ -404,11 +677,21 @@ class NativeCodexBridge:
                 "turn": turn, "last_message": messages[-1] if messages else None})
             return True
         finally:
-            self.process.stdin.close()
+            self._reader_stop.set()
+            try:
+                if self.process.stdin is not None and not self.process.stdin.closed:
+                    self.process.stdin.close()
+            except OSError:
+                pass
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self.process.terminate(); self.process.wait(timeout=5)
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
 
 
 def reconcile_native_operation(directory):
@@ -584,15 +867,30 @@ def _strict_exec(argv, args, key):
         process.terminate()
     stderr = bytearray()
     stdout_bytes = 0
+    max_stdout_bytes = _env_positive_int("META_RESEARCH_NATIVE_MAX_STDOUT_BYTES", MAX_STDOUT_BYTES)
     complete = [False, False]
     errors = []
     stderr_overflow = False
+    stdout_overflow = False
 
     def drain(stream, index):
-        nonlocal stdout_bytes, stderr_overflow
+        nonlocal stdout_bytes, stderr_overflow, stdout_overflow
         try:
             while chunk := stream.read(65536):
                 if index == 0:
+                    if stdout_overflow:
+                        continue
+                    remaining = max_stdout_bytes - stdout_bytes
+                    if len(chunk) > remaining:
+                        if remaining > 0:
+                            sys.stdout.buffer.write(chunk[:remaining])
+                            sys.stdout.buffer.flush()
+                            stdout_bytes += remaining
+                        stdout_overflow = True
+                        errors.append(ValueError("native_provider_stream_limit"))
+                        if process is not None and process.poll() is None:
+                            process.terminate()
+                        continue
                     stdout_bytes += len(chunk)
                     sys.stdout.buffer.write(chunk)
                     sys.stdout.buffer.flush()

@@ -22,7 +22,8 @@ def _seed_threads(root, refs):
             db.execute('INSERT INTO threads VALUES (?,?)', (ref, str(path)))
 
 
-def test_slow_harness_does_not_wait_once_per_retired_thread(tmp_path):
+def test_slow_harness_does_not_wait_once_per_retired_thread(tmp_path, monkeypatch):
+    monkeypatch.setattr("meta_research.native_session_cleanup._NATIVE_DELETE_BATCH_SECONDS", 0.5)
     root = prepare_data_root(tmp_path / 'isolated')
     refs = [str(uuid4()) for _ in range(3)]
     _seed_threads(root, refs)
@@ -39,7 +40,8 @@ def test_slow_harness_does_not_wait_once_per_retired_thread(tmp_path):
     assert all(item['action'] == 'skipped' and item['reason'] == 'native_cleanup_deferred' for item in outcome)
     assert len(list(root.codex_archived_sessions.glob('*.jsonl'))) == 3
 
-def test_slow_leaf_yields_to_healthy_sibling_across_independent_cleanup_pages(tmp_path):
+def test_slow_leaf_yields_to_healthy_sibling_across_independent_cleanup_pages(tmp_path, monkeypatch):
+    monkeypatch.setattr("meta_research.native_session_cleanup._NATIVE_DELETE_BATCH_SECONDS", 0.5)
     root = prepare_data_root(tmp_path / 'isolated')
     refs = sorted(str(uuid4()) for _ in range(5))
     slow_a, healthy_a, slow_b, healthy_b, unrelated = refs

@@ -2501,8 +2501,8 @@ class SQLiteAgentRuntimeHarness:
         with self._database.read() as connection:
             rows = connection.execute(text(
                 "SELECT frozen_prompt FROM ar_harness_provider_operations "
-                "WHERE run_ref=:run_ref AND status='completed' "
-                "AND frozen_prompt IS NOT NULL ORDER BY generation DESC"
+                "WHERE run_ref=:run_ref AND status='executed' "
+                "AND frozen_prompt IS NOT NULL ORDER BY generation DESC LIMIT 3"
             ), {"run_ref": run_ref}).all()
         return tuple(row.frozen_prompt for row in rows)
 

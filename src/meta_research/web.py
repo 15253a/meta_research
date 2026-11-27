@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -88,12 +89,73 @@ PROVIDER_WORKER_WATCHDOG_SECONDS: None = None
 WRITING_DELIVERY_STALL_SECONDS = 910.0
 REASONING_FOLLOWUP_WORKER_WATCHDOG_SECONDS = 30.0
 BACKGROUND_WORKER_STARTUP_GRACE_SECONDS = 0.1
+UPSTREAM_FAILURE_BACKOFF_SCHEDULE_SECONDS: tuple[float, ...] = (
+    30.0,
+    60.0,
+    120.0,
+    240.0,
+    480.0,
+)
+UPSTREAM_FAILURE_PARK_THRESHOLD = len(UPSTREAM_FAILURE_BACKOFF_SCHEDULE_SECONDS)
+GENERIC_FAILURE_BACKOFF_BASE_SECONDS = 0.2
+GENERIC_FAILURE_BACKOFF_MAX_SECONDS = 60.0
+WORKER_PARK_POLL_SECONDS = 60.0
+_UPSTREAM_CAPACITY_OR_TRANSIENT_TOKENS = (
+    "upstream_capacity",
+    "upstream_transient",
+    "upstream_error",
+    "upstream_timeout",
+    "provider_capacity",
+    "model_capacity",
+    "at_capacity",
+    "capacity_exceeded",
+    "rate_limit",
+    "ratelimit",
+    "too_many_requests",
+    "overloaded",
+    "codex_usage_limit",
+    "usage_limit",
+    "service_unavailable",
+    "temporarily_unavailable",
+    "bad_gateway",
+    "gateway_timeout",
+    "native_turn_idle_timeout",
+    "codex_operation_timeout",
+    "codex_operation_failed",
+    "codex_cli_failed",
+    "provider_timeout",
+    "provider_failed",
+    "provider_io_unavailable",
+    "provider_stream_invalid",
+    "provider_outcome_unknown",
+    "http_429",
+    "http_502",
+    "http_503",
+    "http_504",
+    "http_529",
+)
+_UPSTREAM_HTTP_STATUS_RE = re.compile(r"(?:^|[^0-9])(?:429|502|503|504|529)(?:[^0-9]|$)")
+
+
+def _is_upstream_capacity_or_transient_error(error_code: str | None) -> bool:
+    if not isinstance(error_code, str) or not error_code:
+        return False
+    lowered = error_code.strip().lower()
+    if lowered.startswith("worker_parked:"):
+        lowered = lowered.split(":", 1)[1]
+    if any(token in lowered for token in _UPSTREAM_CAPACITY_OR_TRANSIENT_TOKENS):
+        return True
+    return bool(_UPSTREAM_HTTP_STATUS_RE.search(lowered))
+
 
 @dataclass
 class ReconciliationHealth:
     status: Literal["ready", "unavailable"] = "ready"
     last_error: str | None = None
     retry_count: int = 0
+    parked: bool = False
+    warning: str | None = None
+    next_retry_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -948,11 +1010,16 @@ def create_app(
         reason_code = health.last_error or (
             "worker_not_started" if task is None else "worker_exited"
         )
-        return {
+        check: dict[str, object] = {
             "name": name,
             "status": "unavailable",
             "reason": {"code": reason_code},
         }
+        if health.parked:
+            check["parked"] = True
+            if health.warning:
+                check["warning"] = health.warning
+        return check
 
     status_reader = RuntimeStatusReader(runtime._database)
     latest_status_revision: int | None = None
@@ -3930,7 +3997,7 @@ async def _verify_research_assets(
             try:
                 report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, limit=10)
                 for item in report:
-                    if item.get("action") == "removed":
+                    if item.get("action") in {"removed", "rotated"}:
                         LOGGER.info("Completed research workspace reclaimed: %s", item)
             except (OSError, OwnerConflict, ValueError):
                 LOGGER.exception("Completed workspace cleanup deferred")
@@ -4243,7 +4310,11 @@ async def _process_target_runs(
                 error.code if isinstance(error, OwnerConflict) else type(error).__name__
             )
             set_health("unavailable", error_code)
-            await asyncio.sleep(min(2.0, 0.2 * (2 ** min(health.retry_count, 4))))
+            discovery_delay = min(
+                GENERIC_FAILURE_BACKOFF_MAX_SECONDS,
+                GENERIC_FAILURE_BACKOFF_BASE_SECONDS * (2 ** min(max(health.retry_count - 1, 0), 9)),
+            )
+            await asyncio.sleep(discovery_delay)
             continue
 
         # An in-flight retry, or another Target's success, does not prove a
@@ -4485,7 +4556,9 @@ async def _process_background_operation(
     """
 
     consecutive_idle_passes = 0
+    upstream_failure_streak = 0
     while True:
+        advanced = False
         try:
             advanced = await _await_monitored_worker_call(
                 operation,
@@ -4503,16 +4576,80 @@ async def _process_background_operation(
             )
 
         if error_code is not None:
-            changed = health.status != "unavailable" or health.last_error != error_code
-            health.status = "unavailable"
-            health.last_error = error_code
             health.retry_count += 1
-            delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
+            if _is_upstream_capacity_or_transient_error(error_code):
+                upstream_failure_streak += 1
+                if upstream_failure_streak > UPSTREAM_FAILURE_PARK_THRESHOLD:
+                    parked_code = (
+                        error_code
+                        if error_code.startswith("worker_parked:")
+                        else f"worker_parked:{error_code}"
+                    )
+                    warning_message = (
+                        f"{worker_label} parked after {upstream_failure_streak} "
+                        f"consecutive upstream/transient failures ({error_code})"
+                    )
+                    changed = (
+                        health.status != "unavailable"
+                        or health.last_error != parked_code
+                        or not health.parked
+                        or health.warning != warning_message
+                    )
+                    health.status = "unavailable"
+                    health.last_error = parked_code
+                    health.parked = True
+                    health.warning = warning_message
+                    health.next_retry_at = None
+                    LOGGER.warning("%s", warning_message)
+                    if changed and on_health_change is not None:
+                        on_health_change()
+                    while health.parked:
+                        await asyncio.sleep(WORKER_PARK_POLL_SECONDS)
+                    upstream_failure_streak = 0
+                    health.warning = None
+                    continue
+                schedule = UPSTREAM_FAILURE_BACKOFF_SCHEDULE_SECONDS
+                delay = schedule[min(upstream_failure_streak - 1, len(schedule) - 1)]
+                changed = (
+                    health.status != "unavailable"
+                    or health.last_error != error_code
+                    or health.parked
+                )
+                health.status = "unavailable"
+                health.last_error = error_code
+                health.parked = False
+                health.warning = None
+                health.next_retry_at = time.time() + delay
+            else:
+                upstream_failure_streak = 0
+                delay = min(
+                    GENERIC_FAILURE_BACKOFF_MAX_SECONDS,
+                    GENERIC_FAILURE_BACKOFF_BASE_SECONDS * (2 ** min(health.retry_count - 1, 9)),
+                )
+                changed = (
+                    health.status != "unavailable"
+                    or health.last_error != error_code
+                    or health.parked
+                )
+                health.status = "unavailable"
+                health.last_error = error_code
+                health.parked = False
+                health.warning = None
+                health.next_retry_at = time.time() + delay
         else:
-            changed = health.status != "ready" or health.last_error is not None
+            upstream_failure_streak = 0
+            changed = (
+                health.status != "ready"
+                or health.last_error is not None
+                or health.parked
+                or health.warning is not None
+            )
             health.status = "ready"
             health.last_error = None
             health.retry_count = 0
+            health.parked = False
+            health.warning = None
+            health.next_retry_at = None
             if advanced:
                 consecutive_idle_passes = 0
                 delay = active_delay
