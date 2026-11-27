@@ -225,9 +225,35 @@ const formExtraDecls = [
   "reasonCode",
   "humanRequestScopeStale",
   "requestStatusLabel",
+  "explicitRequestDecisions",
+  "requestStatusTone",
   "humanReplyMaterials",
   "humanRequestReceiptPresentation",
 ];
+
+const viewExtraDecls = [
+  "requestCopy",
+  "scopeLabel",
+  "requestStatusLabel",
+  "renderAgentText",
+  "explicitRequestDecisions",
+  "requestStatusTone",
+];
+
+const hiddenDialogueAsidePattern =
+  /<aside\b(?=[^>]*\bclass="[^"]*\bhc-request-draft\b[^"]*")(?=[^>]*\bhidden(?:=""|(?=[\s>])))\s*[^>]*>/;
+
+function loadReceiptHelpers() {
+  const code = extractDeclarations([
+    "requestStatusLabel",
+    "explicitRequestDecisions",
+    "requestStatusTone",
+    "humanRequestReceiptPresentation",
+  ]);
+  const context = {};
+  runInNewContext(code, context, { filename: sourceUrl.pathname });
+  return context;
+}
 
 test("submitted/satisfied receipt renders calm green success state without protocol jargon or raw receipt ID", async () => {
   const mounted = await mountWithHooks(
@@ -329,25 +355,157 @@ test("genuinely unsatisfied and declined states stay visually distinct from gree
   assert.doesNotMatch(declinedHtml, /human_response_declined_456/);
 });
 
-test("collapsed RequestDetails retains response_ref for debugging without leaking into main receipt", async () => {
+test("collapsed RequestDetails retains formal receipt_ref without shadowing and shows response_ref post-reload", async () => {
   const mounted = await mountWithHooks(
     "RequestDetails",
     ["isRecord", "documentText", "firstDefined", "stringify", "Detail"],
     {
-      request: makeRequest({ status: "satisfied" }),
+      request: makeRequest({
+        status: "satisfied",
+        responses: [{
+          response_ref: "human_response_8c94603dc90a4118a4fcc0f75f22f6df",
+          receipt: { receipt_ref: "formal_receipt_abc123" },
+          decision: "provided",
+          note: "已确认按时间切分。",
+        }],
+      }),
       otherBlockers: [],
     },
     {
       ImpactPreview: () => null,
-      humanResponseDeliveryState: () => ({
-        status: "recorded",
-        result: { response_ref: "human_response_8c94603dc90a4118a4fcc0f75f22f6df" },
-      }),
+      // Simulate post-reload: in-memory delivery state is null.
+      humanResponseDeliveryState: () => null,
     },
   );
   const html = mounted.html();
   assert.match(html, /<details class="hc-request-details">/);
-  assert.match(html, /human_response_8c94603dc90a4118a4fcc0f75f22f6df/);
+  assert.match(html, /<dt>Response receipts<\/dt><dd>formal_receipt_abc123<\/dd>/, "formal receipt.receipt_ref must not be shadowed by response_ref");
+  assert.match(html, /<dt>Response refs<\/dt><dd>human_response_8c94603dc90a4118a4fcc0f75f22f6df<\/dd>/, "response_ref must remain available in a separate debug row post-reload");
+});
+
+test("humanRequestReceiptPresentation never renders false-positive green on stale retryStatus or contradictory decisions", () => {
+  const { humanRequestReceiptPresentation, requestStatusTone } = loadReceiptHelpers();
+
+  // Stale retryStatus === "succeeded" after reload moves status away from open/satisfied
+  for (const [status, expectedTone] of [
+    ["unsatisfied", "warning"],
+    ["expired", "warning"],
+    ["declined", "neutral"],
+    ["withdrawn", "neutral"],
+    ["superseded", "neutral"],
+  ]) {
+    const receipt = humanRequestReceiptPresentation(
+      makeRequest({ status, evaluation: null, disposition: null }),
+      { recorded: true, retryStatus: "succeeded" },
+    );
+    assert.equal(receipt.tone, expectedTone, `retryStatus=succeeded with status=${status} must be ${expectedTone}, not success`);
+    assert.notEqual(receipt.tone, "success");
+    assert.notEqual(receipt.title, "原任务已收到重试请求");
+  }
+
+  // Genuine retry success on open or satisfied without contradictory decisions stays green
+  for (const status of ["open", "satisfied"]) {
+    const receipt = humanRequestReceiptPresentation(
+      makeRequest({ status, evaluation: null, disposition: null }),
+      { recorded: false, retryStatus: "succeeded" },
+    );
+    assert.equal(receipt.tone, "success");
+    assert.equal(receipt.title, "原任务已收到重试请求");
+  }
+
+  // retryStatus=succeeded on open with contradictory evaluation must downgrade from green
+  const openContradicted = humanRequestReceiptPresentation(
+    makeRequest({ status: "open", evaluation: { decision: "needs_input" }, disposition: null }),
+    { recorded: false, retryStatus: "succeeded" },
+  );
+  assert.equal(openContradicted.tone, "warning");
+
+  // status=satisfied with contradictory evaluation/disposition must downgrade from green
+  const satisfiedNeedsInput = humanRequestReceiptPresentation(
+    makeRequest({ status: "satisfied", evaluation: { decision: "needs_input" }, disposition: { decision: "satisfied" } }),
+    { recorded: true, retryStatus: null },
+  );
+  assert.equal(satisfiedNeedsInput.tone, "warning");
+  assert.equal(
+    requestStatusTone("satisfied", { evaluation: { decision: "needs_input" }, disposition: { decision: "satisfied" } }),
+    "warning",
+  );
+
+  const satisfiedUnsatisfiedDisp = humanRequestReceiptPresentation(
+    makeRequest({ status: "satisfied", evaluation: { decision: "satisfied" }, disposition: { decision: "unsatisfied" } }),
+    { recorded: true, retryStatus: null },
+  );
+  assert.equal(satisfiedUnsatisfiedDisp.tone, "warning");
+
+  const satisfiedDeclined = humanRequestReceiptPresentation(
+    makeRequest({ status: "satisfied", evaluation: { decision: "declined" }, disposition: { decision: "declined" } }),
+    { recorded: true, retryStatus: null },
+  );
+  assert.equal(satisfiedDeclined.tone, "neutral");
+  assert.equal(
+    requestStatusTone("satisfied", { evaluation: { decision: "declined" }, disposition: { decision: "declined" } }),
+    "neutral",
+  );
+
+  // Direct expired / withdrawn / superseded tones without retryStatus
+  assert.equal(
+    humanRequestReceiptPresentation(makeRequest({ status: "expired", evaluation: null, disposition: null }), { recorded: false, retryStatus: null }).tone,
+    "warning",
+  );
+  assert.equal(
+    humanRequestReceiptPresentation(makeRequest({ status: "withdrawn", evaluation: null, disposition: null }), { recorded: false, retryStatus: null }).tone,
+    "neutral",
+  );
+  assert.equal(
+    humanRequestReceiptPresentation(makeRequest({ status: "superseded", evaluation: null, disposition: null }), { recorded: false, retryStatus: null }).tone,
+    "neutral",
+  );
+});
+
+test("RequestForm renders warning styling (not green) when satisfied status contradicts explicit evaluation", async () => {
+  const mounted = await mountWithHooks(
+    "RequestForm",
+    formExtraDecls,
+    {
+      request: makeRequest({
+        status: "satisfied",
+        evaluation: { decision: "needs_input" },
+        disposition: { decision: "satisfied" },
+      }),
+      commands: [],
+      authorizations: [],
+      selectedReplies: [],
+      onChanged: () => {},
+    },
+    requestFormOverrides("human_response_contradicted_789"),
+  );
+  const html = mounted.html();
+  assert.match(html, /hc-response-boundary--warning/);
+  assert.match(html, /data-receipt-tone="warning"/);
+  assert.doesNotMatch(html, /hc-response-boundary--success/);
+  assert.doesNotMatch(html, /human_response_contradicted_789/);
+});
+
+test("HumanRequestList status pills align with requestStatusTone across open, satisfied, unsatisfied, expired, and declined", async () => {
+  const items = [
+    makeRequest({ request_ref: "r:open", status: "open", evaluation: null, disposition: null }),
+    makeRequest({ request_ref: "r:sat", status: "satisfied" }),
+    makeRequest({ request_ref: "r:unsat", status: "unsatisfied", evaluation: { decision: "needs_input" }, disposition: { decision: "unsatisfied" } }),
+    makeRequest({ request_ref: "r:exp", status: "expired", evaluation: null, disposition: null }),
+    makeRequest({ request_ref: "r:dec", status: "declined", evaluation: { decision: "declined" }, disposition: { decision: "declined" } }),
+  ];
+  const mounted = await mountWithHooks(
+    "HumanRequestList",
+    viewExtraDecls,
+    { items, onSelect: () => {}, onClose: () => {}, blocking: false },
+    { MetaTrace: () => null },
+  );
+  const html = mounted.html();
+  assert.match(html, /<i class="current">待处理<\/i>/);
+  assert.match(html, /<i class="success">已处理<\/i>/);
+  assert.match(html, /<i class="warning">已回应，未满足<\/i>/);
+  assert.match(html, /<i class="warning">已过期<\/i>/);
+  assert.match(html, /<i class="neutral">已拒绝<\/i>/);
 });
 
 test("HumanRequestView simplifies crowded top header and puts spacious primary area on left with collapsible right dialogue pane", async () => {
@@ -359,7 +517,7 @@ test("HumanRequestView simplifies crowded top header and puts spacious primary a
   });
   const mounted = await mountWithHooks(
     "HumanRequestView",
-    ["requestCopy", "scopeLabel", "requestStatusLabel", "renderAgentText", "requestStatusTone"],
+    viewExtraDecls,
     {
       request: openRequest,
       requests: [openRequest],
@@ -427,7 +585,7 @@ test("HumanRequestView simplifies crowded top header and puts spacious primary a
   await mounted.rerender();
   const collapsedHtml = mounted.html();
   assert.match(collapsedHtml, /data-dialogue-open="false"/, "clicking toggle must collapse the right dialogue pane");
-  assert.match(collapsedHtml, /class="hc-request-draft"[^>]*hidden=""/, "collapsed dialogue pane must be hidden");
+  assert.match(collapsedHtml, hiddenDialogueAsidePattern, "collapsed dialogue pane must be hidden");
   const toggleBtnAfter = findElement(
     mounted.tree,
     (el) => el.type === "button" && typeof el.props?.className === "string" && el.props.className.includes("hc-dialogue-toggle"),
@@ -440,7 +598,7 @@ test("HumanRequestView shows only populated category pills when multiple categor
   const reqB = makeRequest({ request_ref: "r:2:r1", kind: "library_reconnect", status: "open", responses: [], evaluation: null, disposition: null });
   const mounted = await mountWithHooks(
     "HumanRequestView",
-    ["requestCopy", "scopeLabel", "requestStatusLabel", "renderAgentText", "requestStatusTone"],
+    viewExtraDecls,
     {
       request: reqA,
       requests: [reqA, reqB],
@@ -499,13 +657,28 @@ test("CSS defines calm green success receipt styling and spacious left-primary +
   const modalWorkspaceRule = modalCss.match(/\.workspace-modal\s+\.hc-request-workspace\s*\{[^}]+\}/);
   assert.ok(modalWorkspaceRule, "workspace-modal.css should define .workspace-modal .hc-request-workspace");
   assert.match(modalWorkspaceRule[0], /grid-template-columns:\s*minmax\(0,\s*1\.[5-9]\d*fr\)\s+minmax\(/, "left primary column must be wider than right dialogue column");
+
+  // 5. workspace-modal.css must override `.workspace-modal :is(button, ...)` font reset for HR header & collapse buttons
+  assert.match(modalCss, /\.workspace-modal\s+\.hc-back-button,\s*\.workspace-modal\s+\.hc-dialogue-toggle\s*\{[^}]*font-size:\s*12px/, "workspace-modal.css must preserve header button typography");
+  assert.match(modalCss, /\.workspace-modal\s+\.hc-draft-collapse\s*\{[^}]*font-size:\s*11px/, "workspace-modal.css must preserve dialogue collapse button typography");
+  assert.match(modalCss, /\.workspace-modal\s+\.hc-queue-nav\s+button\s*\{[^}]*font-size:\s*11px/, "workspace-modal.css must preserve queue nav button typography");
+  assert.match(modalCss, /@media\s*\(max-width:\s*600px\)\s*\{[\s\S]*\.workspace-modal\s+\.hc-dialogue-toggle\s*\{[^}]*font-size:\s*11px/, "workspace-modal.css must include mobile header toggle typography override");
+
+  // 6. library_reconnect desktop min-height specificity guard: no desktop 360px override in shell.css; workspace-modal enforces min-height: 0 on desktop
+  assert.doesNotMatch(shellCss, /\.hc-dialog-library\s+\.hc-request-draft/, "shell.css must not force desktop min-height on library dialogue pane");
+  assert.match(modalCss, /\.workspace-modal\s+\.hc-dialog\s+\.hc-request-draft:not\(\[hidden\]\)\s*\{[^}]*min-height:\s*0/, "workspace-modal.css must enforce min-height: 0 on desktop dialogue pane");
+  assert.match(modalCss, /@media\s*\(max-width:\s*900px\)\s*\{[\s\S]*\.workspace-modal\s+\.hc-dialog\s+\.hc-request-draft:not\(\[hidden\]\)\s*\{[^}]*min-height:\s*360px/, "workspace-modal.css must scope min-height: 360px to narrow stacking viewports");
+
+  // 7. Removed dead HR layout classes stay cleaned up
+  assert.doesNotMatch(shellCss, /\.hc-formal-head\b/);
+  assert.doesNotMatch(modalCss, /\.workspace-stage-track\b/);
 });
 
 test("satisfied request without messages starts with collapsed dialogue pane and can expand on demand", async () => {
   const satisfiedRequest = makeRequest({ status: "satisfied" });
   const mounted = await mountWithHooks(
     "HumanRequestView",
-    ["requestCopy", "scopeLabel", "requestStatusLabel", "renderAgentText", "requestStatusTone"],
+    viewExtraDecls,
     {
       request: satisfiedRequest,
       requests: [satisfiedRequest],
@@ -543,7 +716,7 @@ test("satisfied request without messages starts with collapsed dialogue pane and
   const initialHtml = mounted.html();
   assert.match(initialHtml, /hc-status-badge--success/, "header status pill should use calm green for satisfied request");
   assert.match(initialHtml, /data-dialogue-open="false"/, "handled request without messages should default to spacious collapsed dialogue");
-  assert.match(initialHtml, /class="hc-request-draft"[^>]*hidden=""/);
+  assert.match(initialHtml, hiddenDialogueAsidePattern);
 
   const toggleBtn = findElement(
     mounted.tree,

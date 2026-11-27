@@ -3242,7 +3242,8 @@ a:focus-visible,
   font-style: normal;
 }
 .hc-request-card i.current { color: #ae4d36; background: #fff0eb; }
-.hc-request-card i.satisfied { color: #0f6a5b; background: #e7f6f1; }
+.hc-request-card i.success { color: #0f6a5b; background: #e7f6f1; }
+.hc-request-card i.warning { color: #9f3c23; background: #fff2ec; }
 .hc-list-empty { padding: 70px 20px; text-align: center; }
 .hc-list-empty b { font-family: var(--display); font-size: 25px; }
 .hc-list-empty p { color: var(--ink-muted); font-size: 11px; }
@@ -3298,7 +3299,6 @@ a:focus-visible,
   overflow: auto;
   padding: 26px 28px 24px;
 }
-.hc-dialog-library .hc-request-draft:not([hidden]) { min-height: 360px; }
 .hc-waiting {
   margin-bottom: 19px;
   padding: 13px 14px;
@@ -3768,15 +3768,10 @@ a:focus-visible,
 .hc-draft-compose button { width: 42px; min-height: 42px; align-self: end; border: 0; border-radius: 11px; color: #fff; background: var(--ultraviolet); font-size: 18px; }
 .hc-draft-compose > small { display: block; margin-top: 7px; color: #8b8aa1; font: 8.5px/1.2 var(--utility); }
 .hc-draft-status { padding: 8px 14px; border-top: 1px solid #ecebf6; color: #707b90; background: #fafaff; font-size: 8.5px; line-height: 1.5; }
-.hc-draft-boundary { padding: 8px 14px 13px; color: #8a94a6; background: #fafaff; font-size: 8px; line-height: 1.5; }
 .companion-session-state { padding: 10px 16px; border-bottom: 1px solid var(--line); color: var(--ink-muted); font-size: 10px; overflow-wrap: anywhere; }
 .companion-session-state summary { color: var(--ultraviolet); cursor: pointer; font-weight: 750; }
 .companion-session-state p { margin: 8px 0; line-height: 1.5; }
 .companion-session-state code { font-size: 9px; }
-.hc-formal-head { margin-bottom: 20px; }
-.hc-formal-head small { display: block; color: var(--ultraviolet); font-size: 10px; }
-.hc-formal-head b { display: block; margin-top: 6px; font-size: 16px; }
-.hc-formal-head p { color: var(--ink-muted); font-size: 11px; line-height: 1.5; }
 .hc-select-reply { display: flex; gap: 5px; align-items: center; flex-wrap: wrap; margin-top: 12px; padding-top: 9px; border-top: 1px solid var(--line); font-size: 11px; color: var(--ultraviolet); }
 .hc-select-reply span { color: var(--ink-muted); font-size: 9px; }
 .hc-selected-replies { margin: 16px 0; padding: 13px; border: 1px solid #deddf1; border-radius: 12px; background: #f7f7ff; font-size: 11px; }

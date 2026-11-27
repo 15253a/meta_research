@@ -377,9 +377,34 @@ function requestStatusLabel(status: HumanRequestItem["status"]): string {
 
 type RequestReceiptTone = "success" | "warning" | "neutral";
 
-function requestStatusTone(status: HumanRequestItem["status"]): "open" | RequestReceiptTone {
+function explicitRequestDecisions(
+  request?: Pick<HumanRequestItem, "evaluation" | "disposition">,
+): string[] {
+  const evaluationDecision = typeof request?.evaluation?.decision === "string"
+    ? request.evaluation.decision
+    : null;
+  const dispositionDecision = typeof request?.disposition?.decision === "string"
+    ? request.disposition.decision
+    : null;
+  return [evaluationDecision, dispositionDecision].filter(
+    (value): value is string => Boolean(value),
+  );
+}
+
+function requestStatusTone(
+  status: HumanRequestItem["status"],
+  request?: Pick<HumanRequestItem, "evaluation" | "disposition">,
+): "open" | RequestReceiptTone {
   if (status === "open") return "open";
-  if (status === "satisfied") return "success";
+  if (status === "satisfied") {
+    const explicit = explicitRequestDecisions(request);
+    if (explicit.some((value) => value !== "satisfied")) {
+      return explicit.every((value) => value === "satisfied" || value === "declined")
+        ? "neutral"
+        : "warning";
+    }
+    return "success";
+  }
   if (status === "unsatisfied" || status === "expired") return "warning";
   return "neutral";
 }
@@ -388,7 +413,16 @@ function humanRequestReceiptPresentation(
   request: HumanRequestItem,
   options: { recorded: boolean; retryStatus: "processing" | "succeeded" | null },
 ): { tone: RequestReceiptTone; title: string; summary: string } {
-  if (options.retryStatus === "succeeded") {
+  const explicitDecisions = explicitRequestDecisions(request);
+  const hasContradictoryDecision = explicitDecisions.some((value) => value !== "satisfied");
+  const onlyDeclinedContradiction = hasContradictoryDecision
+    && explicitDecisions.every((value) => value === "satisfied" || value === "declined");
+
+  if (
+    options.retryStatus === "succeeded"
+    && (request.status === "open" || request.status === "satisfied")
+    && !hasContradictoryDecision
+  ) {
     return {
       tone: "success",
       title: "原任务已收到重试请求",
@@ -399,6 +433,20 @@ function humanRequestReceiptPresentation(
   const title = `${prefix} · ${requestStatusLabel(request.status)}`;
   switch (request.status) {
     case "satisfied":
+      if (hasContradictoryDecision) {
+        if (onlyDeclinedContradiction) {
+          return {
+            tone: "neutral",
+            title,
+            summary: "你的决定已收到并交回研究流程，系统会按此调整后续安排。",
+          };
+        }
+        return {
+          tone: "warning",
+          title,
+          summary: "已收到你的回应，但当前核验结果尚未完全确认满足，相关任务可能尚未恢复；请查看详情或留意后续提示。",
+        };
+      }
       return {
         tone: "success",
         title,
@@ -435,6 +483,15 @@ function humanRequestReceiptPresentation(
         summary: "这项请求已有更新版本或后续事项替代，请查看最新待办。",
       };
     default:
+      if (hasContradictoryDecision) {
+        return {
+          tone: onlyDeclinedContradiction ? "neutral" : "warning",
+          title: options.retryStatus === "succeeded" ? "重试状态待进一步核对" : title,
+          summary: onlyDeclinedContradiction
+            ? "请求状态已更新，系统会按当前结果调整后续安排。"
+            : "重试请求已送达，但原任务核验尚未确认恢复，请查看详情或留意后续提示。",
+        };
+      }
       return {
         tone: "neutral",
         title,
@@ -2554,7 +2611,9 @@ function HumanRequestList({
           return (
             <section className="hc-kind-group" key={kind}>
               <header><b>{requestCopy[kind].list}</b><small>{sameKind.length} 项</small></header>
-              {sameKind.map((item) => (
+              {sameKind.map((item) => {
+                const tone = requestStatusTone(item.status, item);
+                return (
                 <button
                   type="button"
                   className="hc-request-card"
@@ -2563,9 +2622,10 @@ function HumanRequestList({
                   aria-label={`${requestCopy[kind].list} · ${item.obligation}`}
                 >
                   <span><b>{item.obligation}</b><small>{scopeLabel(item)}</small></span>
-                  <i className={item.status === "open" ? "current" : item.status === "satisfied" ? "satisfied" : ""}>{requestStatusLabel(item.status)}</i>
+                  <i className={tone === "open" ? "current" : tone}>{requestStatusLabel(item.status)}</i>
                 </button>
-              ))}
+                );
+              })}
             </section>
           );
         }) : (
@@ -2612,6 +2672,18 @@ function HumanRequestView({
 }) {
   const waiting = collaboration?.human_requests.waiting;
   const categoryNav = useRef<HTMLElement>(null);
+  const populatedKinds = (Object.keys(requestCopy) as HumanRequestItem["kind"][])
+    .map((kind) => {
+      const sameKind = requests.filter((item) => item.kind === kind);
+      return {
+        kind,
+        label: requestCopy[kind].list,
+        count: sameKind.length,
+        next: sameKind.find((item) => item.status === "open") ?? sameKind[0] ?? null,
+      };
+    })
+    .filter((entry) => entry.count > 0);
+  const hasCategoryNav = populatedKinds.length > 1;
   useEffect(() => {
     const nav = categoryNav.current;
     const selected = nav?.querySelector<HTMLButtonElement>('[aria-current="page"]');
@@ -2624,7 +2696,7 @@ function HumanRequestView({
     });
     observer.observe(nav);
     return () => observer.disconnect();
-  }, [request.kind]);
+  }, [request.kind, hasCategoryNav]);
   const workspace = useRef<HTMLDivElement>(null);
   usePageReadingPosition(`${request.request_ref}:${request.revision}`, workspace);
   const [selectedReplyRefs, setSelectedReplyRefs] = usePageDraft<string[]>(`hr-replies:${request.request_ref}:${request.revision}`, []);
@@ -2645,18 +2717,7 @@ function HumanRequestView({
   const selectedReplies = requestMessages.filter(message =>
     message.role === "assistant" && message.status === "completed" && !!message.message_ref
     && selectedReplyRefs.includes(message.message_ref));
-  const populatedKinds = (Object.keys(requestCopy) as HumanRequestItem["kind"][])
-    .map((kind) => {
-      const sameKind = requests.filter((item) => item.kind === kind);
-      return {
-        kind,
-        label: requestCopy[kind].list,
-        count: sameKind.length,
-        next: sameKind.find((item) => item.status === "open") ?? sameKind[0] ?? null,
-      };
-    })
-    .filter((entry) => entry.count > 0);
-  const statusTone = requestStatusTone(request.status);
+  const statusTone = requestStatusTone(request.status, request);
 
   return (
     <>
@@ -2901,12 +2962,15 @@ function RequestDetails({
   );
   const responseReceipts = request.responses?.map((response) => {
     const receipt = isRecord(response.receipt) ? response.receipt : undefined;
-    return firstDefined(response, "receipt_ref", "response_receipt_ref", "response_ref")
+    return firstDefined(response, "receipt_ref", "response_receipt_ref")
       ?? firstDefined(receipt ?? {}, "receipt_ref");
   }).filter((value): value is string => typeof value === "string") ?? [];
+  const responseRefs = request.responses?.map((response) =>
+    firstDefined(response, "response_ref"),
+  ).filter((value): value is string => typeof value === "string") ?? [];
   const deliveredResponseRef = humanResponseDeliveryState(request.request_ref)?.result?.response_ref;
-  if (typeof deliveredResponseRef === "string" && deliveredResponseRef && !responseReceipts.includes(deliveredResponseRef)) {
-    responseReceipts.push(deliveredResponseRef);
+  if (typeof deliveredResponseRef === "string" && deliveredResponseRef && !responseRefs.includes(deliveredResponseRef)) {
+    responseRefs.push(deliveredResponseRef);
   }
   const rejectionReceipts = request.response_rejections?.map((rejection) => {
     const receipt = isRecord(rejection.receipt) ? rejection.receipt : undefined;
@@ -2964,6 +3028,7 @@ function RequestDetails({
         <Detail label="Required authorization" value={stringify(request.required_authorization)} />
         <Detail label="Human responses" value={String(request.responses?.length ?? 0)} />
         <Detail label="Response receipts" value={responseReceipts.join("；") || "none"} />
+        {responseRefs.length ? <Detail label="Response refs" value={responseRefs.join("；")} /> : null}
         <Detail label="Rejected response receipts" value={rejectionReceipts.join("；") || "none"} />
         <Detail label="Owner Evaluation" value={typeof evaluation === "string" ? evaluation : "pending"} />
         <Detail label="Evaluation receipt" value={typeof evaluationReceipt === "string" ? evaluationReceipt : undefined} />

@@ -148,9 +148,9 @@ test("a request selects completed assistant work and server artifacts before exp
     expect(work).not.toBeNull();
     expect(response).not.toBeNull();
     if (viewport.width === 1440) {
-      expect(work!.x + work!.width).toBeLessThanOrEqual(response!.x + 1);
-      expect(work!.width).toBeGreaterThan(response!.width);
-    } else expect(work!.y + work!.height).toBeLessThanOrEqual(response!.y + 1);
+      expect(response!.x + response!.width).toBeLessThanOrEqual(work!.x + 1);
+      expect(response!.width).toBeGreaterThan(work!.width);
+    } else expect(response!.y + response!.height).toBeLessThanOrEqual(work!.y + 1);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
     await formal.getByRole("button", { name: "提交", exact: true }).scrollIntoViewIfNeeded();
     await expect(formal.getByRole("button", { name: "提交", exact: true })).toBeInViewport();
