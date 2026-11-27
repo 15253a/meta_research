@@ -395,9 +395,22 @@ def discover_questions(graph, memory, *, quest_ref, query="", offset=0, limit=12
             ORDER BY l.updated_at DESC,l.question_ref LIMIT :limit OFFSET :offset"""),
             {"quest":quest_ref,"query":query,"limit":limit+1,"offset":offset}).all()
         items=[]
-        from meta_research.owners.research_graph import _scientific_outcome_one_line
+        from meta_research.owners.research_graph import (
+            _latest_accepted_outcomes_by_question,
+            _scientific_outcome_one_line,
+        )
         from meta_research.question_relations import question_creation_basis_descriptor
-        for row in rows[:limit]:
+        page_rows = rows[:limit]
+        latest_outcomes = (
+            _latest_accepted_outcomes_by_question(
+                c,
+                quest_ref=quest_ref,
+                question_refs={str(r.question_ref) for r in page_rows},
+            )
+            if page_rows
+            else {}
+        )
+        for row in page_rows:
             q=graph.query_question_history_by_ref(row.question_ref)
             if q is None or q.quest_ref!=quest_ref:raise OwnerConflict("question_source_invalid")
             body=memory.read_question_content(q.content_ref,q.content_hash)
@@ -408,16 +421,7 @@ def discover_questions(graph, memory, *, quest_ref, query="", offset=0, limit=12
             creation_basis=question_creation_basis_descriptor(
                 graph, memory, quest_ref=quest_ref, question_ref=q.question_ref,
                 source_quest_ref=source_quest_ref)
-            latest_row = c.execute(
-                text(
-                    "SELECT outcome_ref, scientific_disposition FROM rg_reasoning_outcome_decisions "
-                    "WHERE decision='accepted' "
-                    "AND json_extract(transition_json,'$.source_quest_ref')=:quest "
-                    "AND json_extract(transition_json,'$.source_question_ref')=:question "
-                    "ORDER BY decided_at DESC, outcome_ref DESC LIMIT 1"
-                ),
-                {"quest": quest_ref, "question": q.question_ref},
-            ).first()
+            latest_row = latest_outcomes.get(q.question_ref)
             latest_outcome_ref = None
             latest_outcome_disposition = None
             latest_outcome_one_line = None

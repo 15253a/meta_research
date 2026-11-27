@@ -6749,68 +6749,71 @@ class SQLiteResearchGraphReceiptVerifier:
                 "rm_autonomous_question_contents",
             } <= tables
             has_outcomes = "rg_reasoning_outcome_decisions" in tables
+            page_refs = [str(row.question_ref) for row in rows]
+            meta_by_ref: dict[str, tuple[str | None, str | None]] = {}
+            if has_question_meta and page_refs:
+                meta_rows = connection.execute(
+                    text(
+                        "SELECT l.question_ref, "
+                        "COALESCE(b.parent_question_ref, d.parent_question_ref) AS parent_question_ref, "
+                        "COALESCE(ac.content_json, bc.content_json, dc.question_json) AS body_json "
+                        "FROM rg_question_lifecycle l "
+                        "LEFT JOIN rg_questions a ON a.question_ref=l.question_ref "
+                        "LEFT JOIN rg_manual_questions b ON b.question_ref=l.question_ref "
+                        "LEFT JOIN rg_autonomous_questions d ON d.question_ref=l.question_ref "
+                        "LEFT JOIN rm_formal_question_contents ac ON ac.content_ref=a.content_ref "
+                        "LEFT JOIN rm_manual_question_contents bc ON bc.content_ref=b.content_ref "
+                        "LEFT JOIN rm_autonomous_question_contents dc ON dc.content_ref=d.content_ref "
+                        "WHERE l.question_ref IN (SELECT value FROM json_each(:q_refs))"
+                    ),
+                    {"q_refs": json.dumps(page_refs)},
+                ).all()
+                for meta in meta_rows:
+                    meta_by_ref[str(meta.question_ref)] = (
+                        meta.parent_question_ref,
+                        meta.body_json if isinstance(meta.body_json, str) else None,
+                    )
+            latest_outcomes = (
+                _latest_accepted_outcomes_by_question(
+                    connection, quest_ref=quest_ref, question_refs=set(page_refs)
+                )
+                if has_outcomes and page_refs
+                else {}
+            )
             questions = []
-            for row in rows:
-                q_ref = str(row.question_ref)
+            for q_ref in page_refs:
                 title = q_ref
                 parent_ref = None
-                if has_question_meta:
-                    meta = connection.execute(
-                        text(
-                            "SELECT "
-                            "COALESCE(b.parent_question_ref, d.parent_question_ref) AS parent_question_ref, "
-                            "COALESCE(ac.content_json, bc.content_json, dc.question_json) AS body_json "
-                            "FROM rg_question_lifecycle l "
-                            "LEFT JOIN rg_questions a ON a.question_ref=l.question_ref "
-                            "LEFT JOIN rg_manual_questions b ON b.question_ref=l.question_ref "
-                            "LEFT JOIN rg_autonomous_questions d ON d.question_ref=l.question_ref "
-                            "LEFT JOIN rm_formal_question_contents ac ON ac.content_ref=a.content_ref "
-                            "LEFT JOIN rm_manual_question_contents bc ON bc.content_ref=b.content_ref "
-                            "LEFT JOIN rm_autonomous_question_contents dc ON dc.content_ref=d.content_ref "
-                            "WHERE l.question_ref=:q"
-                        ),
-                        {"q": q_ref},
-                    ).first()
-                    if meta is not None:
-                        parent_ref = meta.parent_question_ref
-                        if isinstance(meta.body_json, str) and meta.body_json:
-                            try:
-                                parsed_body = json.loads(meta.body_json)
-                                if isinstance(parsed_body, dict) and isinstance(parsed_body.get("title"), str) and parsed_body["title"].strip():
-                                    title = parsed_body["title"].strip()
-                            except (ValueError, TypeError):
-                                pass
+                if q_ref in meta_by_ref:
+                    parent_ref, body_json = meta_by_ref[q_ref]
+                    if body_json:
+                        try:
+                            parsed_body = json.loads(body_json)
+                            if isinstance(parsed_body, dict) and isinstance(parsed_body.get("title"), str) and parsed_body["title"].strip():
+                                title = parsed_body["title"].strip()
+                        except (ValueError, TypeError):
+                            pass
                 latest_outcome_ref = None
                 latest_outcome_disposition = None
                 latest_outcome_one_line = None
-                if has_outcomes:
-                    latest_row = connection.execute(
-                        text(
-                            "SELECT * FROM rg_reasoning_outcome_decisions "
-                            "WHERE decision='accepted' "
-                            "AND json_extract(transition_json,'$.source_quest_ref')=:quest_ref "
-                            "AND json_extract(transition_json,'$.source_question_ref')=:q_ref "
-                            "ORDER BY decided_at DESC, outcome_ref DESC LIMIT 1"
-                        ),
-                        {"quest_ref": quest_ref, "q_ref": q_ref},
-                    ).first()
-                    if latest_row is not None:
-                        latest_outcome_ref = latest_row.outcome_ref
-                        latest_outcome_disposition = getattr(latest_row, "scientific_disposition", None)
-                        if self._reasoning_content_verifier is not None:
-                            try:
-                                source = self._verified_reasoning_history_source(latest_row)
-                                scientific = source.get("scientific_outcome") if isinstance(source, dict) else None
-                                if isinstance(scientific, dict):
-                                    latest_outcome_disposition = scientific.get("disposition", latest_outcome_disposition)
-                                    latest_outcome_one_line = _scientific_outcome_one_line(
-                                        scientific, fallback_disposition=latest_outcome_disposition
-                                    )
-                            except OwnerConflict:
-                                if latest_outcome_disposition:
-                                    latest_outcome_one_line = f"[{latest_outcome_disposition}]"
-                        elif latest_outcome_disposition:
-                            latest_outcome_one_line = f"[{latest_outcome_disposition}]"
+                latest_row = latest_outcomes.get(q_ref)
+                if latest_row is not None:
+                    latest_outcome_ref = latest_row.outcome_ref
+                    latest_outcome_disposition = getattr(latest_row, "scientific_disposition", None)
+                    if self._reasoning_content_verifier is not None:
+                        try:
+                            source = self._verified_reasoning_history_source(latest_row)
+                            scientific = source.get("scientific_outcome") if isinstance(source, dict) else None
+                            if isinstance(scientific, dict):
+                                latest_outcome_disposition = scientific.get("disposition", latest_outcome_disposition)
+                                latest_outcome_one_line = _scientific_outcome_one_line(
+                                    scientific, fallback_disposition=latest_outcome_disposition
+                                )
+                        except OwnerConflict:
+                            if latest_outcome_disposition:
+                                latest_outcome_one_line = f"[{latest_outcome_disposition}]"
+                    elif latest_outcome_disposition:
+                        latest_outcome_one_line = f"[{latest_outcome_disposition}]"
                 questions.append(
                     {
                         "question_ref": q_ref,
@@ -6830,6 +6833,41 @@ class SQLiteResearchGraphReceiptVerifier:
             "next_offset": offset + len(rows) if offset + len(rows) < total else None,
             "summary_only": True,
         }
+
+
+def _latest_accepted_outcomes_by_question(
+    connection,
+    *,
+    quest_ref: str,
+    question_refs: set[str] | None = None,
+) -> dict[str, object]:
+    """Batch-fetch the latest accepted reasoning outcome row per question in one query."""
+    rows = connection.execute(
+        text(
+            "SELECT *, json_extract(transition_json,'$.source_question_ref') AS _source_question_ref "
+            "FROM rg_reasoning_outcome_decisions "
+            "WHERE decision='accepted' "
+            "AND json_extract(transition_json,'$.source_quest_ref')=:quest_ref "
+            "ORDER BY decided_at DESC, outcome_ref DESC"
+        ),
+        {"quest_ref": quest_ref},
+    ).all()
+    latest: dict[str, object] = {}
+    remaining = set(question_refs) if question_refs is not None else None
+    for row in rows:
+        q_ref = getattr(row, "_source_question_ref", None)
+        if not isinstance(q_ref, str) or not q_ref or q_ref in latest:
+            continue
+        if remaining is not None:
+            if q_ref not in remaining:
+                continue
+            latest[q_ref] = row
+            remaining.discard(q_ref)
+            if not remaining:
+                break
+        else:
+            latest[q_ref] = row
+    return latest
 
 
 def _scientific_outcome_one_line(
@@ -16124,7 +16162,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                     "evaluation_count": 0,
                     "authority_count": 0,
                 }
-                for target in accepted_targets:
+                for batch_index, target in enumerate(accepted_targets):
                     created = _insert_target_with_measurement_authority(
                         connection,
                         target=target,
@@ -16151,6 +16189,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                         completion_contract=completion,
                         formal_candidate=formal_by_label[target.target_key],
                         accepted_at=now,
+                        candidate_index=batch_index,
                     )
                     for name, count in created.items():
                         identity_counts[name] += count
@@ -18433,6 +18472,7 @@ def _insert_target_with_measurement_authority(
     completion_contract: NormalizedCompletionContract,
     formal_candidate: FormalTargetCandidate,
     accepted_at: float,
+    candidate_index: int | None = None,
 ) -> dict[str, int]:
     """Atomically insert a Target, its spec receipt, and pure domain roles."""
 
@@ -18506,7 +18546,8 @@ def _insert_target_with_measurement_authority(
         if error.code in BASELINE_METHOD_REJECTION_FEEDBACK:
             details = dict(error.details or {})
             subpath = details.get("path") or "baseline_forward_contract"
-            details["path"] = f"$.candidates[{target.ordinal}].measurement_contract.{subpath}"
+            error_idx = target.ordinal if candidate_index is None else candidate_index
+            details["path"] = f"$.candidates[{error_idx}].measurement_contract.{subpath}"
             details["candidate_label"] = formal_candidate.candidate.local_label
             raise OwnerConflict(error.code, details) from error
         raise

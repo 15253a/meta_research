@@ -290,8 +290,7 @@ def _validate_evidence_accounting(
 
     def register_catalog(
         catalog: Sequence[dict[str, object]], *, required: bool
-    ) -> set[str]:
-        target_refs: set[str] = set()
+    ) -> None:
         for evidence in catalog:
             evidence_ref = evidence.get("evidence_ref") if isinstance(evidence, dict) else None
             if not isinstance(evidence_ref, str) or not evidence_ref:
@@ -318,13 +317,8 @@ def _validate_evidence_accounting(
                 )
             known_target_commits[evidence_ref] = tc_ref
             known_evidence_by_target[tc_ref] = evidence_ref
-            if required:
-                target_refs.add(tc_ref)
-        return target_refs
 
-    required_target_refs = register_catalog(
-        [*frozen_catalog, *selected_catalog], required=True
-    )
+    register_catalog([*frozen_catalog, *selected_catalog], required=True)
     register_catalog(additional_known_catalog, required=False)
     selected_refs = {
         tc_ref

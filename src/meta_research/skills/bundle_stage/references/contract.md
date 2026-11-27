@@ -24,7 +24,7 @@ cells 的切分在首次规范化接纳前由 Bundle 确定；现行滚动合同
 
 Bundle 在 Session 内维护可修改的滚动策略：未解 Brief／cells、已接纳上游闭包、候选和真实依赖、方法复用、资源并行、结果覆盖、阻塞及语义风险。它是决策材料，不是正式 Target、frontier、Run 或 receipt。可先形成并开展一批 Target；该批工作结束、结果完成必要接纳与读取后，再根据实际所得和剩余责任决定下一批，或判断是否收口。批内独立工作可并行，后续工作沿真实依赖安排；起步不要求列尽未来所有 Target。
 
-RG 冻结 Target 的 `experiment_keys`、目标、输入、cells、初始 implementation_revision_ref、承诺和依赖。Plan 可以有多份 Brief；一份 Brief 可由多个 Target 实现，一个 Target 可履行多份 Brief 共有的责任。现有候选允许多个 experiment_keys，但每 Target 的 measurement_unit_keys 恰含一个 cell，且该 cell 必须被每份所列 Brief 要求；其内部可以有多个实际 Run。映射按实际责任成立，不为凑固定数量拆分或合并。
+RG 冻结 Target 的 `experiment_keys`、目标、输入、cells、可选的初始 `implementation_revision_ref`（可省略或填 `null`，执行后由 `target_run_finalizer` 自动计算实际代码指纹）、承诺和依赖。Plan 可以有多份 Brief；一份 Brief 可由多个 Target 实现，一个 Target 可履行多份 Brief 共有的责任。现有候选允许多个 experiment_keys，但每 Target 的 measurement_unit_keys 恰含一个 cell，且该 cell 必须被每份所列 Brief 要求；其内部可以有多个实际 Run。映射按实际责任成立，不为凑固定数量拆分或合并。
 
 保持 Plan 的科学目的、支持要求、增量与明确固定边界；已安排工作的真实前置条件不能因其被称为未安排 gap 而省略，后续发现影响冻结承诺或依赖的变化按既有调整／replan 职责处理；Characteristics 中的普通实现建议可据真实情况调整，理由写入既有策略 notes。实际 Target 工作按所用方法、实现版本和输入如实交接；初始方法建议不锁死跨 Baseline 归属。调整不改写已固定的指标、比较条件或 held-fixed 内容。仅真正消费新产物或以其自适应选择后续路线时建立依赖；共享已接纳材料可以并行。
 

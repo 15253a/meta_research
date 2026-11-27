@@ -716,7 +716,7 @@ class RootWorkspaces:
                         "next_offset": mounted_page["next_offset"],
                         "reader": {
                             "operation": "research_workspace.materials.discover",
-                            "arguments": {"offset": mounted_page["next_offset"], "limit": mounted_page["limit"]},
+                            "arguments": {"offset": 0, "limit": 50},
                         },
                     })
                 )

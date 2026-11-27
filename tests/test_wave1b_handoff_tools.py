@@ -932,9 +932,645 @@ def test_ws1_workspace_kind_purpose_and_mounted_materials_limit_8(tmp_path):
     page_info = json.loads(page_line.split(page_marker, 1)[1])
     assert page_info["total_count"] == 10
     assert page_info["next_offset"] == 8
+    assert page_info["reader"]["arguments"] == {"offset": 0, "limit": 50}
 
     # Full access via offset pagination still returns the remaining 2 items!
     page2 = ws._mounted_material_page(stage_loc, offset=8, limit=8)
     assert len(page2["items"]) == 2
     assert page2["next_offset"] is None
     engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Review Fixes: Blockers #1-#3, Medium #4, Minors #5-#7
+# ---------------------------------------------------------------------------
+
+
+def test_d8b_deepfetch_reconciles_empty_external_mcp_and_rejects_missing_nonempty(tmp_path):
+    """Blocker #1: DeepFetch durable reconciliation succeeds when 0 external MCP services exist,
+    and still fails closed when >=1 external MCP services are configured but header is missing."""
+    from dataclasses import replace
+
+    from meta_research.deepfetch import (
+        CodexDeepFetchAdapter,
+        DEEPFETCH_PROVIDER_STREAM_MAX_BYTES,
+        DeepFetchUnavailable,
+        _deepfetch_output_schema,
+    )
+    from meta_research.external_mcp import ExternalMcpRuntime, compose_external_mcp_prompt, parse_services
+    from meta_research.provider_supervisor import (
+        SUPERVISOR_EXIT_SCHEMA,
+        SUPERVISOR_REQUEST_SCHEMA,
+        supervisor_host_identity,
+        write_exit_receipt,
+    )
+    from meta_research.root_capabilities import root_capability_profile
+    import test_external_mcp as ext_mcp_fixtures
+    import test_part3_stability_workers_guidance_supervisor as df_fixtures
+    PROVIDER_RESULT_MAX_BYTES = df_fixtures.PROVIDER_RESULT_MAX_BYTES
+    ensure_transport_key = df_fixtures.ensure_transport_key
+    write_transport_envelope = df_fixtures.write_transport_envelope
+
+    def _run_reconcile(case_dir: Path, *, with_service: bool, include_header: bool):
+        workspace = case_dir / "df-ws"
+        acquisition = df_fixtures.RecordingAcquisitionClient(case_dir / "acq")
+        ext_runtime = ExternalMcpRuntime(case_dir / "ext-mcp")
+        ext_runtime.configure_endpoint("http://127.0.0.1:9999")
+        if with_service:
+            svc = ext_mcp_fixtures.service(case_dir / "ext-svc")
+            ext_runtime.save_config(
+                services=parse_services([svc]),
+                expected_revision=ext_runtime.read_config().revision,
+            )
+        adapter = df_fixtures._bind_acquisition(
+            CodexDeepFetchAdapter(
+                workspace,
+                model_ref="gpt-test",
+                process_runner=df_fixtures.SequencedPrototypeRunner([df_fixtures.PROTOTYPE_EMPTY_FINAL]),
+            ),
+            acquisition,
+        )
+        adapter.bind_external_mcp(ext_runtime)
+        job_ref = "deepfetch-run:ext-mcp-reconcile"
+        req = replace(
+            df_fixtures._base_deepfetch_request(),
+            job_ref=job_ref,
+            runtime_binding=adapter.runtime_binding(),
+            native_session_ref="native-df-ext-1",
+            reconcile_only=True,
+        )
+        binding_hash = canonical_hash(adapter.runtime_binding().as_dict())
+        provider_job_ref = f"{job_ref}:v4-turn:0"
+        identity_leaf = canonical_hash({"job_ref": provider_job_ref})
+        op_root = workspace / "provider-operations" / f"{binding_hash}-{identity_leaf}"
+        seg0 = op_root / "deepfetch-initial"
+        seg0.mkdir(parents=True)
+        _kp, key = ensure_transport_key(workspace)
+
+        run_root = adapter._protocol_run_root(adapter._provider_execution_key(job_ref), binding_hash)
+        public_root = run_root / "public"
+        public_root.mkdir(parents=True, exist_ok=True)
+        base_prompt = f"public_output_root={public_root}\ngoal=test\n"
+        snapshot = ext_runtime.operation_snapshot(
+            operation_identity=f"{provider_job_ref}:initial",
+            root_kind="deepfetch",
+            task_prompt=base_prompt,
+        )
+        prompt_text = (
+            compose_external_mcp_prompt(base_prompt, snapshot)
+            if include_header
+            else base_prompt
+        )
+        schema_text = canonical_json(_deepfetch_output_schema())
+        profile = root_capability_profile("deepfetch")
+        inv = {
+            "schema_ref": "meta-research/deepfetch-provider-operation/v3",
+            "job_ref": provider_job_ref,
+            "segment_name": "initial",
+            "request_ref": req.request_ref,
+            "correlation_ref": req.correlation_ref,
+            "draft_hash": req.draft_hash,
+            "scope_hash": req.scope_hash,
+            "runtime_binding_hash": binding_hash,
+            "native_session_ref": None,
+            "prompt_hash": canonical_hash(prompt_text),
+            "output_schema_hash": canonical_hash(_deepfetch_output_schema()),
+            "model_ref": req.runtime_binding.model_ref,
+            "root_capability_profile": profile.as_dict(),
+            "root_capability_profile_hash": profile.digest,
+            "external_mcp": snapshot.binding(),
+        }
+        (seg0 / "prompt.txt").write_text(prompt_text, encoding="utf-8")
+        (seg0 / "output-schema.json").write_text(schema_text, encoding="utf-8")
+        (seg0 / "last-message.json").write_text(json.dumps(df_fixtures.PROTOTYPE_EMPTY_FINAL), encoding="utf-8")
+        (seg0 / "stdout.jsonl").write_text(
+            "\n".join([
+                json.dumps({"type": "thread.started", "thread_id": "native-df-ext-1"}),
+                json.dumps({"type": "turn.completed"}),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        write_transport_envelope(seg0 / "invocation.json", inv, key)
+        argv = adapter._durable_argv(
+            job_ref=provider_job_ref,
+            runtime_binding_hash=binding_hash,
+            schema_path=seg0 / "output-schema.json",
+            result_path=seg0 / "last-message.json",
+            native_session_ref=None,
+        )
+        write_transport_envelope(
+            seg0 / "supervisor-request.json",
+            {
+                "schema_ref": SUPERVISOR_REQUEST_SCHEMA,
+                "invocation_hash": canonical_hash(inv),
+                "argv": argv,
+                "prompt_path": str(seg0 / "prompt.txt"),
+                "schema_path": str(seg0 / "output-schema.json"),
+                "stdout_path": str(seg0 / "stdout.jsonl"),
+                "result_path": str(seg0 / "last-message.json"),
+                "lock_path": str(seg0 / "supervisor.lock"),
+                "ready_path": str(seg0 / "supervisor-ready.json"),
+                "started_path": str(seg0 / "provider-started.json"),
+                "receipt_path": str(seg0 / "supervisor-exit.json"),
+                "stop_path": str(seg0 / "supervisor-stop.json"),
+                "timeout_seconds": None,
+                "stream_max_bytes": DEEPFETCH_PROVIDER_STREAM_MAX_BYTES,
+                "result_max_bytes": PROVIDER_RESULT_MAX_BYTES,
+            },
+            key,
+        )
+        write_exit_receipt(
+            seg0 / "supervisor-exit.json",
+            key=key,
+            invocation_hash=canonical_hash(inv),
+            prompt_path=seg0 / "prompt.txt",
+            schema_path=seg0 / "output-schema.json",
+            stdout_path=seg0 / "stdout.jsonl",
+            result_path=seg0 / "last-message.json",
+            stderr_path=None,
+            returncode=0,
+            input_bytes=(seg0 / "prompt.txt").stat().st_size,
+            process_tree={
+                "schema_ref": "meta-research/provider-process-tree/v1",
+                "state": "closed",
+                "mechanism": "linux-subreaper-echild",
+                **supervisor_host_identity(),
+            },
+            termination_reason="completed",
+            schema_ref=SUPERVISOR_EXIT_SCHEMA,
+        )
+        return adapter._read_existing_turn(
+            req,
+            public_root=public_root,
+            provider_job_ref=provider_job_ref,
+            runtime_binding_hash=binding_hash,
+            expected_native_session_ref=None,
+            enforce_native_session_ref=False,
+            expected_web_gate=False,
+            resident_phase="turn-0",
+        )
+
+    # 1. 0 external MCP services configured -> compose omitted empty header -> reconciliation succeeds cleanly!
+    result_doc, observed_native, _, _ = _run_reconcile(
+        tmp_path / "empty-ext", with_service=False, include_header=True
+    )
+    assert observed_native == "native-df-ext-1"
+    assert result_doc["completion"] == "honest_empty"
+
+    # 2. >=1 external MCP services configured -> missing header STILL fails closed with external_mcp_prompt_missing!
+    with pytest.raises(DeepFetchUnavailable) as exc_info:
+        _run_reconcile(tmp_path / "missing-header", with_service=True, include_header=False)
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert str(exc_info.value.__cause__) == "external_mcp_prompt_missing"
+
+
+def test_ws1_resume_runtime_conditions_tracks_mounted_materials_page_changes():
+    """Blocker #2: resume_runtime_conditions detects newly mounted materials even when >= 8 exist."""
+    from meta_research.runtime_conditions import resume_runtime_conditions
+
+    marker = (
+        "Mounted server materials (persistent read-only references, directly accessible on host "
+        "or via research_workspace.materials.*): "
+    )
+    page_marker = "Mounted server materials page: "
+
+    def _mat(i: int) -> dict[str, object]:
+        return {
+            "reference_ref": f"material:{i:02d}",
+            "absolute_path": f"/data/file_{i:02d}.csv",
+            "kind": "file",
+            "access": "read_only",
+        }
+
+    def _cond(items: list[dict[str, object]], total: int) -> str:
+        text_lines = [marker + canonical_json(items)]
+        if total > len(items):
+            text_lines.append(
+                page_marker
+                + canonical_json({
+                    "shown_count": len(items),
+                    "total_count": total,
+                    "offset": 0,
+                    "limit": 8,
+                    "next_offset": 8,
+                    "reader": {
+                        "operation": "research_workspace.materials.discover",
+                        "arguments": {"offset": 0, "limit": 50},
+                    },
+                })
+            )
+        return "\n".join(text_lines)
+
+    first_8 = [_mat(i) for i in range(8)]
+    prompt_8 = _cond(first_8, total=8)
+    prompt_9 = _cond(first_8, total=9)
+
+    # (a) 8 -> 9 mounted materials emits delta with updated page metadata & reader!
+    delta_8_to_9 = resume_runtime_conditions(prompt_9, (prompt_8,), ordered=True)
+    assert delta_8_to_9.startswith("挂载材料授权更新=")
+    payload_9 = json.loads(delta_8_to_9.split("=", 1)[1])
+    assert payload_9["mounted_materials_page"]["total_count"] == 9
+    assert payload_9["mounted_materials_page"]["reader"]["arguments"] == {"offset": 0, "limit": 50}
+
+    # (b) 9 -> 9 unchanged (even after an unrelated time-only update) emits ""!
+    time_only = '当前运行条件更新={"research_time":{"used_seconds":42}}'
+    assert resume_runtime_conditions(prompt_9, (time_only, delta_8_to_9, prompt_8), ordered=True) == ""
+
+    # (c) 10 -> 9 after removing an early material (material:00) emits removed_reference_refs + updated page!
+    prompt_10 = _cond(first_8, total=10)
+    after_remove = [_mat(i) for i in range(1, 9)]
+    prompt_9_shifted = _cond(after_remove, total=9)
+    delta_shifted = resume_runtime_conditions(prompt_9_shifted, (prompt_10,), ordered=True)
+    assert delta_shifted.startswith("挂载材料授权更新=")
+    payload_shifted = json.loads(delta_shifted.split("=", 1)[1])
+    assert payload_shifted["removed_reference_refs"] == ["material:00"]
+    assert payload_shifted["mounted_materials_page"]["total_count"] == 9
+
+    # (d) 9 -> 8 emits page cleared to None, then 8 -> 8 emits ""!
+    delta_9_to_8 = resume_runtime_conditions(prompt_8, (delta_8_to_9, prompt_8), ordered=True)
+    assert delta_9_to_8.startswith("挂载材料授权更新=")
+    assert json.loads(delta_9_to_8.split("=", 1)[1])["mounted_materials_page"] is None
+    assert resume_runtime_conditions(prompt_8, (delta_9_to_8, delta_8_to_9), ordered=True) == ""
+
+
+def test_ws1_discover_work_materials_reader_preserves_all_ordinals_with_workspace_scoped_materials(tmp_path):
+    """Blocker #3: discover_work_materials orders by (created_at, ordinal, reference_ref) and
+    following the emitted reader returns all 10 same-timestamp files + workspace-scoped material
+    with zero skipped ordinals and zero duplicates."""
+    from contextlib import contextmanager
+    from sqlalchemy import create_engine
+
+    from meta_research.root_workspace import RootWorkspaces, WorkspaceLocation
+    from meta_research.work_materials import WorkMaterialsMixin
+
+    stage_dir = tmp_path / "stage_idea"
+    stage_dir.mkdir()
+    engine = create_engine("sqlite:///:memory:")
+    # Deliberately reverse-lexicographical reference_refs for ordinals 0..9 to prove ordinal order wins.
+    ordered_refs = [f"ref_{chr(ord('z') - i)}_ord{i}" for i in range(10)]
+    ws_scoped_ref = "ref_00_workspace_scoped"
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE rg_quests (quest_ref TEXT, initialization_id TEXT)"))
+        conn.execute(text("INSERT INTO rg_quests VALUES ('quest:1', 'init:1')"))
+        conn.execute(text("CREATE TABLE rg_targets (target_ref TEXT, target_key TEXT, spec_json TEXT)"))
+        conn.execute(text("CREATE TABLE ar_deepfetch_runs (run_ref TEXT, request_ref TEXT)"))
+        conn.execute(text("CREATE TABLE hc_deepfetch_requests (request_ref TEXT, initialization_id TEXT)"))
+        conn.execute(
+            text(
+                "CREATE TABLE hc_work_material_submissions ("
+                "submission_ref TEXT, state TEXT, anchor_kind TEXT, anchor_ref TEXT, "
+                "receiver_json TEXT, command_json TEXT, created_at REAL)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE hc_work_material_references ("
+                "reference_ref TEXT, submission_ref TEXT, ordinal INTEGER, selection_json TEXT)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE hc_work_material_roots ("
+                "submission_ref TEXT, workspace_ref TEXT)"
+            )
+        )
+        # Earlier workspace-scoped material (not quest-receiver anchored, so shifts discover offset).
+        conn.execute(
+            text(
+                "INSERT INTO hc_work_material_submissions VALUES "
+                "('sub:ws', 'ready', 'manual', 'ws:stage', '{}', :cmd, 5.0)"
+            ),
+            {"cmd": canonical_json({"description": "Workspace-only scratch"})},
+        )
+        conn.execute(
+            text("INSERT INTO hc_work_material_roots VALUES ('sub:ws', 'ws:stage')")
+        )
+        conn.execute(
+            text("INSERT INTO hc_work_material_references VALUES (:ref, 'sub:ws', 0, :sel)"),
+            {"ref": ws_scoped_ref, "sel": canonical_json({"absolute_path": "/data/ws.csv", "kind": "file"})},
+        )
+        # Single submission with 10 files sharing identical created_at=10.0 and ordinals 0..9.
+        conn.execute(
+            text(
+                "INSERT INTO hc_work_material_submissions VALUES "
+                "('sub:batch10', 'ready', 'manual', 'quest:1', :recv, :cmd, 10.0)"
+            ),
+            {
+                "recv": canonical_json({"quest_ref": "quest:1"}),
+                "cmd": canonical_json({"description": "Ten mounted files"}),
+            },
+        )
+        for ordinal, ref in enumerate(ordered_refs):
+            conn.execute(
+                text("INSERT INTO hc_work_material_references VALUES (:ref, 'sub:batch10', :ord, :sel)"),
+                {
+                    "ref": ref,
+                    "ord": ordinal,
+                    "sel": canonical_json({"absolute_path": f"/data/batch_{ordinal}.csv", "kind": "file"}),
+                },
+            )
+
+    class _DB:
+        @contextmanager
+        def read(self):
+            with engine.connect() as c:
+                yield c
+
+    db = _DB()
+    stage_loc = WorkspaceLocation(
+        workspace_ref="ws:stage", work_ref="idea_run:1", root_kind="idea",
+        quest_ref="quest:1", cycle_ref="cycle:1", target_ref=None,
+        root_session_ref="sess:1", request_ref="req:1", initialization_id=None,
+        context_generation=None, directory=stage_dir.resolve(),
+    )
+    ws = object.__new__(RootWorkspaces)
+    ws._hc = SimpleNamespace(_database=db)
+    ws._rg = SimpleNamespace(_database=db)
+    ws._ae = SimpleNamespace(query_cycle_position=lambda _c: None)
+    ws._visible_locations = lambda current: (stage_loc,)
+
+    prompt = ws.native_directory_prompt(stage_loc)
+    page_marker = "Mounted server materials page: "
+    page_info = json.loads(
+        next(line for line in prompt.splitlines() if line.startswith(page_marker)).split(page_marker, 1)[1]
+    )
+    reader_args = page_info["reader"]["arguments"]
+    assert reader_args == {"offset": 0, "limit": 50}
+
+    class _Owner(WorkMaterialsMixin):
+        def __init__(self):
+            self._database = db
+
+        def _material_visible_workspaces(self, context):
+            return {"ws:stage"}
+
+        def _quest_directory_references(self, context):
+            return set(ordered_refs)
+
+        def _material_scope(self, context):
+            return {}
+
+        def query_work_material(self, reference_ref):
+            return {"reference_ref": reference_ref}
+
+    owner = _Owner()
+    discovered = owner.discover_work_materials(
+        context=SimpleNamespace(phase="primary"),
+        **reader_args,
+    )
+    returned_refs = [item["reference_ref"] for item in discovered["references"]]
+    assert len(returned_refs) == len(set(returned_refs)) == 11
+    assert returned_refs[0] == ws_scoped_ref
+    assert returned_refs[1:] == ordered_refs
+    engine.dispose()
+
+
+def test_d5_rolling_batch_baseline_rejection_uses_batch_local_index_and_surfaces_path(tmp_path):
+    """Medium #4: Rolling batch rejection reports batch-local $.candidates[0] (not global ordinal)
+    and surfaces contract_failure_detail_path in repair_hint."""
+    from meta_research.owners.research_graph import _insert_target_with_measurement_authority
+    from meta_research.sealed_provider_operations import _provider_terminal_contract_checkpoint
+    from meta_research.owners.agent_runtime import _validated_stage_provider_hard_ceiling
+
+    # 1. Batch-local index is used when candidate_index=0 even if target.ordinal=3.
+    import test_bundle_skill_adapter as bundle_fixtures
+
+    plan = bundle_fixtures._plan_document()
+    target_plan = bundle_fixtures._target_plan(plan, "a" * 64)
+    completion = normalized_completion_contract_from_dict(
+        target_plan["completion_contract"], plan_document=plan
+    )
+    raw_cand = deepcopy(target_plan["initial_strategy_update"]["candidates"][0])
+    raw_cand["measurement_contract"]["baseline_forward_contract"] = {"method_key": "legacy-only"}
+    formal_candidate = formal_target_candidate_from_dict(raw_cand, completion_contract=completion)
+    target_spec = formal_target_candidate_to_dict(formal_candidate, completion_contract=completion)
+    target = SimpleNamespace(
+        target_ref="target:3",
+        graph_ref="graph:1",
+        target_key=formal_candidate.candidate.local_label,
+        ordinal=3,
+        spec=target_spec,
+        spec_hash=canonical_hash(target_spec),
+        dependency_refs=(),
+        receipt=SimpleNamespace(receipt_ref="rec:1", payload_hash="a" * 64),
+    )
+    from sqlalchemy import create_engine
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE rm_asset_versions (version_ref TEXT)"))
+        conn.execute(text(
+            "CREATE TABLE rg_targets (target_ref TEXT, graph_ref TEXT, target_key TEXT, ordinal INT, "
+            "spec_json TEXT, spec_hash TEXT, dependency_refs_json TEXT, dependency_refs_hash TEXT, "
+            "receipt_ref TEXT, receipt_hash TEXT, accepted_at REAL, append_ref TEXT)"
+        ))
+        conn.execute(text(
+            "CREATE TABLE rg_target_spec_acceptances (acceptance_ref TEXT, target_ref TEXT, graph_ref TEXT, "
+            "spec_content_hash_ref TEXT, target_acceptance_receipt_ref TEXT, target_acceptance_receipt_hash TEXT, "
+            "receipt_ref TEXT, receipt_hash TEXT, accepted_at REAL)"
+        ))
+        conn.execute(text(
+            "CREATE TABLE rg_experiment_baselines (baseline_ref TEXT, quest_ref TEXT, "
+            "forward_contract_json TEXT, forward_contract_hash TEXT, accepted_at REAL)"
+        ))
+        with pytest.raises(OwnerConflict) as exc_info:
+            _insert_target_with_measurement_authority(
+                conn,
+                target=target,
+                append_ref="append:1",
+                quest_ref="quest:1",
+                target_plan_hash="b" * 64,
+                graph_generation=1,
+                graph_acceptance_receipt=SimpleNamespace(receipt_ref="gr:1", payload_hash="c" * 64),
+                rolling_append_source=None,
+                stage_request_ref="req:1",
+                plan_binding=SimpleNamespace(),
+                completion_contract=SimpleNamespace(),
+                formal_candidate=formal_candidate,
+                accepted_at=1.0,
+                candidate_index=0,
+            )
+    assert exc_info.value.code == "baseline_method_identity_required"
+    assert exc_info.value.details is not None
+    assert exc_info.value.details["path"].startswith("$.candidates[0].measurement_contract.")
+    engine.dispose()
+
+    # 2. Terminal contract failure checkpoint accepts and validates optional contract_failure_detail_path.
+    detail_path = "$.candidates[0].measurement_contract.baseline_forward_contract"
+    marker = {
+        "termination_reason": "completed",
+        "invocation_hash": "1" * 64,
+        "prompt_hash": "2" * 64,
+        "output_schema_hash": "3" * 64,
+        "stdout_hash": "4" * 64,
+        "result_file_hash": "5" * 64,
+        "supervisor_receipt_hash": "6" * 64,
+    }
+    checkpoint = _provider_terminal_contract_checkpoint(
+        marker,
+        "bundle_review_result_contract_invalid",
+        "baseline_method_identity_required",
+        detail_path=detail_path,
+    )
+    assert checkpoint["contract_failure_detail_path"] == detail_path
+    validated = _validated_stage_provider_hard_ceiling(
+        unit_kind="bundle_review",
+        failure_code="bundle_review_result_contract_invalid",
+        provider_exit=checkpoint,
+    )
+    assert validated["contract_failure_detail_path"] == detail_path
+
+
+def test_d3_omitted_implementation_revision_ref_flows_through_graph_finalizer_and_commit(tmp_path):
+    """Minor #5: End-to-end integration test with Bundle implementation_revision_ref=None
+    flowing through accept_target_graph -> TargetRunFinalizer -> accept_target_commit_from_root_completion."""
+    import test_target_root_finalizer as finalizer_fixtures
+
+    class _NullImplBundleSkill(finalizer_fixtures._CurrentBindingBundleSkill):
+        def _target_plan(self, request):
+            document = super()._target_plan(request)
+            for item in document["initial_strategy_update"]["candidates"]:
+                item["candidate"]["implementation_revision_ref"] = None
+            return document
+
+    runtime = finalizer_fixtures._current_bundle_runtime(
+        tmp_path / "d3-e2e-null-impl",
+        bundle_skill=_NullImplBundleSkill(),
+    )
+    try:
+        runtime, lifecycle, memory, authority, handle, workspace, evidence = (
+            finalizer_fixtures._root_finalizer_fixture(tmp_path / "unused", runtime=runtime)
+        )
+        # Confirm Bundle candidate was accepted into RG with implementation_revision_ref=None.
+        with runtime._database.read() as conn:
+            spec_json = conn.execute(
+                text("SELECT spec_json FROM rg_targets WHERE target_ref = :ref"),
+                {"ref": handle.target_ref},
+            ).scalar_one()
+        assert json.loads(spec_json)["candidate"]["implementation_revision_ref"] is None
+
+        finalizer = finalizer_fixtures.TargetRunFinalizer(
+            lifecycle=lifecycle,
+            memory=memory,
+            workspace_resolver=runtime.target_run_authorities.agent_runtime,
+            evidence_reader=finalizer_fixtures._EvidenceReader(evidence),
+            measurement_authority=runtime.owners.research_graph,
+            graph_authority=runtime.owners.research_graph,
+        )
+        completed = finalizer.finalize(handle=handle, evidence=evidence)
+        assert completed.status == "completed"
+        assert completed.target_commit_ref is not None
+        manifest = memory.query(completed.manifest_ref)
+        assert manifest is not None
+        assert manifest.implementation_revision_ref.startswith("target_impl_")
+        commits = runtime.owners.research_graph.query_target_commits(authority.graph_ref)
+        assert any(c.commit_ref == completed.target_commit_ref for c in commits)
+    finally:
+        runtime.close()
+
+
+def test_d9_check_result_aligns_status_with_matching_failure_and_checks_failed_eval_metrics(
+    tmp_path, monkeypatch, capsys
+):
+    """Minor #6: Top-level run_key/attempt_key align with chosen status (metric_key_mismatch),
+    and explicit metrics dict on a status='failed' evaluation is still validated."""
+    import meta_research.target_execution_contract as tec
+
+    monkeypatch.chdir(tmp_path)
+    draft = tmp_path / "outputs" / "result.json"
+    draft.parent.mkdir(parents=True)
+    # Run-1 (status='failed') has an invalid metric value; Run-2 has metric_key_mismatch.
+    orig_valid = tec.valid_target_metric_value
+    monkeypatch.setattr(
+        tec,
+        "valid_target_metric_value",
+        lambda v: False if v == "__invalid_sentinel__" else orig_valid(v),
+    )
+    document = {
+        "metrics": {"effect": 1.0},
+        "formal_runs": [
+            {
+                "run_key": "run-1",
+                "evaluations": [
+                    {"attempt_key": "eval-1", "status": "failed", "metrics": {"effect": "__invalid_sentinel__"}}
+                ],
+            },
+            {
+                "run_key": "run-2",
+                "evaluations": [
+                    {"attempt_key": "eval-2", "metrics": {"wrong_key": 2.0}}
+                ],
+            },
+        ],
+    }
+    draft.write_text(canonical_json(document), encoding="utf-8")
+    protocol = {
+        "protocol_version_ref": "proto:1",
+        "required_metric_keys": ["effect"],
+        "optional_metric_keys": [],
+    }
+    assert check_result_main(["--check-result", canonical_json(protocol)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "metric_key_mismatch"
+    assert out["run_key"] == "run-2"
+    assert out["attempt_key"] == "eval-2"
+    assert out["missing_metric_keys"] == ["effect"]
+    assert out["unexpected_metric_keys"] == ["wrong_key"]
+    assert len(out["failing_evaluations"]) == 2
+    by_run = {item["run_key"]: item for item in out["failing_evaluations"]}
+    assert by_run["run-1"]["invalid_metric_values"] == ["effect"]
+    assert by_run["run-2"]["missing_metric_keys"] == ["effect"]
+
+    # Also verify alignment when run-1 (executed, first in failing_evaluations) has invalid value
+    # and run-2 (executed, second) has metric_key_mismatch -> top-level status & run_key align to run-2.
+    document["formal_runs"][0]["evaluations"][0]["status"] = "executed"
+    draft.write_text(canonical_json(document), encoding="utf-8")
+    assert check_result_main(["--check-result", canonical_json(protocol)]) == 0
+    out2 = json.loads(capsys.readouterr().out)
+    assert out2["status"] == "metric_key_mismatch"
+    assert out2["run_key"] == "run-2"
+    assert out2["attempt_key"] == "eval-2"
+    assert out2["failing_evaluations"][0]["run_key"] == "run-1"
+    assert out2["failing_evaluations"][1]["run_key"] == "run-2"
+
+
+def test_rg2_batch_query_avoids_n_plus_one_outcome_scans(tmp_path):
+    """Minor #7: query_active_question_page and discover_questions execute at most 1
+    rg_reasoning_outcome_decisions scan regardless of question count."""
+    from sqlalchemy import event
+    from test_public_manual_question_lifecycle import _confirm_waived_manual_question
+    from test_research_datasets import _quest, _runtime
+
+    runtime = _runtime(tmp_path / "rg2-batch-sql")
+    try:
+        root_q = _quest(runtime, "root-batch")
+        human = runtime.owners.human_collaboration
+        graph = runtime.owners.research_graph
+        memory = runtime.owners.research_memory
+        for i in range(4):
+            _confirm_waived_manual_question(
+                human, quest_ref=root_q.quest_ref, parent_question_ref=root_q.question_ref, key_prefix=f"c-{i}"
+            )
+            for _ in range(8):
+                if not human.reconcile_once():
+                    break
+
+        outcome_queries: list[str] = []
+
+        def _capture(conn, cursor, statement, parameters, context, executemany):
+            if "rg_reasoning_outcome_decisions" in statement:
+                outcome_queries.append(statement)
+
+        event.listen(runtime._database._engine, "before_cursor_execute", _capture)
+        try:
+            active = graph.query_active_question_page(quest_ref=root_q.quest_ref, offset=0, limit=12)
+            assert len(active["questions"]) == 5
+            assert len(outcome_queries) == 1
+
+            outcome_queries.clear()
+            page = discover_questions(graph, memory, quest_ref=root_q.quest_ref, limit=12)
+            assert len(page["items"]) == 5
+            assert len(outcome_queries) == 1
+        finally:
+            event.remove(runtime._database._engine, "before_cursor_execute", _capture)
+    finally:
+        runtime.close()

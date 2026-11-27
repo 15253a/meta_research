@@ -2095,9 +2095,11 @@ class CodexDeepFetchAdapter:
                     expected_invocation_keys.add("external_mcp")
                     if self._external_mcp is None:
                         raise ValueError("external_mcp_runtime_missing")
-                    self._external_mcp.restore_snapshot(invocation["external_mcp"], root_kind="deepfetch")
+                    restored_external = self._external_mcp.restore_snapshot(
+                        invocation["external_mcp"], root_kind="deepfetch"
+                    )
                     external_context, protocol_prompt = split_external_mcp_prompt(protocol_prompt)
-                    if not external_context:
+                    if restored_external.services and not external_context:
                         raise ValueError("external_mcp_prompt_missing")
                 if "mcp_url" in invocation or "mcp_scope_binding_hash" in invocation:
                     expected_invocation_keys |= {"mcp_url", "mcp_scope_binding_hash"}

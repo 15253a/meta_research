@@ -382,7 +382,13 @@ class WorkMaterialsMixin(MaterialProcessingMixin):
                     query += " AND (EXISTS (SELECT 1 FROM hc_work_material_roots w WHERE w.submission_ref=s.submission_ref AND w.workspace_ref IN (SELECT value FROM json_each(:visible))) OR r.reference_ref IN (SELECT value FROM json_each(:directories)))"
                     params["visible"] = json.dumps(visible)
                     params["directories"] = json.dumps(directories)
-                rows = connection.execute(text(query + " ORDER BY s.created_at,r.reference_ref LIMIT :limit OFFSET :offset"), params).all()
+                rows = connection.execute(
+                    text(
+                        query
+                        + " ORDER BY s.created_at ASC, r.ordinal ASC, r.reference_ref ASC LIMIT :limit OFFSET :offset"
+                    ),
+                    params,
+                ).all()
             retained = []
             if context is not None:
                 quest = self._material_scope(context).get("quest_ref")

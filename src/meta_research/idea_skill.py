@@ -1550,12 +1550,19 @@ class CodexIdeaSkillAdapter:
         native_session_ref: str,
         failure_code: str,
         detail_code: str,
+        detail_path: str | None = None,
     ) -> dict[str, object]:
         """Bind a terminal contract failure to the already-sealed operation."""
 
         if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", failure_code) is None:
             raise IdeaSkillUnavailable("codex_contract_failure_code_invalid")
         if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", detail_code) is None:
+            raise IdeaSkillUnavailable("codex_contract_failure_detail_code_invalid")
+        if detail_path is not None and (
+            not isinstance(detail_path, str)
+            or not 1 <= len(detail_path.strip()) <= 512
+            or any(char in detail_path for char in ("\x00", "\r", "\n"))
+        ):
             raise IdeaSkillUnavailable("codex_contract_failure_detail_code_invalid")
         directory = (
             self._workspace
@@ -1618,11 +1625,14 @@ class CodexIdeaSkillAdapter:
         return self._terminal_contract_checkpoint(
             marker=marker, operation_name=operation_name, failure_code=failure_code,
             detail_code=detail_code, verified_native_session_ref=recovered_session,
+            detail_path=detail_path,
         )
 
     def _terminal_contract_checkpoint(self, *, marker, operation_name, failure_code,
-            detail_code, verified_native_session_ref):
-        return _provider_terminal_contract_checkpoint(marker, failure_code, detail_code)
+            detail_code, verified_native_session_ref, detail_path: str | None = None):
+        return _provider_terminal_contract_checkpoint(
+            marker, failure_code, detail_code, detail_path=detail_path
+        )
 
     def _sealed_transport_contract_failure(
         self,

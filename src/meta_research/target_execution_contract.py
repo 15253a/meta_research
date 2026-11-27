@@ -170,11 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         allowed_keys = required_keys | set(protocol["optional_metric_keys"])
         failures: list[dict[str, object]] = []
         for run, attempt in work:
-            if (
-                attempt is None
-                or attempt.get("status", "executed") != "executed"
-                or attempt.get("evaluation_ref") is not None
-            ):
+            if attempt is None or attempt.get("evaluation_ref") is not None:
                 continue
             metrics = attempt.get("metrics")
             if not isinstance(metrics, dict):
@@ -214,20 +210,26 @@ def main(argv: list[str] | None = None) -> int:
                 unexpected_metric_keys=[],
             )
         else:
-            first_fail = failures[0]
-            has_key_mismatch = any(
-                item["missing_metric_keys"] or item["unexpected_metric_keys"]
+            key_failures = [
+                item
                 for item in failures
-            )
+                if item["missing_metric_keys"] or item["unexpected_metric_keys"]
+            ]
+            if key_failures:
+                chosen_status = "metric_key_mismatch"
+                primary_fail = key_failures[0]
+            else:
+                chosen_status = "metric_value_invalid"
+                primary_fail = failures[0]
             details.update(
-                status="metric_key_mismatch" if has_key_mismatch else "metric_value_invalid",
-                run_key=first_fail["run_key"],
-                attempt_key=first_fail["attempt_key"],
-                missing_metric_keys=first_fail["missing_metric_keys"],
-                unexpected_metric_keys=first_fail["unexpected_metric_keys"],
+                status=chosen_status,
+                run_key=primary_fail["run_key"],
+                attempt_key=primary_fail["attempt_key"],
+                missing_metric_keys=primary_fail["missing_metric_keys"],
+                unexpected_metric_keys=primary_fail["unexpected_metric_keys"],
             )
-            if first_fail.get("invalid_metric_values"):
-                details["invalid_metric_values"] = first_fail["invalid_metric_values"]
+            if primary_fail.get("invalid_metric_values"):
+                details["invalid_metric_values"] = primary_fail["invalid_metric_values"]
             if len(work) > 1 or len(failures) > 1:
                 details["failing_evaluations"] = failures
         if expected_schema is not None and draft.document.schema_ref is not None:
