@@ -97,6 +97,7 @@ class IdeaStageWorker:
         self._provider = provider
         self._human_collaboration = human_collaboration
         self._transient_error: str | None = None
+        self._transient_error_classification: str | None = None
         self._provider_cursor_cycle_ref: str | None = None
         self._provider_boundary_attempted: bool = False
 
@@ -105,6 +106,18 @@ class IdeaStageWorker:
         """Return the last adapter failure for daemon health, never as truth."""
 
         return self._transient_error
+
+    @property
+    def transient_error_classification(self) -> str | None:
+        return self._transient_error_classification
+
+    def _clear_transient_error(self) -> None:
+        self._transient_error = None
+        self._transient_error_classification = None
+
+    def _set_transient_error_from(self, error: BaseException) -> None:
+        self._transient_error = getattr(error, "code", str(error))
+        self._transient_error_classification = getattr(error, "upstream_classification", None)
 
     def start(self, idempotency_key: str) -> dict[str, object]:
         """Freeze the current Question into an AE request and admit its Run."""
@@ -133,7 +146,7 @@ class IdeaStageWorker:
             try:
                 runtime_binding = stage_provider(self._provider, quest_ref=current.question.quest_ref).runtime_binding()
             except IdeaSkillUnavailable as error:
-                self._transient_error = error.code
+                self._set_transient_error_from(error)
                 return self.query_current()
             self._agent_runtime.admit_idea_stage(
                 request,
@@ -156,9 +169,10 @@ class IdeaStageWorker:
         ):
             return True
         advanced = False
-        self._transient_error = None
+        self._clear_transient_error()
         cycles = list(self._discover_cycles())
         transient_error: str | None = self._transient_error
+        transient_error_classification: str | None = self._transient_error_classification
         if self._provider_cursor_cycle_ref is not None:
             cursor = next(
                 (
@@ -171,7 +185,7 @@ class IdeaStageWorker:
             if cursor is not None:
                 cycles = cycles[cursor + 1 :] + cycles[: cursor + 1]
         for current in cycles:
-            self._transient_error = None
+            self._clear_transient_error()
             self._provider_boundary_attempted = False
             try:
                 step = self._process_cycle(current)
@@ -190,7 +204,11 @@ class IdeaStageWorker:
             if step.advanced:
                 advanced = True
             if self._transient_error is not None:
-                transient_error = transient_error or self._transient_error
+                if transient_error is None:
+                    transient_error = self._transient_error
+                    transient_error_classification = self._transient_error_classification
+                elif transient_error_classification is None and self._transient_error_classification is not None:
+                    transient_error_classification = self._transient_error_classification
             # One provider boundary can legitimately consume the full provider
             # deadline. Later provider work belongs to the next daemon pass so
             # the watchdog does not scale with the number of active Cycles.
@@ -198,6 +216,9 @@ class IdeaStageWorker:
                 self._provider_cursor_cycle_ref = current.cycle_ref
                 break
         self._transient_error = transient_error
+        self._transient_error_classification = (
+            transient_error_classification if transient_error is not None else None
+        )
         return advanced
 
     def _process_cycle(self, current: _CurrentCycle) -> _CycleStep:
@@ -238,7 +259,7 @@ class IdeaStageWorker:
             try:
                 runtime_binding = stage_provider(self._provider, quest_ref=current.question.quest_ref).runtime_binding()
             except IdeaSkillUnavailable as error:
-                self._transient_error = error.code
+                self._set_transient_error_from(error)
                 return _CycleStep(False, provider_boundary_attempted=True)
             self._agent_runtime.admit_idea_stage(
                 request,
@@ -482,7 +503,7 @@ class IdeaStageWorker:
             provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
             runtime_binding = provider.runtime_binding()
         except IdeaSkillUnavailable as error:
-            self._transient_error = error.code
+            self._set_transient_error_from(error)
             return _CycleStep(False, provider_boundary_attempted=True)
         if not idea_bindings_compatible(runtime_binding, run.runtime_binding):
             self._transient_error = "idea_runtime_binding_drift"
@@ -562,7 +583,7 @@ class IdeaStageWorker:
                     unit_kind="idea_primary",
                 )
             except OwnerConflict as error:
-                self._transient_error = error.code
+                self._set_transient_error_from(error)
                 return _CycleStep(False, provider_boundary_attempted=True)
             provider_safe = True
             draft = None
@@ -605,7 +626,7 @@ class IdeaStageWorker:
                             detail_code=error.rejected_detail_code,
                         )
                         provider_safe = False
-                        self._transient_error = error.code
+                        self._set_transient_error_from(error)
                         return _CycleStep(
                             True, provider_boundary_attempted=True
                         )
@@ -620,7 +641,7 @@ class IdeaStageWorker:
                             fence_ref=run.fence_ref,
                         ),
                     )
-                    self._transient_error = error.code
+                    self._set_transient_error_from(error)
                     return _CycleStep(False, provider_boundary_attempted=True)
                 except RecoverableIdeaSkillCandidateError as error:
                     if draft is None:
@@ -716,7 +737,7 @@ class IdeaStageWorker:
                 )
                 self._transient_error = "idea_local_result_contract_invalid"
                 return _CycleStep(True)
-            self._transient_error = error.code
+            self._set_transient_error_from(error)
             return _CycleStep(False)
         except RecoverableIdeaSkillCandidateError as error:
             if result is None:

@@ -29,7 +29,21 @@ from meta_research.provider_supervisor import (
 MAX_STDOUT_BYTES = 64 * 1024 * 1024
 MAX_STDOUT_LINE_BYTES = 64 * 1024 * 1024
 DEFAULT_TURN_IDLE_TIMEOUT_SECONDS = 900.0
+DEFAULT_TURN_ACTIVE_TOOL_IDLE_TIMEOUT_SECONDS = 3600.0
+DEFAULT_TURN_INTERRUPT_GRACE_SECONDS = 2.0
 _READ_CHUNK_BYTES = 65536
+_ACTIVE_TOOL_ITEM_TYPES = frozenset({"commandExecution", "collabAgentToolCall", "mcpToolCall"})
+_HTTP_CAPACITY_STATUS_RE = re.compile(
+    r"(?:\b(?:http|status|code|error|err)\s*[:=_\-/ ]*\s*(?:429|529)\b"
+    r"|\b(?:429|529)\s+(?:too many requests|overloaded|rate limit|capacity)\b)"
+)
+_HTTP_TRANSIENT_STATUS_RE = re.compile(
+    r"(?:\b(?:http|status|code|error|err)\s*[:=_\-/ ]*\s*(?:502|503|504)\b"
+    r"|\b(?:502|503|504)\s+(?:bad gateway|service unavailable|gateway timeout)\b)"
+)
+_KNOWN_UPSTREAM_CLASSIFICATIONS = frozenset(
+    {"upstream_capacity", "upstream_transient", "usage_limit", "native_turn_idle_timeout"}
+)
 
 
 def _env_positive_float(name: str, default: float) -> float:
@@ -115,7 +129,7 @@ def classify_native_error(error_payload, *, will_retry: bool | None = None) -> s
                 "status 429",
                 "status 529",
             )
-        ) or re.search(r"\b(?:429|529)\b", combined):
+        ) or _HTTP_CAPACITY_STATUS_RE.search(combined):
             return "upstream_capacity"
         if any(
             token in combined
@@ -127,15 +141,73 @@ def classify_native_error(error_payload, *, will_retry: bool | None = None) -> s
                 "connection reset",
                 "stream disconnected",
                 "reconnecting",
-                "upstream",
+                "upstream timeout",
+                "upstream_timeout",
+                "upstream transient",
+                "upstream_transient",
+                "upstream error",
+                "upstream_error",
+                "upstream connect",
+                "upstream reset",
+                "native_turn_idle_timeout",
                 "status 502",
                 "status 503",
                 "status 504",
             )
-        ) or re.search(r"\b(?:502|503|504)\b", combined):
+        ) or _HTTP_TRANSIENT_STATUS_RE.search(combined):
             return "upstream_transient"
     if will_retry is True:
         return "upstream_transient"
+    return None
+
+
+def extract_native_error_classification(events_or_stdout, *, native_error=None) -> str | None:
+    """Extract structured upstream classification from bridge stdout JSONL or native_error."""
+    if native_error is not None and native_error != {}:
+        if isinstance(native_error, dict) and native_error.get("code") == "native_turn_idle_timeout":
+            return "native_turn_idle_timeout"
+        return classify_native_error(native_error)
+
+    if isinstance(events_or_stdout, str):
+        events: list[dict[str, object]] = []
+        for line in events_or_stdout.splitlines():
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict):
+                events.append(parsed)
+    elif isinstance(events_or_stdout, (list, tuple)):
+        events = [e for e in events_or_stdout if isinstance(e, dict)]
+    else:
+        events = []
+
+    last_turn_failed = None
+    for event in reversed(events):
+        if event.get("type") == "turn.failed":
+            last_turn_failed = event
+            break
+    if last_turn_failed is not None:
+        raw_cls = last_turn_failed.get("classification")
+        err = last_turn_failed.get("error")
+        if isinstance(err, dict) and err.get("code") == "native_turn_idle_timeout":
+            return "native_turn_idle_timeout"
+        if isinstance(raw_cls, str) and raw_cls in _KNOWN_UPSTREAM_CLASSIFICATIONS:
+            return raw_cls
+        if err is not None and err != {}:
+            # Terminal error is present and did not classify as upstream; do not
+            # inherit an earlier recovered transient blip.
+            return classify_native_error(err)
+
+    for event in reversed(events):
+        if event.get("type") == "error":
+            err = event.get("error")
+            if isinstance(err, dict) and err.get("code") == "native_turn_idle_timeout":
+                return "native_turn_idle_timeout"
+            raw_cls = event.get("classification")
+            if isinstance(raw_cls, str) and raw_cls in _KNOWN_UPSTREAM_CLASSIFICATIONS:
+                return raw_cls
+            return classify_native_error(err if err is not None else event.get("message"))
     return None
 
 
@@ -198,12 +270,13 @@ class NativeRpcError(ValueError):
 
 class NativeTerminalTurnError(RuntimeError):
     """The exact original native turn has an authenticated failure outcome."""
-    def __init__(self, *, status, native_session_ref, stdout, checkpoint):
+    def __init__(self, *, status, native_session_ref, stdout, checkpoint, classification=None):
         super().__init__("provider_native_turn_" + status)
         self.status = status
         self.native_session_ref = native_session_ref
         self.stdout = stdout
         self.checkpoint = checkpoint
+        self.classification = classification
 
 
 class NativeCodexBridge:
@@ -214,6 +287,8 @@ class NativeCodexBridge:
         prompt,
         *,
         turn_idle_timeout_seconds: float | None = None,
+        turn_active_tool_idle_timeout_seconds: float | None = None,
+        turn_interrupt_grace_seconds: float | None = None,
         max_stdout_bytes: int | None = None,
         max_stdout_line_bytes: int | None = None,
     ):
@@ -232,6 +307,8 @@ class NativeCodexBridge:
         self._reader_stop = threading.Event()
         self._seen = set()
         self._next_reconcile = {}
+        self._active_item_ids: set[str] = set()
+        self._anonymous_active_items = 0
         self.process = None
         self.usage = None
         self.turn_idle_timeout_seconds = (
@@ -241,6 +318,22 @@ class NativeCodexBridge:
             )
             if turn_idle_timeout_seconds is None
             else turn_idle_timeout_seconds
+        )
+        self.turn_active_tool_idle_timeout_seconds = (
+            _env_positive_float(
+                "META_RESEARCH_NATIVE_ACTIVE_TOOL_IDLE_TIMEOUT_SECONDS",
+                DEFAULT_TURN_ACTIVE_TOOL_IDLE_TIMEOUT_SECONDS,
+            )
+            if turn_active_tool_idle_timeout_seconds is None
+            else turn_active_tool_idle_timeout_seconds
+        )
+        self.turn_interrupt_grace_seconds = (
+            _env_positive_float(
+                "META_RESEARCH_NATIVE_TURN_INTERRUPT_GRACE_SECONDS",
+                DEFAULT_TURN_INTERRUPT_GRACE_SECONDS,
+            )
+            if turn_interrupt_grace_seconds is None
+            else turn_interrupt_grace_seconds
         )
         self.max_stdout_bytes = (
             _env_positive_int("META_RESEARCH_NATIVE_MAX_STDOUT_BYTES", MAX_STDOUT_BYTES)
@@ -334,14 +427,34 @@ class NativeCodexBridge:
             return
         if self.thread_id is not None and params.get("threadId", self.thread_id) != self.thread_id:
             return
+        if method != "error":
+            self._last_activity = time.monotonic()
+            if method != "turn/completed":
+                # Real forward progress supersedes any earlier recovered transient error.
+                self.last_error = None
+                self.last_error_classification = None
         if method in {"item/started", "item/completed"}:
             item = params.get("item")
-            if isinstance(item, dict) and (translated := _exec_item(item)) is not None:
-                _emit({"type": "item.started" if method.endswith("started") else "item.completed",
-                       "thread_id": params.get("threadId"), "turn_id": params.get("turnId"),
-                       "item": translated})
-                if method == "item/completed" and item.get("type") == "agentMessage":
-                    self.last_message = item.get("text")
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                if item_type in _ACTIVE_TOOL_ITEM_TYPES:
+                    item_id = item.get("id")
+                    if method == "item/started":
+                        if isinstance(item_id, str) and item_id:
+                            self._active_item_ids.add(item_id)
+                        else:
+                            self._anonymous_active_items += 1
+                    else:
+                        if isinstance(item_id, str) and item_id:
+                            self._active_item_ids.discard(item_id)
+                        elif self._anonymous_active_items > 0:
+                            self._anonymous_active_items -= 1
+                if (translated := _exec_item(item)) is not None:
+                    _emit({"type": "item.started" if method.endswith("started") else "item.completed",
+                           "thread_id": params.get("threadId"), "turn_id": params.get("turnId"),
+                           "item": translated})
+                    if method == "item/completed" and item_type == "agentMessage":
+                        self.last_message = item.get("text")
         elif method == "turn/started":
             turn = params.get("turn", {})
             self.turn_id = turn.get("id")
@@ -387,9 +500,40 @@ class NativeCodexBridge:
             if classification is not None:
                 event["classification"] = classification
             self.last_error = event
-            if classification is not None:
-                self.last_error_classification = classification
+            self.last_error_classification = classification
             _emit(event)
+
+    def _interrupt_turn_best_effort(self) -> None:
+        if not self.thread_id or not self.turn_id or self.process is None:
+            return
+        self._next_id += 1
+        interrupt_id = self._next_id
+        try:
+            self._send({
+                "id": interrupt_id,
+                "method": "turn/interrupt",
+                "params": {"threadId": self.thread_id, "turnId": self.turn_id},
+            })
+        except OSError:
+            return
+        grace = self.turn_interrupt_grace_seconds
+        if grace is None or grace <= 0:
+            return
+        deadline = time.monotonic() + grace
+        while self.terminal is None and time.monotonic() < deadline:
+            remaining = max(0.01, min(0.05, deadline - time.monotonic()))
+            try:
+                record = self._next(timeout=remaining)
+            except queue.Empty:
+                continue
+            except (EOFError, OSError, ValueError):
+                break
+            if record.get("id") == interrupt_id and "method" not in record:
+                continue
+            try:
+                self.notification(record)
+            except (OSError, ValueError):
+                break
 
     def _save_state(self, path, value):
         write_transport_envelope(path, value, self.key)
@@ -550,29 +694,40 @@ class NativeCodexBridge:
                 except queue.Empty:
                     record = None
                 if record is not None:
-                    if record.get("method") != "error":
-                        self._last_activity = time.monotonic()
                     self.notification(record)
+                has_active_tool = bool(self._active_item_ids) or self._anonymous_active_items > 0
+                effective_idle_timeout = (
+                    self.turn_active_tool_idle_timeout_seconds
+                    if has_active_tool and self.turn_active_tool_idle_timeout_seconds is not None
+                    else self.turn_idle_timeout_seconds
+                )
                 if (
                     self.terminal is None
-                    and self.turn_idle_timeout_seconds is not None
-                    and (time.monotonic() - self._last_activity) >= self.turn_idle_timeout_seconds
+                    and effective_idle_timeout is not None
+                    and (time.monotonic() - self._last_activity) >= effective_idle_timeout
                 ):
-                    aborted = True
-                    _emit({
+                    watchdog_event = {
                         "type": "error",
                         "thread_id": self.thread_id,
                         "turn_id": self.turn_id,
                         "message": (
-                            f"Native turn idle timeout after {self.turn_idle_timeout_seconds:.1f}s without activity"
+                            f"Native turn idle timeout after {effective_idle_timeout:.1f}s without activity"
                         ),
                         "error": {
                             "code": "native_turn_idle_timeout",
-                            "idle_timeout_seconds": self.turn_idle_timeout_seconds,
+                            "idle_timeout_seconds": effective_idle_timeout,
+                            "active_tool_in_flight": has_active_tool,
                         },
                         "will_retry": False,
                         "classification": "upstream_transient",
-                    })
+                    }
+                    _emit(watchdog_event)
+                    self.last_error = watchdog_event
+                    self.last_error_classification = "upstream_transient"
+                    self._interrupt_turn_best_effort()
+                    if self.terminal is not None:
+                        break
+                    aborted = True
                     raise TimeoutError("native_turn_idle_timeout")
             success = self.terminal.get("status") == "completed"
             last_usage = self.usage.get("last") if isinstance(self.usage, dict) else None
@@ -583,11 +738,18 @@ class NativeCodexBridge:
             terminal_error = self.terminal.get("error")
             if not success and terminal_error is None and isinstance(self.last_error, dict):
                 terminal_error = self.last_error.get("error") or {"message": self.last_error.get("message")}
-            classification = (
-                None
-                if success
-                else (classify_native_error(terminal_error) or self.last_error_classification)
-            )
+            if success:
+                classification = None
+            elif terminal_error is not None:
+                direct = classify_native_error(terminal_error)
+                if direct is not None:
+                    classification = direct
+                elif isinstance(self.last_error, dict) and terminal_error == self.last_error.get("error"):
+                    classification = self.last_error_classification
+                else:
+                    classification = None
+            else:
+                classification = self.last_error_classification
             _emit({"type": "turn.completed" if success else "turn.failed",
                    "turn_id": self.turn_id, "error": terminal_error,
                    **({"classification": classification} if classification is not None else {}),
@@ -642,6 +804,7 @@ class NativeCodexBridge:
             stdout=subprocess.PIPE, stderr=sys.stderr.buffer, bufsize=0)
         self._reader_stop.clear()
         threading.Thread(target=self._reader, daemon=True).start()
+        aborted = False
         try:
             self.request("initialize", {"clientInfo": {"name": "meta_research", "version": "1.0"},
                 "capabilities": {"experimentalApi": True}})
@@ -676,6 +839,9 @@ class NativeCodexBridge:
                 "start_hash": canonical_hash(start), "thread_id": thread["id"],
                 "turn": turn, "last_message": messages[-1] if messages else None})
             return True
+        except BaseException:
+            aborted = True
+            raise
         finally:
             self._reader_stop.set()
             try:
@@ -683,6 +849,8 @@ class NativeCodexBridge:
                     self.process.stdin.close()
             except OSError:
                 pass
+            if aborted and self.process.poll() is None:
+                self.process.terminate()
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -767,14 +935,17 @@ def reconcile_native_operation(directory):
         if translated is not None:
             events.append({"type": "item.completed", "thread_id": recovered["thread_id"],
                 "turn_id": recovered["turn"]["id"], "item": translated})
+    reconciled_classification = None if status == "completed" else classify_native_error(turn.get("error"))
     events.append({"type": "turn.completed" if status == "completed" else "turn.failed",
         "turn_id": turn["id"], "error": turn.get("error"),
+        **({"classification": reconciled_classification} if reconciled_classification is not None else {}),
         "native_reconciliation_ref": canonical_hash(recovered)})
     stdout = "\n".join(json.dumps(item, ensure_ascii=False) for item in events) + "\n"
     if status != "completed":
         request_path = directory / "supervisor-request.json"
         request = read_supervisor_request(request_path, key) if request_path.exists() else {}
         raise NativeTerminalTurnError(status=status, native_session_ref=recovered["thread_id"], stdout=stdout,
+            classification=reconciled_classification,
             checkpoint={"schema_ref": "meta-research/provider-native-turn-terminal/v1",
                 "supervisor_invocation_hash": request.get("invocation_hash"),
                 "native_session_ref": recovered["thread_id"], "native_turn_ref": turn["id"],
@@ -908,7 +1079,20 @@ def _strict_exec(argv, args, key):
                 for index, stream in enumerate((process.stdout, process.stderr))]
     for drainer in drainers:
         drainer.start()
-    returncode = process.wait()
+    while True:
+        try:
+            returncode = process.wait(timeout=0.2)
+            break
+        except subprocess.TimeoutExpired:
+            if stopped or stdout_overflow:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    returncode = process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    returncode = process.wait(timeout=5)
+                break
     for drainer in drainers:
         drainer.join(timeout=1)
     if stopped or errors or not all(complete):

@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
-from typing import AsyncIterator, Awaitable, Callable, Literal, TypeVar
+from typing import AsyncIterator, Awaitable, Callable, Iterable, Literal, TypeVar
 from urllib.parse import parse_qs, urlsplit, quote
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -42,6 +42,7 @@ from meta_research.harness import (
     FullConformanceRequest,
     HarnessAdmissionError,
 )
+from meta_research.native_session_cleanup import _NATIVE_DELETE_BATCH_SECONDS
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.owners.secret_detection import contains_secret
 from meta_research.owners.research_graph import ASSET_ROLE_QUERY_MAX_PAGE_SIZE
@@ -84,6 +85,11 @@ MAX_JSON_REQUEST_BODY_BYTES = MAX_ASSET_INTAKE_REQUEST_BODY_BYTES
 MAX_CONCURRENT_ASSET_INTAKE_REQUESTS = 2
 MAX_CONCURRENT_ASSET_IO_OPERATIONS = 2
 ASSET_WORKER_WATCHDOG_SECONDS = 5.0
+ASSET_CLEANUP_WATCHDOG_SECONDS = max(
+    ASSET_WORKER_WATCHDOG_SECONDS,
+    float(_NATIVE_DELETE_BATCH_SECONDS) + 30.0,
+)
+ASSET_CLEANUP_INTERVAL_SECONDS = 60.0
 ASSET_ROUTE_WATCHDOG_SECONDS = 5.0
 PROVIDER_WORKER_WATCHDOG_SECONDS: None = None
 WRITING_DELIVERY_STALL_SECONDS = 910.0
@@ -120,27 +126,30 @@ _UPSTREAM_CAPACITY_OR_TRANSIENT_TOKENS = (
     "bad_gateway",
     "gateway_timeout",
     "native_turn_idle_timeout",
-    "codex_operation_timeout",
-    "codex_operation_failed",
-    "codex_cli_failed",
-    "provider_timeout",
-    "provider_failed",
-    "provider_io_unavailable",
-    "provider_stream_invalid",
-    "provider_outcome_unknown",
     "http_429",
     "http_502",
     "http_503",
     "http_504",
     "http_529",
 )
-_UPSTREAM_HTTP_STATUS_RE = re.compile(r"(?:^|[^0-9])(?:429|502|503|504|529)(?:[^0-9]|$)")
+_UPSTREAM_HTTP_STATUS_RE = re.compile(
+    r"(?:\b(?:http|status|code|error|err)\s*[:=_\-/ ]*\s*(?:429|502|503|504|529)\b"
+    r"|\b(?:429|502|503|504|529)\s+(?:too many requests|bad gateway|service unavailable|gateway timeout|overloaded)\b)"
+)
 
 
-def _is_upstream_capacity_or_transient_error(error_code: str | None) -> bool:
-    if not isinstance(error_code, str) or not error_code:
+def _is_upstream_capacity_or_transient_error(error: object | None) -> bool:
+    if error is None:
         return False
-    lowered = error_code.strip().lower()
+    if not isinstance(error, str):
+        for attr in ("upstream_classification", "classification", "code"):
+            value = getattr(error, attr, None)
+            if isinstance(value, str) and _is_upstream_capacity_or_transient_error(value):
+                return True
+        return False
+    lowered = error.strip().lower()
+    if not lowered:
+        return False
     if lowered.startswith("worker_parked:"):
         lowered = lowered.split(":", 1)[1]
     if any(token in lowered for token in _UPSTREAM_CAPACITY_OR_TRANSIENT_TOKENS):
@@ -156,6 +165,62 @@ class ReconciliationHealth:
     parked: bool = False
     warning: str | None = None
     next_retry_at: float | None = None
+    _wake_event: asyncio.Event | None = field(default=None, init=False, repr=False, compare=False)
+    _wake_loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False, compare=False)
+
+    def wake(self) -> bool:
+        was_parked = self.parked
+        self.parked = False
+        self.warning = None
+        self.next_retry_at = None
+        self.retry_count = 0
+        if self.last_error and self.last_error.startswith("worker_parked:"):
+            self.last_error = None
+            self.status = "ready"
+        event = self._wake_event
+        loop = self._wake_loop
+        if event is not None:
+            if loop is not None and not loop.is_closed():
+                try:
+                    running = asyncio.get_running_loop()
+                except RuntimeError:
+                    running = None
+                if running is loop:
+                    event.set()
+                else:
+                    loop.call_soon_threadsafe(event.set)
+            else:
+                event.set()
+        return was_parked
+
+
+async def _wait_while_parked(health: ReconciliationHealth, poll_seconds: float) -> None:
+    loop = asyncio.get_running_loop()
+    event = health._wake_event
+    if event is None or health._wake_loop is not loop:
+        event = asyncio.Event()
+        health._wake_event = event
+        health._wake_loop = loop
+    event.clear()
+    if not health.parked:
+        return
+    sleep_task = asyncio.create_task(asyncio.sleep(poll_seconds))
+    wake_task = asyncio.create_task(event.wait())
+    try:
+        done, pending = await asyncio.wait(
+            {sleep_task, wake_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if sleep_task in done:
+            sleep_task.result()
+    finally:
+        for task in (sleep_task, wake_task):
+            if not task.done():
+                task.cancel()
 
 
 @dataclass(frozen=True)
@@ -173,6 +238,7 @@ class _TargetRunFlight:
 class WorkerHealthUpdates:
     _revision: int = 0
     _changed: asyncio.Event = field(default_factory=asyncio.Event)
+    _loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False)
 
     @property
     def revision(self) -> int:
@@ -180,9 +246,21 @@ class WorkerHealthUpdates:
 
     def publish(self) -> None:
         self._revision += 1
-        self._changed.set()
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                self._changed.set()
+            else:
+                loop.call_soon_threadsafe(self._changed.set)
+        else:
+            self._changed.set()
 
     async def wait_after(self, revision: int, timeout: float) -> int | None:
+        self._loop = asyncio.get_running_loop()
         while self._revision <= revision:
             self._changed.clear()
             if self._revision > revision:
@@ -955,6 +1033,21 @@ def create_app(
         lifespan=lifespan,
     )
 
+    def unpark_workers(names: Iterable[str] | None = None) -> list[str]:
+        target_names = tuple(worker_health) if names is None else tuple(names)
+        unparked: list[str] = []
+        for worker_name in target_names:
+            health_state = worker_health.get(worker_name)
+            if health_state is not None and health_state.wake():
+                unparked.append(worker_name)
+        if unparked:
+            LOGGER.info("Unparked background workers via operator action: %s", ", ".join(unparked))
+            worker_health_updates.publish()
+        return unparked
+
+    app.state.worker_health = worker_health
+    app.state.unpark_workers = unpark_workers
+
     def account_response(operation: Callable[[], dict[str, object]]) -> CodexAccountView:
         try:
             # The public boundary allowlists identity fields, never credentials.
@@ -1351,71 +1444,37 @@ def create_app(
     @app.get("/internal/readiness")
     async def internal_readiness() -> dict[str, object]:
         health = worker_health_status()
-        reconciliation = worker_check("quest_reconciliation_worker")
-        drafting = worker_check("quest_drafting_worker")
-        deepfetch = worker_check("first_question_deepfetch_worker")
-        idea_stage = worker_check("idea_stage_worker")
-        plan_stage = worker_check("plan_stage_worker")
-        bundle_stage = worker_check("bundle_stage_worker")
-        reasoning_stage = worker_check("reasoning_stage_worker")
-        autonomous_creation = worker_check("autonomous_creation_worker")
-        quest_completion = worker_check("quest_completion_worker")
-        target_runs = worker_check("target_run_worker")
-        research_assets = worker_check("research_asset_intake_worker")
-        research_asset_verification = worker_check("research_asset_verification_worker")
+
+        def readiness_entry(name: str) -> dict[str, object]:
+            check = worker_check(name)
+            health_state = worker_health[name]
+            entry: dict[str, object] = {
+                "status": check["status"],
+                "last_error": health_state.last_error,
+            }
+            if health_state.parked:
+                entry["parked"] = True
+                if health_state.warning:
+                    entry["warning"] = health_state.warning
+            return entry
+
         target_root = runtime.query_target_root_readiness()
         return {
             "status": health["status"],
             "revision": health["revision"],
-            "reconciliation": {
-                "status": reconciliation["status"],
-                "last_error": worker_health["quest_reconciliation_worker"].last_error,
-            },
-            "drafting": {
-                "status": drafting["status"],
-                "last_error": worker_health["quest_drafting_worker"].last_error,
-            },
-            "deepfetch": {
-                "status": deepfetch["status"],
-                "last_error": worker_health["first_question_deepfetch_worker"].last_error,
-            },
-            "idea_stage": {
-                "status": idea_stage["status"],
-                "last_error": worker_health["idea_stage_worker"].last_error,
-            },
-            "plan_stage": {
-                "status": plan_stage["status"],
-                "last_error": worker_health["plan_stage_worker"].last_error,
-            },
-            "bundle_stage": {
-                "status": bundle_stage["status"],
-                "last_error": worker_health["bundle_stage_worker"].last_error,
-            },
-            "reasoning_stage": {
-                "status": reasoning_stage["status"],
-                "last_error": worker_health["reasoning_stage_worker"].last_error,
-            },
-            "autonomous_creation": {
-                "status": autonomous_creation["status"],
-                "last_error": worker_health["autonomous_creation_worker"].last_error,
-            },
-            "quest_completion": {
-                "status": quest_completion["status"],
-                "last_error": worker_health["quest_completion_worker"].last_error,
-            },
-            "target_runs": {
-                "status": target_runs["status"],
-                "last_error": worker_health["target_run_worker"].last_error,
-            },
+            "reconciliation": readiness_entry("quest_reconciliation_worker"),
+            "drafting": readiness_entry("quest_drafting_worker"),
+            "deepfetch": readiness_entry("first_question_deepfetch_worker"),
+            "idea_stage": readiness_entry("idea_stage_worker"),
+            "plan_stage": readiness_entry("plan_stage_worker"),
+            "bundle_stage": readiness_entry("bundle_stage_worker"),
+            "reasoning_stage": readiness_entry("reasoning_stage_worker"),
+            "autonomous_creation": readiness_entry("autonomous_creation_worker"),
+            "quest_completion": readiness_entry("quest_completion_worker"),
+            "target_runs": readiness_entry("target_run_worker"),
             "target_root": target_root,
-            "research_assets": {
-                "status": research_assets["status"],
-                "last_error": worker_health["research_asset_intake_worker"].last_error,
-            },
-            "research_asset_verification": {
-                "status": research_asset_verification["status"],
-                "last_error": worker_health["research_asset_verification_worker"].last_error,
-            },
+            "research_assets": readiness_entry("research_asset_intake_worker"),
+            "research_asset_verification": readiness_entry("research_asset_verification_worker"),
         }
 
     @app.get("/internal/doctor")
@@ -1930,6 +1989,7 @@ def create_app(
             reconciled = runtime.owners.agent_runtime.reconcile_root_human_request(
                 request_ref
             )
+            unpark_workers()
             return agent_retry_result(current if reconciled is None else reconciled)
         if current.get("status") != "open":
             raise OwnerConflict("system_operation_retry_unavailable")
@@ -1945,6 +2005,7 @@ def create_app(
             reconciled = runtime.owners.agent_runtime.query_human_request(request_ref)
         if reconciled is None:
             raise OwnerConflict("human_request_not_found")
+        unpark_workers()
         return agent_retry_result(reconciled)
 
     @app.post("/api/v1/human-collaboration/guidance", status_code=201)
@@ -2118,11 +2179,21 @@ def create_app(
         request: Request,
         execution: CommandExecutionRequest,
     ) -> dict[str, object]:
-        return runtime.owners.human_collaboration.execute_confirmed_command(
+        result = runtime.owners.human_collaboration.execute_confirmed_command(
             intent_id,
             execution.confirmation_receipt_ref,
             _idempotency_key(request),
         )
+        draft = result.get("draft") if isinstance(result, dict) else None
+        payload = draft.get("payload") if isinstance(draft, dict) else None
+        if (
+            isinstance(draft, dict)
+            and draft.get("command_kind") == "research_control"
+            and isinstance(payload, dict)
+            and payload.get("action") in {"resume", "restore", "normal_switch", "forced_switch"}
+        ):
+            unpark_workers()
+        return result
 
     @app.post(
         "/api/v1/human-collaboration/commands/{intent_id}/authorizations",
@@ -2687,8 +2758,14 @@ def create_app(
     @app.put("/api/v1/quests/{quest_ref}/runtime-conditions")
     def put_runtime_conditions(quest_ref: str, conditions: RuntimeConditionsRequest) -> dict[str, object]:
         from meta_research.runtime_conditions import save_runtime_conditions
-        return save_runtime_conditions(runtime.data_root.root, quest_ref,
-                                       database=runtime._database, **conditions.model_dump())
+        saved = save_runtime_conditions(
+            runtime.data_root.root,
+            quest_ref,
+            database=runtime._database,
+            **conditions.model_dump(),
+        )
+        unpark_workers()
+        return saved
 
     @app.put("/api/v1/preferences")
     def set_preferences(preference: OutputLanguagePreference) -> dict[str, object]:
@@ -3449,7 +3526,9 @@ def create_app(
 
     @app.post("/api/v1/bundle-stage/provider-transition")
     def apply_bundle_provider_transition(command: BundleProviderTransitionRequest) -> dict[str, object]:
-        return runtime.bundle_stage.provider_transition(**command.model_dump())
+        result = runtime.bundle_stage.provider_transition(**command.model_dump())
+        unpark_workers()
+        return result
 
     @app.get("/api/v1/reasoning-stage/current")
     def query_current_reasoning_stage() -> dict[str, object]:
@@ -3986,32 +4065,87 @@ async def _verify_research_assets(
     health: ReconciliationHealth,
     on_health_change: Callable[[], None] | None = None,
 ) -> None:
-    last_cleanup = 0.0
+    last_cleanup: float | None = None
+    consecutive_idle_passes = 0
 
-    def verify_and_reclaim() -> bool:
+    def reclaim_completed() -> bool:
         nonlocal last_cleanup
-        worked = runtime.owners.research_memory.verify_asset_inventory_once()
-        now = time.monotonic()
-        if now - last_cleanup >= 60:
-            last_cleanup = now
-            try:
-                report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, limit=10)
-                for item in report:
-                    if item.get("action") in {"removed", "rotated"}:
-                        LOGGER.info("Completed research workspace reclaimed: %s", item)
-            except (OSError, OwnerConflict, ValueError):
-                LOGGER.exception("Completed workspace cleanup deferred")
-        return worked
+        try:
+            report = runtime.target_run_runtime.cleanup_completed_workspaces(dry_run=False, limit=10)
+            for item in report:
+                if item.get("action") in {"removed", "rotated"}:
+                    LOGGER.info("Completed research workspace reclaimed: %s", item)
+        except (OSError, OwnerConflict, ValueError):
+            LOGGER.exception("Completed workspace cleanup deferred")
+        finally:
+            last_cleanup = time.monotonic()
+        return False
 
-    await _process_background_operation(
-        verify_and_reclaim,
-        health=health,
-        worker_label='research asset verification',
-        timeout_code='asset_verification_io_timeout',
-        timeout_seconds=ASSET_WORKER_WATCHDOG_SECONDS,
-        on_health_change=on_health_change,
-        active_delay=0.05,
-    )
+    while True:
+        advanced = False
+        error_code: str | None = None
+        try:
+            advanced = await _await_monitored_worker_call(
+                runtime.owners.research_memory.verify_asset_inventory_once,
+                health=health,
+                timeout_code='asset_verification_io_timeout',
+                on_health_change=on_health_change,
+                timeout_seconds=ASSET_WORKER_WATCHDOG_SECONDS,
+            )
+            now = time.monotonic()
+            if last_cleanup is None or (now - last_cleanup) >= ASSET_CLEANUP_INTERVAL_SECONDS:
+                await _await_monitored_worker_call(
+                    reclaim_completed,
+                    health=health,
+                    timeout_code='asset_cleanup_io_timeout',
+                    on_health_change=on_health_change,
+                    timeout_seconds=ASSET_CLEANUP_WATCHDOG_SECONDS,
+                )
+        except Exception as error:
+            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
+                LOGGER.exception("research asset verification attempt failed unexpectedly")
+            error_code = (
+                error.code if isinstance(error, OwnerConflict) else type(error).__name__
+            )
+
+        if error_code is not None:
+            health.retry_count += 1
+            delay = min(
+                GENERIC_FAILURE_BACKOFF_MAX_SECONDS,
+                GENERIC_FAILURE_BACKOFF_BASE_SECONDS * (2 ** min(health.retry_count - 1, 9)),
+            )
+            changed = (
+                health.status != "unavailable"
+                or health.last_error != error_code
+                or health.parked
+            )
+            health.status = "unavailable"
+            health.last_error = error_code
+            health.parked = False
+            health.warning = None
+            health.next_retry_at = time.time() + delay
+        else:
+            changed = (
+                health.status != "ready"
+                or health.last_error is not None
+                or health.parked
+                or health.warning is not None
+            )
+            health.status = "ready"
+            health.last_error = None
+            health.retry_count = 0
+            health.parked = False
+            health.warning = None
+            health.next_retry_at = None
+            if advanced:
+                consecutive_idle_passes = 0
+                delay = 0.05
+            else:
+                consecutive_idle_passes = min(consecutive_idle_passes + 1, 6)
+                delay = min(0.2 * (2 ** (consecutive_idle_passes - 1)), 30.0)
+        if changed and on_health_change is not None:
+            on_health_change()
+        await asyncio.sleep(delay)
 
 
 async def _await_monitored_worker_call(
@@ -4251,6 +4385,9 @@ async def _process_idea_stage(
         timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
         on_health_change=on_health_change,
         transient_error=lambda: runtime.idea_stage.transient_error,
+        transient_error_classification=lambda: getattr(
+            runtime.idea_stage, "transient_error_classification", None
+        ),
     )
 
 
@@ -4267,6 +4404,9 @@ async def _process_plan_stage(
         timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
         on_health_change=on_health_change,
         transient_error=lambda: runtime.plan_stage.transient_error,
+        transient_error_classification=lambda: getattr(
+            runtime.plan_stage, "transient_error_classification", None
+        ),
     )
 
 
@@ -4280,19 +4420,65 @@ async def _process_target_runs(
     flights: dict[str, _TargetRunFlight] = {}
     cancel_flights: dict[str, _TargetRunFlight] = {}
     operation_errors: dict[str, str] = {}
+    upstream_errors: dict[str, tuple[str, str]] = {}
     next_due: dict[str, float] = {}
     no_progress_count: dict[str, int] = {}
+    discovery_error_streak = 0
+    upstream_failure_streak = 0
 
     def set_health(status: Literal["ready", "unavailable"], code: str | None) -> None:
-        changed = health.status != status or health.last_error != code
+        changed = health.status != status or health.last_error != code or health.parked
         health.status = status
         health.last_error = code
         if status == "ready":
             health.retry_count = 0
+            health.parked = False
+            health.warning = None
+            health.next_retry_at = None
         elif changed:
             health.retry_count += 1
         if changed and on_health_change is not None:
             on_health_change()
+
+    async def park_target_worker(error_code: str, classification: str | None) -> None:
+        nonlocal upstream_failure_streak, discovery_error_streak
+        parked_code = (
+            error_code
+            if error_code.startswith("worker_parked:")
+            else f"worker_parked:{error_code}"
+        )
+        detail = (
+            f"{error_code}; classification={classification}"
+            if classification and classification != error_code
+            else error_code
+        )
+        warning_message = (
+            f"target run worker parked after {upstream_failure_streak} "
+            f"consecutive upstream/transient failures ({detail})"
+        )
+        changed = (
+            health.status != "unavailable"
+            or health.last_error != parked_code
+            or not health.parked
+            or health.warning != warning_message
+        )
+        health.status = "unavailable"
+        health.last_error = parked_code
+        health.parked = True
+        health.warning = warning_message
+        health.next_retry_at = None
+        LOGGER.warning("%s", warning_message)
+        if changed and on_health_change is not None:
+            on_health_change()
+        while health.parked:
+            await _wait_while_parked(health, WORKER_PARK_POLL_SECONDS)
+        upstream_failure_streak = 0
+        discovery_error_streak = 0
+        upstream_errors.clear()
+        next_due.clear()
+        no_progress_count.clear()
+        health.warning = None
+        health.next_retry_at = None
 
     while True:
         try:
@@ -4303,17 +4489,30 @@ async def _process_target_runs(
                 runtime.owners.agent_runtime.list_target_root_reconciliation_refs
             )
             target_refs = tuple(dict.fromkeys((*target_refs, *reconciliation_refs)))
+            discovery_error_streak = 0
         except Exception as error:
             if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
                 LOGGER.exception("TargetRun frontier discovery failed unexpectedly")
             error_code = (
                 error.code if isinstance(error, OwnerConflict) else type(error).__name__
             )
+            discovery_error_streak += 1
+            if _is_upstream_capacity_or_transient_error(error) or _is_upstream_capacity_or_transient_error(error_code):
+                upstream_failure_streak += 1
+                classification = getattr(error, "upstream_classification", None)
+                if upstream_failure_streak > UPSTREAM_FAILURE_PARK_THRESHOLD:
+                    await park_target_worker(error_code, classification)
+                    continue
+                schedule = UPSTREAM_FAILURE_BACKOFF_SCHEDULE_SECONDS
+                discovery_delay = schedule[min(upstream_failure_streak - 1, len(schedule) - 1)]
+                health.next_retry_at = time.time() + discovery_delay
+            else:
+                discovery_delay = min(
+                    GENERIC_FAILURE_BACKOFF_MAX_SECONDS,
+                    GENERIC_FAILURE_BACKOFF_BASE_SECONDS * (2 ** min(discovery_error_streak - 1, 9)),
+                )
+                health.next_retry_at = time.time() + discovery_delay
             set_health("unavailable", error_code)
-            discovery_delay = min(
-                GENERIC_FAILURE_BACKOFF_MAX_SECONDS,
-                GENERIC_FAILURE_BACKOFF_BASE_SECONDS * (2 ** min(max(health.retry_count - 1, 0), 9)),
-            )
             await asyncio.sleep(discovery_delay)
             continue
 
@@ -4322,6 +4521,8 @@ async def _process_target_runs(
         # returns a valid result or leaves the authoritative work inventory.
         for target_ref in operation_errors.keys() - set(target_refs):
             del operation_errors[target_ref]
+        for target_ref in upstream_errors.keys() - set(target_refs):
+            del upstream_errors[target_ref]
         for target_ref in next_due.keys() - set(target_refs):
             next_due.pop(target_ref, None)
             no_progress_count.pop(target_ref, None)
@@ -4399,6 +4600,8 @@ async def _process_target_runs(
             )
 
         advanced = False
+        park_trigger: tuple[str, str | None] | None = None
+        query_status = getattr(runtime.target_run_runtime, "query_status", None)
         for flight_map in (flights, cancel_flights):
             for target_ref, flight in tuple(flight_map.items()):
                 if (
@@ -4415,30 +4618,70 @@ async def _process_target_runs(
                         )
                     advanced = advanced or result
                     operation_errors.pop(target_ref, None)
-                    count = 0 if result else min(no_progress_count.get(target_ref, 0) + 1, 9)
-                    no_progress_count[target_ref] = count
-                    next_due[target_ref] = asyncio.get_running_loop().time() + (
-                        0 if result else min(0.2 * (2 ** (count - 1)), 30.0)
-                    )
+                    if result:
+                        upstream_errors.pop(target_ref, None)
+                        upstream_failure_streak = 0
+                        no_progress_count[target_ref] = 0
+                        next_due[target_ref] = asyncio.get_running_loop().time()
+                    else:
+                        status_obj = query_status(target_ref) if callable(query_status) else None
+                        u_class = getattr(status_obj, "upstream_classification", None)
+                        u_code = getattr(status_obj, "pending_code", None)
+                        if _is_upstream_capacity_or_transient_error(u_class) or _is_upstream_capacity_or_transient_error(u_code):
+                            upstream_failure_streak += 1
+                            eff_code = u_code or u_class or "upstream_transient"
+                            upstream_errors[target_ref] = (eff_code, u_class or eff_code)
+                            if upstream_failure_streak > UPSTREAM_FAILURE_PARK_THRESHOLD:
+                                park_trigger = (eff_code, u_class)
+                            else:
+                                schedule = UPSTREAM_FAILURE_BACKOFF_SCHEDULE_SECONDS
+                                delay = schedule[min(upstream_failure_streak - 1, len(schedule) - 1)]
+                                next_due[target_ref] = asyncio.get_running_loop().time() + delay
+                                health.next_retry_at = time.time() + delay
+                        else:
+                            upstream_errors.pop(target_ref, None)
+                            count = min(no_progress_count.get(target_ref, 0) + 1, 9)
+                            no_progress_count[target_ref] = count
+                            next_due[target_ref] = asyncio.get_running_loop().time() + min(
+                                0.2 * (2 ** (count - 1)), 30.0
+                            )
                 except Exception as error:
                     if not isinstance(
                         error, (OSError, OwnerConflict, SQLAlchemyError)
                     ):
                         LOGGER.exception("TargetRun boundary failed unexpectedly")
-                    operation_errors[target_ref] = (
+                    op_code = (
                         error.code
                         if isinstance(error, OwnerConflict)
                         else type(error).__name__
                     )
-                    count = min(no_progress_count.get(target_ref, 0) + 1, 9)
-                    no_progress_count[target_ref] = count
-                    next_due[target_ref] = asyncio.get_running_loop().time() + min(
-                        0.2 * (2 ** (count - 1)), 30.0
-                    )
+                    u_class = getattr(error, "upstream_classification", None)
+                    if _is_upstream_capacity_or_transient_error(error) or _is_upstream_capacity_or_transient_error(op_code):
+                        upstream_failure_streak += 1
+                        upstream_errors[target_ref] = (op_code, u_class or op_code)
+                        if upstream_failure_streak > UPSTREAM_FAILURE_PARK_THRESHOLD:
+                            park_trigger = (op_code, u_class)
+                        else:
+                            schedule = UPSTREAM_FAILURE_BACKOFF_SCHEDULE_SECONDS
+                            delay = schedule[min(upstream_failure_streak - 1, len(schedule) - 1)]
+                            next_due[target_ref] = asyncio.get_running_loop().time() + delay
+                            health.next_retry_at = time.time() + delay
+                    else:
+                        operation_errors[target_ref] = op_code
+                        count = min(no_progress_count.get(target_ref, 0) + 1, 9)
+                        no_progress_count[target_ref] = count
+                        next_due[target_ref] = asyncio.get_running_loop().time() + min(
+                            0.2 * (2 ** (count - 1)), 30.0
+                        )
+
+        if park_trigger is not None:
+            await park_target_worker(park_trigger[0], park_trigger[1])
+            continue
 
         operation_error = next(iter(operation_errors.values()), None)
-        if discovery_error is not None or operation_error is not None:
-            set_health("unavailable", discovery_error or operation_error)
+        upstream_error = next((code for code, _ in upstream_errors.values()), None)
+        if discovery_error is not None or operation_error is not None or upstream_error is not None:
+            set_health("unavailable", discovery_error or operation_error or upstream_error)
         else:
             set_health("ready", None)
 
@@ -4470,6 +4713,11 @@ async def _process_bundle_stage(
             if runtime.bundle_stage.observation.kind == "failure"
             else None
         ),
+        transient_error_classification=lambda: (
+            runtime.bundle_stage.observation.classification
+            if runtime.bundle_stage.observation.kind == "failure"
+            else None
+        ),
     )
 
 
@@ -4486,6 +4734,9 @@ async def _process_reasoning_stage(
         timeout_seconds=PROVIDER_WORKER_WATCHDOG_SECONDS,
         on_health_change=on_health_change,
         transient_error=lambda: runtime.reasoning_stage.transient_error,
+        transient_error_classification=lambda: getattr(
+            runtime.reasoning_stage, "transient_error_classification", None
+        ),
     )
 
 
@@ -4548,6 +4799,7 @@ async def _process_background_operation(
     idle_delay: float = 0.2,
     active_delay: float = 0,
     transient_error: Callable[[], str | None] | None = None,
+    transient_error_classification: Callable[[], str | None] | None = None,
 ) -> None:
     """Share retry and health reporting while each worker owns its operation.
 
@@ -4559,6 +4811,7 @@ async def _process_background_operation(
     upstream_failure_streak = 0
     while True:
         advanced = False
+        caught_error: BaseException | None = None
         try:
             advanced = await _await_monitored_worker_call(
                 operation,
@@ -4568,16 +4821,31 @@ async def _process_background_operation(
                 timeout_seconds=timeout_seconds,
             )
             error_code = transient_error() if transient_error is not None else None
+            error_classification = (
+                transient_error_classification()
+                if transient_error_classification is not None
+                else None
+            )
         except Exception as error:
+            caught_error = error
             if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
                 LOGGER.exception("%s attempt failed unexpectedly", worker_label)
             error_code = (
                 error.code if isinstance(error, OwnerConflict) else type(error).__name__
             )
+            error_classification = getattr(error, "upstream_classification", None)
 
         if error_code is not None:
             health.retry_count += 1
-            if _is_upstream_capacity_or_transient_error(error_code):
+            is_upstream = (
+                _is_upstream_capacity_or_transient_error(error_classification)
+                or _is_upstream_capacity_or_transient_error(error_code)
+                or (
+                    caught_error is not None
+                    and _is_upstream_capacity_or_transient_error(caught_error)
+                )
+            )
+            if is_upstream:
                 upstream_failure_streak += 1
                 if upstream_failure_streak > UPSTREAM_FAILURE_PARK_THRESHOLD:
                     parked_code = (
@@ -4585,9 +4853,14 @@ async def _process_background_operation(
                         if error_code.startswith("worker_parked:")
                         else f"worker_parked:{error_code}"
                     )
+                    detail = (
+                        f"{error_code}; classification={error_classification}"
+                        if error_classification and error_classification != error_code
+                        else error_code
+                    )
                     warning_message = (
                         f"{worker_label} parked after {upstream_failure_streak} "
-                        f"consecutive upstream/transient failures ({error_code})"
+                        f"consecutive upstream/transient failures ({detail})"
                     )
                     changed = (
                         health.status != "unavailable"
@@ -4604,7 +4877,7 @@ async def _process_background_operation(
                     if changed and on_health_change is not None:
                         on_health_change()
                     while health.parked:
-                        await asyncio.sleep(WORKER_PARK_POLL_SECONDS)
+                        await _wait_while_parked(health, WORKER_PARK_POLL_SECONDS)
                     upstream_failure_streak = 0
                     health.warning = None
                     continue

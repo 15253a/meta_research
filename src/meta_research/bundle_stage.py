@@ -133,6 +133,7 @@ class BundleObservation:
 
     kind: Literal["ready", "waiting", "failure"]
     code: str | None = None
+    classification: str | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +231,7 @@ class BundleStageWorker:
             "codex_operation_stopped",
             recovery_checkpoint=checkpoint,
             native_session_ref=error.native_session_ref,
+            upstream_classification=error.upstream_classification,
         )
 
     def process_once(self) -> bool:
@@ -242,7 +244,7 @@ class BundleStageWorker:
             if error.code not in {
                 "bundle_inbox_ack_stale", "bundle_inbox_checkpoint_stale",
             }:
-                self._observation = BundleObservation("failure", error.code)
+                self._observation = BundleObservation("failure", error.code, classification=getattr(error, "upstream_classification", None))
                 raise
             # Another Owner advanced the inbox while this boundary was being
             # assembled. Yield so the next pass reads a fresh run/checkpoint;
@@ -393,7 +395,7 @@ class BundleStageWorker:
                         attempt_ref=run.attempt_ref, fence_ref=run.fence_ref, runtime_binding=current_binding,
                         harness_authority=self._harnesses)
                 except OwnerConflict as error:
-                    self._observation = BundleObservation("failure", error.code)
+                    self._observation = BundleObservation("failure", error.code, classification=getattr(error, "upstream_classification", None))
                     return False
                 if refreshed:
                     self._observation = BundleObservation("ready")
@@ -672,7 +674,7 @@ class BundleStageWorker:
                         unit_kind="bundle_review",
                     )
                 except OwnerConflict as error:
-                    self._observation = BundleObservation("failure", error.code)
+                    self._observation = BundleObservation("failure", error.code, classification=getattr(error, "upstream_classification", None))
                     return False
                 provider_safe = True
                 result = None
@@ -696,7 +698,7 @@ class BundleStageWorker:
                         elif error.recovery_checkpoint is not None:
                             provider_safe = False
                             if self._rolling_identity_unresolved(run, error.recovery_checkpoint, error.code):
-                                self._observation = BundleObservation("failure", "codex_operation_reconciliation_pending")
+                                self._observation = BundleObservation("failure", "codex_operation_reconciliation_pending", classification=getattr(error, "upstream_classification", None))
                                 return False
                             self._agent_runtime.record_stage_provider_hard_ceiling(
                                 unit_ref=batch_unit_ref,
@@ -706,7 +708,7 @@ class BundleStageWorker:
                                 failure_code=error.code,
                                 provider_exit=error.recovery_checkpoint,
                             )
-                        self._observation = BundleObservation("failure", error.code)
+                        self._observation = BundleObservation("failure", error.code, classification=getattr(error, "upstream_classification", None))
                         return False
                     except BundleSkillContractError as error:
                         if result is None:
@@ -727,7 +729,7 @@ class BundleStageWorker:
                             )
                         except BundleSkillUnavailable as checkpoint_error:
                             provider_safe = False
-                            self._observation = BundleObservation("failure", checkpoint_error.code)
+                            self._observation = BundleObservation("failure", checkpoint_error.code, classification=getattr(checkpoint_error, "upstream_classification", None))
                             return False
                         if terminal:
                             provider_safe = False
@@ -1027,7 +1029,7 @@ class BundleStageWorker:
                     unit_kind="bundle_review",
                 )
             except OwnerConflict as error:
-                self._observation = BundleObservation("failure", error.code)
+                self._observation = BundleObservation("failure", error.code, classification=getattr(error, "upstream_classification", None))
                 return False
             provider_safe = True
             result = None
@@ -1044,7 +1046,7 @@ class BundleStageWorker:
                     elif error.recovery_checkpoint is not None:
                         provider_safe = False
                         if self._rolling_identity_unresolved(run, error.recovery_checkpoint, error.code):
-                            self._observation = BundleObservation("failure", "codex_operation_reconciliation_pending")
+                            self._observation = BundleObservation("failure", "codex_operation_reconciliation_pending", classification=getattr(error, "upstream_classification", None))
                             return False
                         self._agent_runtime.record_stage_provider_hard_ceiling(
                             unit_ref=dispatch_unit_ref,
@@ -1054,7 +1056,7 @@ class BundleStageWorker:
                             failure_code=error.code,
                             provider_exit=error.recovery_checkpoint,
                         )
-                    self._observation = BundleObservation("failure", error.code)
+                    self._observation = BundleObservation("failure", error.code, classification=getattr(error, "upstream_classification", None))
                     return False
                 except BundleSkillContractError as error:
                     if result is None:
@@ -1073,7 +1075,7 @@ class BundleStageWorker:
                         )
                     except BundleSkillUnavailable as checkpoint_error:
                         provider_safe = False
-                        self._observation = BundleObservation("failure", checkpoint_error.code)
+                        self._observation = BundleObservation("failure", checkpoint_error.code, classification=getattr(checkpoint_error, "upstream_classification", None))
                         return False
                     if terminal:
                         provider_safe = False
@@ -2988,7 +2990,7 @@ class BundleStageWorker:
                     unit_kind="bundle_primary",
                 )
             except OwnerConflict as error:
-                self._observation = BundleObservation("failure", error.code)
+                self._observation = BundleObservation("failure", error.code, classification=getattr(error, "upstream_classification", None))
                 return False
             provider_safe = True
             draft = None
@@ -3031,7 +3033,7 @@ class BundleStageWorker:
                             detail_code=error.rejected_detail_code,
                         )
                         provider_safe = False
-                        self._observation = BundleObservation("failure", error.code)
+                        self._observation = BundleObservation("failure", error.code, classification=getattr(error, "upstream_classification", None))
                         return True
                     provider_safe = False
                     provider_safe = settle_stage_provider_failure(
@@ -3044,7 +3046,7 @@ class BundleStageWorker:
                             fence_ref=run.fence_ref,
                         ),
                     )
-                    self._observation = BundleObservation("failure", error.code)
+                    self._observation = BundleObservation("failure", error.code, classification=getattr(error, "upstream_classification", None))
                     return False
                 except RecoverableBundleSkillCandidateError as error:
                     if draft is None:
@@ -3127,7 +3129,7 @@ class BundleStageWorker:
                     raise BundleSkillContractError("bundle_skill_result_invalid")
                 validate_bundle_exhaustion_skill_result(skill_request, result)
             except BundleSkillUnavailable as error:
-                self._observation = BundleObservation("failure", error.code)
+                self._observation = BundleObservation("failure", error.code, classification=getattr(error, "upstream_classification", None))
                 return False
             except RecoverableBundleSkillCandidateError as error:
                 if result is not None:
@@ -3162,7 +3164,7 @@ class BundleStageWorker:
                 validate_bundle_skill_result(skill_request, result)
             )
         except BundleSkillUnavailable as error:
-            self._observation = BundleObservation("failure", error.code)
+            self._observation = BundleObservation("failure", error.code, classification=getattr(error, "upstream_classification", None))
             return False
         except RecoverableBundleSkillCandidateError as error:
             if result is not None:
@@ -3335,7 +3337,7 @@ class BundleStageWorker:
             self._observation = BundleObservation("ready") if corrected else BundleObservation("failure", detail_code)
             return corrected
         except BundleSkillUnavailable as error:
-            self._observation = BundleObservation("failure", error.code)
+            self._observation = BundleObservation("failure", error.code, classification=getattr(error, "upstream_classification", None))
             return False
         finally:
             if not corrected:
@@ -3600,7 +3602,7 @@ class BundleStageWorker:
         try:
             runtime_binding = provider.runtime_binding()
         except (BundleSkillUnavailable, HarnessAdmissionError) as error:
-            self._observation = BundleObservation("failure", error.code)
+            self._observation = BundleObservation("failure", error.code, classification=getattr(error, "upstream_classification", None))
             return None
         return runtime_binding
 

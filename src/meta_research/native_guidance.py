@@ -102,11 +102,21 @@ def live_native_argv(argv, directory, *, enabled=True, force_transport=False, pa
     return [*wrapped, "-"]
 
 
+def _path_chrono_key(path: Path) -> tuple[int, str]:
+    try:
+        return (path.stat().st_mtime_ns, str(path))
+    except OSError:
+        return (0, str(path))
+
+
 def native_human_input_history(workspace, native_session_ref, *, exclude_directory=None):
     if native_session_ref is None:
         return ()
     observed = []
-    for path in (Path(workspace) / "provider-operations").glob("*/*/native-turn-id.json"):
+    for path in sorted(
+        (Path(workspace) / "provider-operations").glob("*/*/native-turn-id.json"),
+        key=_path_chrono_key,
+    ):
         directory = path.parent
         if directory == exclude_directory:
             continue
@@ -120,7 +130,10 @@ def native_human_input_history(workspace, native_session_ref, *, exclude_directo
                 or not isinstance(accepted.get("turn_id"), str)):
             raise OwnerConflict("native_guidance_send_identity_invalid")
         observed.append(start["parameters"]["input"][0]["text"])
-    for path in (Path(workspace) / "provider-operations").glob("*/*/live-guidance/*.sending"):
+    for path in sorted(
+        (Path(workspace) / "provider-operations").glob("*/*/live-guidance/*.sending"),
+        key=_path_chrono_key,
+    ):
         directory = path.parent.parent
         if directory == exclude_directory:
             continue

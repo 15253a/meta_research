@@ -71,6 +71,7 @@ class ProviderOperationUnavailable(RuntimeError):
         rejected_detail_code: str | None = None,
         rejected_feedback: tuple[str, ...] = (),
         native_session_ref: str | None = None,
+        upstream_classification: str | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
@@ -84,6 +85,7 @@ class ProviderOperationUnavailable(RuntimeError):
         self.rejected_detail_code = rejected_detail_code
         self.rejected_feedback = rejected_feedback
         self.native_session_ref = native_session_ref or rejected_native_session_ref
+        self.upstream_classification = upstream_classification
 
 
 def _reject_non_finite_json_constant(_value: str) -> object:
@@ -620,8 +622,14 @@ def _with_failed_native_session(
     error: ProviderOperationUnavailable,
     *,
     native_session_ref: str | None,
+    upstream_classification: str | None = None,
 ) -> ProviderOperationUnavailable:
-    if native_session_ref is None or error.native_session_ref is not None:
+    resolved_session = error.native_session_ref or native_session_ref
+    resolved_classification = error.upstream_classification or upstream_classification
+    if (
+        resolved_session == error.native_session_ref
+        and resolved_classification == error.upstream_classification
+    ):
         return error
     return ProviderOperationUnavailable(
         error.code,
@@ -630,7 +638,8 @@ def _with_failed_native_session(
         rejected_native_session_ref=error.rejected_native_session_ref,
         rejected_detail_code=error.rejected_detail_code,
         rejected_feedback=error.rejected_feedback,
-        native_session_ref=native_session_ref,
+        native_session_ref=resolved_session,
+        upstream_classification=resolved_classification,
     )
 
 
@@ -682,7 +691,22 @@ def read_completed_operation(
     if ((marker.get("returncode") == 75
             or (marker.get("returncode") == 1 and marker.get("termination_reason") == "completed"))
             and (directory / "native-turn-start.json").is_file()):
-        from meta_research.native_codex_bridge import reconcile_native_operation, NativeTerminalTurnError
+        from meta_research.native_codex_bridge import (
+            NativeTerminalTurnError,
+            extract_native_error_classification,
+            reconcile_native_operation,
+        )
+
+        def _spool_classification() -> str | None:
+            try:
+                spool_stdout = read_spool_text(
+                    directory / "stdout.jsonl",
+                    transport_limits.stream_max_bytes,
+                )
+            except (OSError, UnicodeDecodeError, ProviderOperationUnavailable):
+                return None
+            return extract_native_error_classification(spool_stdout)
+
         try:
             recovered = reconcile_native_operation(directory)
         except NativeTerminalTurnError as error:
@@ -693,14 +717,31 @@ def read_completed_operation(
                     or native_session_ref is not None and error.native_session_ref != native_session_ref):
                 raise ProviderOperationUnavailable("codex_operation_spool_invalid") from error
             checkpoint = {**hard_ceiling_checkpoint(marker), **proof}
-            raise ProviderOperationUnavailable("codex_operation_failed", recovery_checkpoint=checkpoint,
-                native_session_ref=error.native_session_ref) from error
+            native_err = proof.get("native_error")
+            classification = getattr(error, "classification", None) or extract_native_error_classification(
+                error.stdout,
+                native_error=native_err,
+            )
+            if classification is None and (native_err is None or native_err == {}):
+                classification = _spool_classification()
+            raise ProviderOperationUnavailable(
+                "codex_operation_failed",
+                recovery_checkpoint=checkpoint,
+                native_session_ref=error.native_session_ref,
+                upstream_classification=classification,
+            ) from error
         except subprocess.TimeoutExpired as error:
-            raise ProviderOperationUnavailable("codex_operation_reconciliation_pending") from error
+            raise ProviderOperationUnavailable(
+                "codex_operation_reconciliation_pending",
+                upstream_classification=_spool_classification(),
+            ) from error
         except (OSError, ValueError, KeyError, TypeError, ProviderSupervisorError) as error:
             raise ProviderOperationUnavailable("codex_operation_spool_invalid") from error
         if recovered is None:
-            raise ProviderOperationUnavailable("codex_operation_reconciliation_pending")
+            raise ProviderOperationUnavailable(
+                "codex_operation_reconciliation_pending",
+                upstream_classification=_spool_classification(),
+            )
         final_text, recovered_session, stdout = recovered
         if native_session_ref is not None and recovered_session != native_session_ref:
             raise ProviderOperationUnavailable("codex_native_session_mismatch")
@@ -719,6 +760,7 @@ def read_completed_operation(
         if error.recovery_checkpoint is None:
             raise
         recovered_session = None
+        recovered_classification = None
         try:
             failed_stdout = read_spool_text(
                 directory / "stdout.jsonl",
@@ -727,13 +769,17 @@ def read_completed_operation(
         except (OSError, UnicodeDecodeError, ProviderOperationUnavailable):
             pass
         else:
+            from meta_research.native_codex_bridge import extract_native_error_classification
+
             recovered_session = _recover_failed_native_session(
                 failed_stdout,
                 expected=native_session_ref,
             )
+            recovered_classification = extract_native_error_classification(failed_stdout)
         enriched = _with_failed_native_session(
             error,
             native_session_ref=recovered_session,
+            upstream_classification=recovered_classification,
         )
         if enriched is error:
             raise

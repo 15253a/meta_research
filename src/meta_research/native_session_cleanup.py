@@ -200,7 +200,15 @@ def rotate_codex_logs_db(
                 "action": "skipped",
                 "reason": "codex_logs_db_busy",
             }]
-        conn.execute("PRAGMA journal_mode = DELETE")
+        mode_row = conn.execute("PRAGMA journal_mode = DELETE").fetchone()
+        if mode_row is None or str(mode_row[0]).strip().lower() != "delete":
+            return [{
+                "root_kind": "codex_logs_db",
+                "path": str(logs_db),
+                "bytes": total_bytes,
+                "action": "skipped",
+                "reason": "codex_logs_db_busy",
+            }]
     except sqlite3.OperationalError:
         return [{
             "root_kind": "codex_logs_db",
@@ -231,6 +239,18 @@ def rotate_codex_logs_db(
             "action": "skipped",
             "reason": "codex_logs_db_in_use",
         }]
+    # After PRAGMA journal_mode = DELETE + conn.close(), SQLite itself must have
+    # removed -wal and -shm. If either remains, another reader/writer is active
+    # or WAL teardown did not complete; abort before os.replace (never unlink
+    # sidecars after os.replace, which could corrupt a newly-created live DB).
+    if wal_path.exists() or shm_path.exists():
+        return [{
+            "root_kind": "codex_logs_db",
+            "path": str(logs_db),
+            "bytes": total_bytes,
+            "action": "skipped",
+            "reason": "wal_sidecar_present",
+        }]
     archive_dir = codex_home / "logs-archive"
     if archive_dir.is_symlink() or (archive_dir.exists() and not archive_dir.is_dir()):
         return [{
@@ -250,17 +270,10 @@ def rotate_codex_logs_db(
             "reason": "unsafe_codex_logs_archive",
         }]
     keep = _CODEX_LOGS_DB_MAX_ARCHIVES if max_archives is None else max(1, int(max_archives))
-    pruned_count, pruned_bytes = _prune_logs_archives(archive_dir, max(0, keep - 1))
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     stem = f"logs_2.{stamp}-{time.time_ns() % 1_000_000_000:09d}"
     staged = archive_dir / f"{stem}.sqlite"
     os.replace(logs_db, staged)
-    for sidecar in (wal_path, shm_path):
-        try:
-            if sidecar.exists() and sidecar.is_file() and not sidecar.is_symlink():
-                sidecar.unlink()
-        except OSError:
-            pass
     final_archive = staged
     gz_tmp = archive_dir / f".{stem}.sqlite.gz.tmp"
     gz_path = archive_dir / f"{stem}.sqlite.gz"
@@ -277,9 +290,20 @@ def rotate_codex_logs_db(
                 gz_tmp.unlink()
         except OSError:
             pass
-    more_pruned, more_bytes = _prune_logs_archives(archive_dir, keep)
-    pruned_count += more_pruned
-    pruned_bytes += more_bytes
+    # Clean up stale orphan temp files left behind by any prior interrupted gzip pass
+    for orphan in archive_dir.iterdir():
+        if (
+            orphan.name.startswith(".logs_2.")
+            and orphan.name.endswith(".tmp")
+            and orphan.is_file()
+            and not orphan.is_symlink()
+        ):
+            try:
+                orphan.unlink()
+            except OSError:
+                pass
+    # Prune old archives strictly AFTER the new archive is durably in place
+    pruned_count, pruned_bytes = _prune_logs_archives(archive_dir, keep)
     try:
         archive_bytes = final_archive.stat().st_size
     except OSError:
@@ -902,11 +926,14 @@ class NativeSessionCleanup:
             with database.read_snapshot() as connection:
                 active = connection.execute(text("""
                     SELECT 1 WHERE
-                      EXISTS (SELECT 1 FROM ar_harness_provider_operations WHERE status='running')
-                      OR EXISTS (SELECT 1 FROM ar_provider_units WHERE status='active')
+                      EXISTS (SELECT 1 FROM ar_harness_provider_operations WHERE status IN ('running', 'unknown_outcome'))
+                      OR EXISTS (SELECT 1 FROM ar_provider_units WHERE status IN ('active', 'revocation_pending'))
                       OR EXISTS (SELECT 1 FROM ar_acquisition_requests WHERE status='running')
+                      OR EXISTS (SELECT 1 FROM ar_deepfetch_runs WHERE status='running')
+                      OR EXISTS (SELECT 1 FROM ar_run_controls WHERE status='running')
                       OR EXISTS (SELECT 1 FROM hc_companion_turns WHERE assistant_status='processing')
                       OR EXISTS (SELECT 1 FROM hc_intent_drafting_turns WHERE assistant_status='running')
+                      OR EXISTS (SELECT 1 FROM hc_manual_drafting_turns WHERE assistant_status='running')
                       OR EXISTS (SELECT 1 FROM hc_proposal_generation_attempts WHERE status='running')
                 """)).first() is not None
                 if active:
@@ -922,6 +949,31 @@ class NativeSessionCleanup:
             protected = _resolve_protected_paths((*locators, *pending_intakes))
         except (OwnerConflict, OSError, ValueError):
             return []
+        recorder = self.root.root / "research-recorder" / "summaries.sqlite3"
+        if recorder.exists() and not recorder.is_symlink() and recorder.resolve() == recorder:
+            try:
+                with sqlite3.connect(recorder.as_uri() + "?mode=ro", uri=True, timeout=2) as rdb:
+                    has_jobs = rdb.execute(
+                        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='jobs'"
+                    ).fetchone() is not None
+                    if has_jobs and rdb.execute(
+                        "SELECT 1 FROM jobs WHERE status='active' LIMIT 1"
+                    ).fetchone() is not None:
+                        return [{
+                            "root_kind": "codex_logs_db",
+                            "path": str(logs_db),
+                            "bytes": _codex_logs_db_total_bytes(self.root.codex_home),
+                            "action": "skipped",
+                            "reason": "codex_logs_db_in_use",
+                        }]
+            except sqlite3.Error:
+                return [{
+                    "root_kind": "codex_logs_db",
+                    "path": str(logs_db),
+                    "bytes": _codex_logs_db_total_bytes(self.root.codex_home),
+                    "action": "skipped",
+                    "reason": "codex_logs_db_in_use",
+                }]
         try:
             return rotate_codex_logs_db(self.root, dry_run=dry_run, protected_paths=protected)
         except (OSError, sqlite3.Error, ValueError):
