@@ -395,8 +395,22 @@ def discover_questions(graph, memory, *, quest_ref, query="", offset=0, limit=12
             ORDER BY l.updated_at DESC,l.question_ref LIMIT :limit OFFSET :offset"""),
             {"quest":quest_ref,"query":query,"limit":limit+1,"offset":offset}).all()
         items=[]
+        from meta_research.owners.research_graph import (
+            _latest_accepted_outcomes_by_question,
+            _scientific_outcome_one_line,
+        )
         from meta_research.question_relations import question_creation_basis_descriptor
-        for row in rows[:limit]:
+        page_rows = rows[:limit]
+        latest_outcomes = (
+            _latest_accepted_outcomes_by_question(
+                c,
+                quest_ref=quest_ref,
+                question_refs={str(r.question_ref) for r in page_rows},
+            )
+            if page_rows
+            else {}
+        )
+        for row in page_rows:
             q=graph.query_question_history_by_ref(row.question_ref)
             if q is None or q.quest_ref!=quest_ref:raise OwnerConflict("question_source_invalid")
             body=memory.read_question_content(q.content_ref,q.content_hash)
@@ -407,11 +421,42 @@ def discover_questions(graph, memory, *, quest_ref, query="", offset=0, limit=12
             creation_basis=question_creation_basis_descriptor(
                 graph, memory, quest_ref=quest_ref, question_ref=q.question_ref,
                 source_quest_ref=source_quest_ref)
-            items.append({"question_ref":q.question_ref,"name":body.get("title",q.question_ref),
-                "summary":body.get("unknown_statement","")[:1200],"status":row.status,
-                "relation_count":relation_count,"creation_basis":creation_basis,
-                "reader":_reader({"source_ref":q.question_ref,"version_ref":q.content_ref}, source_quest_ref),
-                "history_reader":_reader({"operation":"research_graph.question_history.read","question_ref":q.question_ref,"offset":0,"limit":12}, source_quest_ref)})
+            latest_row = latest_outcomes.get(q.question_ref)
+            latest_outcome_ref = None
+            latest_outcome_disposition = None
+            latest_outcome_one_line = None
+            if latest_row is not None:
+                latest_outcome_ref = latest_row.outcome_ref
+                latest_outcome_disposition = latest_row.scientific_disposition
+                try:
+                    scientific = graph.read_question_scientific_outcome(
+                        quest_ref=quest_ref,
+                        question_ref=q.question_ref,
+                        outcome_ref=latest_row.outcome_ref,
+                    )
+                    latest_outcome_disposition = scientific.get("disposition", latest_outcome_disposition)
+                    latest_outcome_one_line = _scientific_outcome_one_line(
+                        scientific, fallback_disposition=latest_outcome_disposition
+                    )
+                except OwnerConflict:
+                    if latest_outcome_disposition:
+                        latest_outcome_one_line = f"[{latest_outcome_disposition}]"
+            title = body.get("title", q.question_ref)
+            items.append({
+                "question_ref": q.question_ref,
+                "title": title,
+                "name": title,
+                "parent_question_ref": q.parent_question_ref,
+                "summary": body.get("unknown_statement", "")[:1200],
+                "status": row.status,
+                "latest_outcome_ref": latest_outcome_ref,
+                "latest_outcome_disposition": latest_outcome_disposition,
+                "latest_outcome_one_line": latest_outcome_one_line,
+                "relation_count": relation_count,
+                "creation_basis": creation_basis,
+                "reader": _reader({"source_ref": q.question_ref, "version_ref": q.content_ref}, source_quest_ref),
+                "history_reader": _reader({"operation": "research_graph.question_history.read", "question_ref": q.question_ref, "offset": 0, "limit": 12}, source_quest_ref),
+            })
     next_offset = offset + limit if len(rows) > limit else None
     return {"items":items,"offset":offset,"next_offset":next_offset,"query_revision":revision,
             **page_state(items,next_offset,offset=offset,query=query)}

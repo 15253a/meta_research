@@ -6737,7 +6737,169 @@ class SQLiteResearchGraphReceiptVerifier:
             params={"quest_ref":quest_ref,"offset":offset,"limit":limit,"focus":focus_question_ref}
             total=int(connection.execute(text("SELECT COUNT(*) FROM rg_question_lifecycle WHERE quest_ref=:quest_ref AND status='active'"),params).scalar_one())
             rows=connection.execute(text("SELECT question_ref FROM rg_question_lifecycle WHERE quest_ref=:quest_ref AND status='active' ORDER BY CASE WHEN question_ref=:focus THEN 0 ELSE 1 END, question_ref LIMIT :limit OFFSET :offset"),params).all()
-        return {"items":[row.question_ref for row in rows],"total_count":total,"shown_count":len(rows),"offset":offset,"next_offset":offset+len(rows) if offset+len(rows)<total else None,"summary_only":True}
+            tables = {
+                r[0]
+                for r in connection.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table'")
+                ).all()
+            }
+            has_question_meta = {
+                "rg_questions", "rg_manual_questions", "rg_autonomous_questions",
+                "rm_formal_question_contents", "rm_manual_question_contents",
+                "rm_autonomous_question_contents",
+            } <= tables
+            has_outcomes = "rg_reasoning_outcome_decisions" in tables
+            page_refs = [str(row.question_ref) for row in rows]
+            meta_by_ref: dict[str, tuple[str | None, str | None]] = {}
+            if has_question_meta and page_refs:
+                meta_rows = connection.execute(
+                    text(
+                        "SELECT l.question_ref, "
+                        "COALESCE(b.parent_question_ref, d.parent_question_ref) AS parent_question_ref, "
+                        "COALESCE(ac.content_json, bc.content_json, dc.question_json) AS body_json "
+                        "FROM rg_question_lifecycle l "
+                        "LEFT JOIN rg_questions a ON a.question_ref=l.question_ref "
+                        "LEFT JOIN rg_manual_questions b ON b.question_ref=l.question_ref "
+                        "LEFT JOIN rg_autonomous_questions d ON d.question_ref=l.question_ref "
+                        "LEFT JOIN rm_formal_question_contents ac ON ac.content_ref=a.content_ref "
+                        "LEFT JOIN rm_manual_question_contents bc ON bc.content_ref=b.content_ref "
+                        "LEFT JOIN rm_autonomous_question_contents dc ON dc.content_ref=d.content_ref "
+                        "WHERE l.question_ref IN (SELECT value FROM json_each(:q_refs))"
+                    ),
+                    {"q_refs": json.dumps(page_refs)},
+                ).all()
+                for meta in meta_rows:
+                    meta_by_ref[str(meta.question_ref)] = (
+                        meta.parent_question_ref,
+                        meta.body_json if isinstance(meta.body_json, str) else None,
+                    )
+            latest_outcomes = (
+                _latest_accepted_outcomes_by_question(
+                    connection, quest_ref=quest_ref, question_refs=set(page_refs)
+                )
+                if has_outcomes and page_refs
+                else {}
+            )
+            questions = []
+            for q_ref in page_refs:
+                title = q_ref
+                parent_ref = None
+                if q_ref in meta_by_ref:
+                    parent_ref, body_json = meta_by_ref[q_ref]
+                    if body_json:
+                        try:
+                            parsed_body = json.loads(body_json)
+                            if isinstance(parsed_body, dict) and isinstance(parsed_body.get("title"), str) and parsed_body["title"].strip():
+                                title = parsed_body["title"].strip()
+                        except (ValueError, TypeError):
+                            pass
+                latest_outcome_ref = None
+                latest_outcome_disposition = None
+                latest_outcome_one_line = None
+                latest_row = latest_outcomes.get(q_ref)
+                if latest_row is not None:
+                    latest_outcome_ref = latest_row.outcome_ref
+                    latest_outcome_disposition = getattr(latest_row, "scientific_disposition", None)
+                    if self._reasoning_content_verifier is not None:
+                        try:
+                            source = self._verified_reasoning_history_source(latest_row)
+                            scientific = source.get("scientific_outcome") if isinstance(source, dict) else None
+                            if isinstance(scientific, dict):
+                                latest_outcome_disposition = scientific.get("disposition", latest_outcome_disposition)
+                                latest_outcome_one_line = _scientific_outcome_one_line(
+                                    scientific, fallback_disposition=latest_outcome_disposition
+                                )
+                        except OwnerConflict:
+                            if latest_outcome_disposition:
+                                latest_outcome_one_line = f"[{latest_outcome_disposition}]"
+                    elif latest_outcome_disposition:
+                        latest_outcome_one_line = f"[{latest_outcome_disposition}]"
+                questions.append(
+                    {
+                        "question_ref": q_ref,
+                        "title": title,
+                        "parent_question_ref": parent_ref,
+                        "latest_outcome_ref": latest_outcome_ref,
+                        "latest_outcome_disposition": latest_outcome_disposition,
+                        "latest_outcome_one_line": latest_outcome_one_line,
+                    }
+                )
+        return {
+            "items": [row.question_ref for row in rows],
+            "questions": questions,
+            "total_count": total,
+            "shown_count": len(rows),
+            "offset": offset,
+            "next_offset": offset + len(rows) if offset + len(rows) < total else None,
+            "summary_only": True,
+        }
+
+
+def _latest_accepted_outcomes_by_question(
+    connection,
+    *,
+    quest_ref: str,
+    question_refs: set[str] | None = None,
+) -> dict[str, object]:
+    """Batch-fetch the latest accepted reasoning outcome row per question in one query."""
+    rows = connection.execute(
+        text(
+            "SELECT *, json_extract(transition_json,'$.source_question_ref') AS _source_question_ref "
+            "FROM rg_reasoning_outcome_decisions "
+            "WHERE decision='accepted' "
+            "AND json_extract(transition_json,'$.source_quest_ref')=:quest_ref "
+            "ORDER BY decided_at DESC, outcome_ref DESC"
+        ),
+        {"quest_ref": quest_ref},
+    ).all()
+    latest: dict[str, object] = {}
+    remaining = set(question_refs) if question_refs is not None else None
+    for row in rows:
+        q_ref = getattr(row, "_source_question_ref", None)
+        if not isinstance(q_ref, str) or not q_ref or q_ref in latest:
+            continue
+        if remaining is not None:
+            if q_ref not in remaining:
+                continue
+            latest[q_ref] = row
+            remaining.discard(q_ref)
+            if not remaining:
+                break
+        else:
+            latest[q_ref] = row
+    return latest
+
+
+def _scientific_outcome_one_line(
+    scientific: dict[str, object], *, fallback_disposition: object = None, max_chars: int = 200
+) -> str | None:
+    import re
+    disposition = scientific.get("disposition") or fallback_disposition
+    raw = (
+        scientific.get("claim")
+        or scientific.get("summary")
+        or scientific.get("statement")
+        or scientific.get("sufficiency_rationale")
+        or ""
+    )
+    if not isinstance(raw, str) or not raw.strip():
+        for list_field in ("missing_evidence", "uncertainty_basis", "limitations"):
+            candidate = scientific.get(list_field)
+            if isinstance(candidate, list):
+                raw = next((item for item in candidate if isinstance(item, str) and item.strip()), "")
+            elif isinstance(candidate, str) and candidate.strip():
+                raw = candidate
+            if isinstance(raw, str) and raw.strip():
+                break
+    text_body = " ".join(str(raw).split())
+    first = re.split(r"(?:\.(?=\s|$)|[。；]|;\s)", text_body, maxsplit=1)[0].strip() if text_body else ""
+    prefix = f"[{disposition}] " if isinstance(disposition, str) and disposition.strip() else ""
+    combined = (prefix + first).strip() if first else (f"[{disposition}]" if prefix else "")
+    if not combined:
+        return None
+    if len(combined) <= max_chars:
+        return combined
+    return combined[: max_chars - 1].rstrip() + "…"
 
 
 class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, BaselineIdentityQueries, ResearchEnvironmentOwnerMixin, ResearchDatasetOwnerMixin, QuestionRelationOwnerMixin, HumanRequestOwnerMixin):
@@ -12368,13 +12530,9 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 evidence_reference_revision=evidence_revision,
             )
             if "evidence_accounting" in content.plan_document:
-                current_catalog = self._query_current_question_plan_evidence_catalog(
-                    quest_ref=accepted_question.quest_ref,
-                    question_ref=accepted_question.question_ref,
-                )
                 known_refs = {
                     tc
-                    for item in (*current_catalog, *selected_catalog)
+                    for item in selected_catalog
                     if isinstance(item, dict)
                     and (tc := _evidence_target_commit_ref(item)) is not None
                 }
@@ -12404,7 +12562,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 try:
                     validate_current_plan_evidence_accounting(
                         content.plan_document,
-                        current_catalog=current_catalog,
+                        current_catalog=[],
                         selected_catalog=selected_catalog,
                         additional_known_catalog=additional_catalog,
                     )
@@ -13073,6 +13231,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                 execution_payload_hash=execution_payload_hash,
                 execution_receipt=execution_receipt,
                 reason_code=error.code,
+                error_details=error.details,
             )
 
     def _record_target_graph_rejection(
@@ -13092,14 +13251,24 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
         execution_payload_hash: str,
         execution_receipt: AcceptanceReceipt,
         reason_code: str,
+        error_details: dict[str, object] | None = None,
     ) -> TargetGraphRejection:
         if (reason_code != "target_candidate_owner_proof_unverified"
                 and reason_code not in BASELINE_METHOD_REJECTION_FEEDBACK):
             raise OwnerConflict("target_graph_rejection_reason_invalid")
-        feedback = (f"{reason_code}: {BASELINE_METHOD_REJECTION_FEEDBACK[reason_code]}",) if reason_code in BASELINE_METHOD_REJECTION_FEEDBACK else (
-            "Research Graph rejected the exact TargetPlan because its candidate "
-            "Owner proofs were not accepted.",
-        )
+        if reason_code in BASELINE_METHOD_REJECTION_FEEDBACK:
+            path = (
+                error_details.get("path")
+                if isinstance(error_details, dict) and isinstance(error_details.get("path"), str)
+                else None
+            )
+            prefix = f"{reason_code} (at {path})" if path else reason_code
+            feedback = (f"{prefix}: {BASELINE_METHOD_REJECTION_FEEDBACK[reason_code]}",)
+        else:
+            feedback = (
+                "Research Graph rejected the exact TargetPlan because its candidate "
+                "Owner proofs were not accepted.",
+            )
         feedback_hash = canonical_hash(list(feedback))
         rejection_ref = new_ref("target_graph_rejection")
         receipt_ref = new_ref("rg_target_graph_rejection_receipt")
@@ -15993,7 +16162,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                     "evaluation_count": 0,
                     "authority_count": 0,
                 }
-                for target in accepted_targets:
+                for batch_index, target in enumerate(accepted_targets):
                     created = _insert_target_with_measurement_authority(
                         connection,
                         target=target,
@@ -16020,6 +16189,7 @@ class SQLiteResearchGraph(ResearchLiteratureOwnerMixin, QuestGoalOwnerMixin, Bas
                         completion_contract=completion,
                         formal_candidate=formal_by_label[target.target_key],
                         accepted_at=now,
+                        candidate_index=batch_index,
                     )
                     for name, count in created.items():
                         identity_counts[name] += count
@@ -18061,7 +18231,7 @@ def _verify_target_measurement_native_identity_rows(
     lineage = contract.evaluation_protocol_lineage.as_dict()
     protocol_document = measurement_contract_to_dict(contract)["protocol_version"]
     required_metric_keys = list(contract.protocol_version.required_metric_keys)
-    verify_baseline_method_identity(forward, baseline_row, baseline_method_row)
+    verify_baseline_method_identity(forward, baseline_row, baseline_method_row, draft=True)
     if (
         baseline_row.baseline_ref != identities.baseline_ref
         or variant_row.variant_ref != identities.variant_ref
@@ -18302,6 +18472,7 @@ def _insert_target_with_measurement_authority(
     completion_contract: NormalizedCompletionContract,
     formal_candidate: FormalTargetCandidate,
     accepted_at: float,
+    candidate_index: int | None = None,
 ) -> dict[str, int]:
     """Atomically insert a Target, its spec receipt, and pure domain roles."""
 
@@ -18363,12 +18534,23 @@ def _insert_target_with_measurement_authority(
     lineage = contract.evaluation_protocol_lineage.as_dict()
     protocol = cast(dict[str, object], contract_document["protocol_version"])
     required_metric_keys = list(contract.protocol_version.required_metric_keys)
-    baseline_ref, baseline_created = resolve_baseline_method_identity(
-        connection,
-        forward=forward,
-        quest_ref=quest_ref,
-        accepted_at=accepted_at,
-    )
+    try:
+        baseline_ref, baseline_created = resolve_baseline_method_identity(
+            connection,
+            forward=forward,
+            quest_ref=quest_ref,
+            accepted_at=accepted_at,
+            draft=True,
+        )
+    except OwnerConflict as error:
+        if error.code in BASELINE_METHOD_REJECTION_FEEDBACK:
+            details = dict(error.details or {})
+            subpath = details.get("path") or "baseline_forward_contract"
+            error_idx = target.ordinal if candidate_index is None else candidate_index
+            details["path"] = f"$.candidates[{error_idx}].measurement_contract.{subpath}"
+            details["candidate_label"] = formal_candidate.candidate.local_label
+            raise OwnerConflict(error.code, details) from error
+        raise
     variant_ref, variant_created = _get_or_create_target_measurement_identity(
         connection,
         table="rg_experiment_variants",
@@ -20955,7 +21137,11 @@ def _target_root_commit_material(
 
     candidate = candidate_projection.candidate
     provenance = [
-        candidate.implementation_revision_ref,
+        *(
+            (candidate.implementation_revision_ref,)
+            if candidate.implementation_revision_ref is not None
+            else ()
+        ),
         manifest.implementation_revision_ref,
         manifest.implementation_tree_hash,
         completion.receipt.receipt_ref,

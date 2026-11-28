@@ -296,6 +296,23 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
         except OwnerConflict as error:
             raise SemanticMcpError(error.code, error.details) from error
 
+    read_descriptions = {
+        "page": (
+            "Page accepted asset families in the current Quest with exact content readers; optional query matches display names. "
+            "Family-authorized assets use lifecycle selection while manifest-only assets use the newest matching accepted version. "
+            "Companion may select source_quest_ref for another currently HC-authorized Quest and carry it in returned readers."
+        ),
+        "lifecycle": (
+            "Read the lifecycle history, supersession chain, correction explanations, and retirement status for one exact asset version_ref. "
+            "Exact historical content.read keeps original bytes. "
+            "Companion may select source_quest_ref for another currently HC-authorized Quest."
+        ),
+        "current": (
+            "Resolve the explicitly selected current version for an asset family given a known version_ref. "
+            "Family-authorized assets follow current lifecycle selection; manifest-only assets resolve to the newest matching accepted version. "
+            "Companion may select source_quest_ref for another currently HC-authorized Quest."
+        ),
+    }
     operations = []
     for action in ("page", "lifecycle", "current"):
         properties = (
@@ -311,7 +328,7 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
             SemanticOperation(
                 semantic_operation_id="research_memory.assets." + action,
                 owning_module="research_memory",
-                description="Discover and read accepted asset lifecycle. The directory returns one item per asset family and an exact content reader. Family-authorized assets use the lifecycle selection; assets visible only through an accepted Target manifest use the newest matching accepted exact version, which may be historical. query matches visible version display names. Companion may select source_quest_ref for another currently HC-authorized Quest; carry that selector in returned readers. This does not authorize writes. Current selection is explicit. Exact historical content.read keeps original bytes and shows correction or retirement explanations.",
+                description=read_descriptions[action],
                 input_schema={
                     "type": "object",
                     "properties": {**properties, "source_quest_ref": {"type": "string", "minLength": 1, "maxLength": 256}},
@@ -510,6 +527,23 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
             )
         },
     }
+    effect_descriptions = {
+        ("intake", False): (
+            "Intake text, verified Target notes, or authorized Workspace/material files and directories into Research Memory as an immutable AssetVersion. "
+            "Select source_kind=local_path or directory plus source and managed/linked_local custody; supports atomic supplement, substantive_change, or correction against a predecessor. "
+            "Caller provenance stays declarative; retry a queued intake with the same effect_id and exact payload."
+        ),
+        ("intake", True): (
+            "Reconcile an interrupted or unknown-outcome research_memory.assets.intake effect using the original effect_id and exact unchanged payload before retrying."
+        ),
+        ("retire", False): (
+            "Retire an accepted AssetVersion when confirmed low value, obsolete, and incorrect with understood impact and no explanatory value. "
+            "Active references and holds block retirement; failure, negative results, and goal changes never trigger retirement. All historical bytes remain retained."
+        ),
+        ("retire", True): (
+            "Reconcile an interrupted or unknown-outcome research_memory.assets.retire effect using the original effect_id and exact unchanged retirement payload before retrying."
+        ),
+    }
     for action, properties in (
         ("intake", {"intake": intake_schema}),
         ("retire", retirement),
@@ -529,7 +563,7 @@ def asset_lifecycle_operations(graph, memory, agent_runtime, target_run_agent=No
                     reconciliation_operation_id=None
                     if reconcile
                     else name + ".reconcile",
-                    description="Intake text, verified Target notes, or selected authorized Workspace/material files and directories. Select source_kind=local_path or directory plus source and managed/linked_local custody; returned reader names the accepted exact version. Caller provenance stays a declaration, never a verified producer. Accept an asset supplement, substantive change, or correction atomically with its exact predecessor, explanation and current selection. Correction requires error, exact evidence bindings, scope, and per-work recheck/redo/unaffected/unknown judgments; if no work is affected, record no_affected_work_explanation with the checked scope and reason. Retirement requires confirmed low value, obsolescence and error, understood impact and no explanatory value; fresh references and holds block it. Failure, negative results and goal changes never trigger retirement. All historical bytes are retained. Keep the same effect_id and exact payload when reconciling. A queued intake awaits an authorized caller: retry the same effect and payload with the current root scope; background workers cannot accept it without that scope.",
+                    description=effect_descriptions[(action, reconcile)],
                     input_schema={
                         "type": "object",
                         "properties": properties,

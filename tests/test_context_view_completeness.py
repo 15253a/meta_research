@@ -13,7 +13,7 @@ from test_target_run_owner import _records
 
 @pytest.mark.parametrize("stage,science", [
     ("idea", "prior_accepted_bindings"), ("bundle", "accepted_formal_plan_binding"),
-    ("reasoning", "upstream_stage_closure"),
+    ("reasoning", "plan_evidence_input"),
 ])
 def test_view_marks_complete_science_and_only_actual_optional_previews(stage, science):
     body = {"notes": "完整的当前科学正文。" * 12000}

@@ -868,9 +868,9 @@ def _plan_evidence_operations(
             owning_module="research_graph",
             description="Browse current Quest evidence candidates in bounded pages. An exact accepted candidate from any page may be selected; the Owner revalidates every actual selected evidence binding.",
             input_schema={"type": "object", "properties": {
-                "offset": {"type": "integer", "minimum": 0},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 256},
-            }, "required": ["offset", "limit"], "additionalProperties": False},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 256, "default": 32},
+            }, "required": [], "additionalProperties": False},
             output_schema={"type": "object", "properties": {
                 "context_pack_ref": _string(), "page": {"type": "object"},
                 "evidence_catalog": {"type": "array", "items": {"type": "object"}},
@@ -883,7 +883,7 @@ def _plan_evidence_operations(
         SemanticOperation(
             semantic_operation_id="research_memory.plan_evidence.read",
             owning_module="research_memory",
-            description="Read an exact evidence asset version and hash in bounded text chunks within the current Plan Quest; historical reads require a frozen request binding.",
+            description="Read an exact evidence asset version and hash in bounded UTF-8 character chunks within the current Plan Quest. Historical reads require a frozen request binding; offset and limit are measured in characters (not bytes).",
             return_description=(
                 "Check isError on every response before reading a cursor. On error stop the paging loop "
                 "and inspect structuredContent.details for the correction. On success next_offset is "
@@ -893,9 +893,9 @@ def _plan_evidence_operations(
                 "target_commit_ref": _string(max_length=256),
                 "asset_version_ref": _string(max_length=256), "content_hash": _hash_schema(),
                 "role_ref": _string(max_length=256),
-                "offset": {"type": "integer", "minimum": 0},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 32768},
-            }, "required": ["target_commit_ref", "asset_version_ref", "content_hash", "role_ref", "offset", "limit"], "additionalProperties": False},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 32768, "default": 8192},
+            }, "required": ["target_commit_ref", "asset_version_ref", "content_hash", "role_ref"], "additionalProperties": False},
             output_schema={"type": "object", "properties": {
                 "context_pack_ref": _string(), "source_binding": {"type": "object"},
                 "selected_evidence_binding": {"type": "object"},
@@ -936,11 +936,13 @@ def _plan_evidence_request(advancement_engine, agent_runtime, context):
 
 def _read_plan_evidence_page(advancement_engine, agent_runtime, research_graph, context, arguments):
     request = _plan_evidence_request(advancement_engine, agent_runtime, context)
+    offset = arguments.get("offset", 0)
+    limit = arguments.get("limit", 32)
     try:
         page, catalog = research_graph.query_plan_evidence_page(
             quest_ref=request.accepted_question.quest_ref,
             question_ref=request.accepted_question.question_ref,
-            offset=arguments["offset"], limit=arguments["limit"],
+            offset=offset, limit=limit,
         )
     except OwnerConflict as error:
         raise SemanticMcpError(error.code, error.details) from error
@@ -953,8 +955,10 @@ def _read_plan_evidence_page(advancement_engine, agent_runtime, research_graph, 
 
 def _read_plan_evidence_content(advancement_engine, agent_runtime, research_graph, research_memory, context, arguments):
     request = _plan_evidence_request(advancement_engine, agent_runtime, context)
-    if (type(arguments.get("offset")) is not int or arguments["offset"] < 0
-            or type(arguments.get("limit")) is not int or not 1 <= arguments["limit"] <= 32768):
+    offset = arguments.get("offset", 0)
+    limit = arguments.get("limit", 8192)
+    if (type(offset) is not int or offset < 0
+            or type(limit) is not int or not 1 <= limit <= 32768):
         raise SemanticMcpError("plan_evidence_query_invalid")
     def exact(item):
         return (item["target_commit_root_ref"] == arguments["target_commit_ref"]
@@ -983,7 +987,6 @@ def _read_plan_evidence_content(advancement_engine, agent_runtime, research_grap
     if hashlib.sha256(materialized.content).hexdigest() != binding["content_hash"]:
         raise SemanticMcpError("plan_evidence_content_mismatch")
     body = materialized.content.decode("utf-8")
-    offset, limit = arguments["offset"], arguments["limit"]
     next_offset = offset + limit
     from meta_research.target_commit_evidence import target_adoption_binding
     return {
@@ -1088,10 +1091,18 @@ def _reasoning_operations(
             semantic_operation_id="research_memory.reasoning_evidence.read",
             owning_module="research_memory",
             description=(
-                "Read the issuer-frozen literature, Plan, and accepted Target "
-                "evidence inputs for the current Reasoning Run."
+                "Read bounded, paginated issuer-frozen literature, Plan, and accepted Target "
+                "evidence inputs for the current Reasoning Run. Oversized sections include an "
+                "exact stage_context.read reader."
             ),
-            input_schema=_empty_schema(),
+            input_schema=_closed_object(
+                {
+                    "offset": {"type": "integer", "minimum": 0, "default": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 32, "default": 8},
+                    "max_bytes": {"type": "integer", "minimum": 1024, "maximum": 32768, "default": 16384},
+                },
+                required=(),
+            ),
             output_schema=_reasoning_evidence_output_schema(),
             handler=lambda context, arguments: _read_reasoning_evidence(
                 advancement_engine,
@@ -2565,25 +2576,124 @@ def _observe_reasoning_stage_run(
     }
 
 
+def _bounded_reasoning_section(
+    value: object, *, budget: int, context_pack_ref: str, path: list[str]
+) -> tuple[object, bool]:
+    raw = canonical_json(value).encode("utf-8")
+    if len(raw) <= budget:
+        return value, False
+    reader = {
+        "operation": "research_memory.stage_context.read",
+        "context_pack_ref": context_pack_ref,
+        "source": "context_pack",
+        "path": path,
+        "offset": 0,
+        "limit": 8192,
+    }
+    if isinstance(value, dict):
+        return {
+            "summary_only": True,
+            "source_utf8_bytes": len(raw),
+            "field_names": sorted(str(k) for k in list(value)[:16]),
+            "field_count": len(value),
+            "reader": reader,
+        }, True
+    return {
+        "summary_only": True,
+        "source_utf8_bytes": len(raw),
+        "reader": reader,
+    }, True
+
+
 def _read_reasoning_evidence(
     advancement_engine: AdvancementEngineInterface,
     agent_runtime: AgentRuntimeInterface,
     context: SemanticCallContext,
-    _arguments: dict[str, object],
+    arguments: dict[str, object],
 ) -> dict[str, object]:
     request, _run = _reasoning_stage_run(
         advancement_engine, agent_runtime, context
     )
+    offset = arguments.get("offset", 0)
+    limit = arguments.get("limit", 8)
+    max_bytes = arguments.get("max_bytes", 16384)
+    if (
+        type(offset) is not int or offset < 0
+        or type(limit) is not int or not 1 <= limit <= 32
+        or type(max_bytes) is not int or not 1024 <= max_bytes <= 32768
+    ):
+        raise SemanticMcpError("reasoning_evidence_query_invalid")
     pack = request.context_pack
+    section_budget = max(512, max_bytes // 4)
+    lit_value, lit_truncated = _bounded_reasoning_section(
+        pack["question_literature_input"],
+        budget=section_budget,
+        context_pack_ref=request.context_pack_ref,
+        path=["question_literature_input"],
+    )
+    plan_value, plan_truncated = _bounded_reasoning_section(
+        pack["plan_evidence_input"],
+        budget=section_budget,
+        context_pack_ref=request.context_pack_ref,
+        path=["plan_evidence_input"],
+    )
+    all_closures = list(pack["accepted_target_commit_closures"])
+    total_commits = len(all_closures)
+    used_bytes = (
+        len(canonical_json(lit_value).encode("utf-8"))
+        + len(canonical_json(plan_value).encode("utf-8"))
+        + 512
+    )
+    remaining_budget = max(512, max_bytes - used_bytes)
+    page_items: list[object] = []
+    truncated = lit_truncated or plan_truncated
+    consumed = 0
+    for idx, item in enumerate(all_closures[offset : offset + limit]):
+        item_bytes = len(canonical_json(item).encode("utf-8"))
+        if item_bytes <= remaining_budget:
+            page_items.append(item)
+            remaining_budget -= item_bytes + 1
+            consumed += 1
+        elif consumed == 0:
+            summarized, _ = _bounded_reasoning_section(
+                item,
+                budget=max(256, remaining_budget),
+                context_pack_ref=request.context_pack_ref,
+                path=["accepted_target_commit_closures", str(offset + idx)],
+            )
+            page_items.append(summarized)
+            truncated = True
+            consumed += 1
+            break
+        else:
+            truncated = True
+            break
+    next_offset = (
+        offset + consumed if offset + consumed < total_commits else None
+    )
+    if next_offset is not None:
+        truncated = True
     return {
         "status": "current",
         "request_ref": request.request_ref,
         "context_pack_hash": request.context_pack_hash,
-        "question_literature_input": pack["question_literature_input"],
-        "plan_evidence_input": pack["plan_evidence_input"],
-        "accepted_target_commit_closures": pack[
-            "accepted_target_commit_closures"
-        ],
+        "question_literature_input": lit_value,
+        "plan_evidence_input": plan_value,
+        "accepted_target_commit_closures": page_items,
+        "offset": offset,
+        "limit": limit,
+        "total_target_commits": total_commits,
+        "shown_target_commits": len(page_items),
+        "next_offset": next_offset,
+        "truncated": truncated,
+        "exact_reader": {
+            "operation": "research_memory.stage_context.read",
+            "context_pack_ref": request.context_pack_ref,
+            "source": "context_pack",
+            "path": [],
+            "offset": 0,
+            "limit": 8192,
+        },
     }
 
 
@@ -3003,7 +3113,7 @@ def _read_bundle_inbox(
     arguments: dict[str, object],
 ) -> dict[str, object]:
     _verify_bundle_scope(agent_runtime, context)
-    limit = arguments["limit"]
+    limit = arguments.get("limit", 32)
     if (
         not isinstance(limit, int)
         or isinstance(limit, bool)
@@ -3843,6 +3953,23 @@ def _reasoning_evidence_output_schema() -> dict[str, object]:
                 "type": "array",
                 "items": {"type": "object"},
             },
+            "offset": {"type": "integer", "minimum": 0},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 32},
+            "total_target_commits": {"type": "integer", "minimum": 0},
+            "shown_target_commits": {"type": "integer", "minimum": 0},
+            "next_offset": {"type": ["integer", "null"], "minimum": 0},
+            "truncated": {"type": "boolean"},
+            "exact_reader": _closed_object(
+                {
+                    "operation": _string(),
+                    "context_pack_ref": _string(),
+                    "source": _string(),
+                    "path": _string_array(),
+                    "offset": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1},
+                },
+                required=("operation", "context_pack_ref", "source", "path", "offset", "limit"),
+            ),
         },
         required=(
             "status",
@@ -3851,6 +3978,13 @@ def _reasoning_evidence_output_schema() -> dict[str, object]:
             "question_literature_input",
             "plan_evidence_input",
             "accepted_target_commit_closures",
+            "offset",
+            "limit",
+            "total_target_commits",
+            "shown_target_commits",
+            "next_offset",
+            "truncated",
+            "exact_reader",
         ),
     )
 
@@ -3902,8 +4036,8 @@ def _target_frontier_output_schema() -> dict[str, object]:
 
 def _bundle_inbox_input_schema() -> dict[str, object]:
     return _closed_object(
-        {"limit": {"type": "integer", "minimum": 1, "maximum": 128}},
-        required=("limit",),
+        {"limit": {"type": "integer", "minimum": 1, "maximum": 128, "default": 32}},
+        required=(),
     )
 
 

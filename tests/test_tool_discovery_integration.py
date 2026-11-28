@@ -97,6 +97,9 @@ def test_bundle_discovery_tracks_human_wait_and_same_root_resume(tmp_path):
 
             before = _structured(call("tools.catalog.page", {"view": "operations", "limit": 100}))
             before_ids = {item["operation_id"] for item in before["items"]}
+            assert all(not op.endswith(".reconcile") for op in before_ids)
+            before_with_reconcile = _structured(call("tools.catalog.page", {"view": "operations", "include_reconcile": True, "limit": 100}))
+            before_with_reconcile_ids = {item["operation_id"] for item in before_with_reconcile["items"]}
             first_page = _structured(call("tools.catalog.page", {"view": "operations", "limit": 1}))
             assert first_page["next_offset"] == 1
             reader = "research_graph.datasets.page"
@@ -109,7 +112,7 @@ def test_bundle_discovery_tracks_human_wait_and_same_root_resume(tmp_path):
 
             waiting = _structured(call("tools.catalog.page", {"view": "operations", "limit": 100}))
             waiting_ids = {item["operation_id"] for item in waiting["items"]}
-            assert waiting_ids < before_ids
+            assert waiting_ids < before_with_reconcile_ids
             assert {"tools.catalog.page", "tools.contracts.read",
                     "human_request.open.reconcile"} <= waiting_ids
             assert reader not in waiting_ids

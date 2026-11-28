@@ -213,9 +213,12 @@ def test_large_proof_tree_cannot_hide_short_current_research_notes():
         'closure':{'notes':note,'large_proof':{f'field_{i}':'x'*1900 for i in range(400)}}}]}
     digest=canonical_hash(pack)
     view=stage_context_view('reasoning',pack,context_pack_ref='ctx',context_pack_hash=digest)
-    assert view['sections']['upstream_stage_closure'] == pack['upstream_stage_closure']
-    assert 'current_handoff_notes' not in view
-    pointer = {"path": ['upstream_stage_closure','0','closure','notes']}
+    assert view['section_delivery']['upstream_stage_closure'] == 'preview'
+    assert len(canonical_json(view).encode()) <= CONTEXT_VIEW_MAX_BYTES
+    assert view['current_handoff_notes'][0]['source_commit_ref'] == 'commit-current'
+    assert view['current_handoff_notes'][0]['notes']['text'] == note
+    assert view['current_handoff_notes'][0]['notes']['truncated'] is False
+    pointer = view['current_handoff_notes'][0]['reader']
     full=context_read_page(pack,path=pointer['path'],offset=0,limit=16384)
     assert json.loads(full['text'])==note and full['content_hash']==canonical_hash(note)
     assert canonical_hash(pack)==digest
@@ -223,12 +226,14 @@ def test_large_proof_tree_cannot_hide_short_current_research_notes():
 
 @pytest.mark.parametrize('count',[100,1000])
 def test_current_stage_notes_remain_complete_independent_of_optional_view_budget(count):
-    pack={'upstream_stage_closure':[{'stage':'bundle','commit_ref':f'commit_{i:06}',
-        'closure':{'notes':'研究认识与尚缺证据。'*1000}} for i in range(count)]}
+    pack={'plan_evidence_input':{'kind':'accepted','notes':'核心科学计划正文。'*100},
+          'upstream_stage_closure':[{'stage':'bundle','commit_ref':f'commit_{i:06}',
+              'closure':{'notes':'研究认识与尚缺证据。'*1000}} for i in range(count)]}
     digest=canonical_hash(pack)
     view=stage_context_view('reasoning',pack,context_pack_ref='ctx',context_pack_hash=digest)
-    assert view['sections']['upstream_stage_closure'] == pack['upstream_stage_closure']
-    assert len(view['sections']['upstream_stage_closure']) == count
-    assert 'current_handoff_notes' not in view
-    assert len(canonical_json(view).encode()) > CONTEXT_VIEW_MAX_BYTES
+    assert view['section_delivery']['plan_evidence_input'] == 'complete'
+    assert view['sections']['plan_evidence_input'] == pack['plan_evidence_input']
+    assert view['section_delivery']['upstream_stage_closure'] == 'preview'
+    assert len(view['current_handoff_notes']) == 3
+    assert len(canonical_json(view).encode()) <= CONTEXT_VIEW_MAX_BYTES
     assert canonical_hash(pack)==digest

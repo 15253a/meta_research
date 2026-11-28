@@ -1265,9 +1265,10 @@ def _verify_candidate(
     bindings = _binding_map(candidate.held_fixed_bindings)
     if set(bindings) != expected_slots:
         raise BundleTargetContractError("candidate_held_fixed_binding_incomplete")
-    _ref(
-        candidate.implementation_revision_ref, "ImplementationRevisionRef"
-    )
+    if candidate.implementation_revision_ref is not None:
+        _ref(
+            candidate.implementation_revision_ref, "ImplementationRevisionRef"
+        )
     route_refs = tuple(route.route_ref for route in candidate.routes)
     if not route_refs or len(route_refs) != len(set(route_refs)):
         raise BundleTargetContractError("candidate_routes_incomplete")
@@ -1357,8 +1358,17 @@ def _verify_acyclic(candidates: Mapping[str, TargetCandidate]) -> None:
 
 
 def _candidate_from_dict(value: object) -> TargetCandidate:
-    document = _exact_dict(
-        value, set(_TARGET_CANDIDATE_FIELDS), "target_candidate_invalid"
+    if type(value) is not dict:
+        raise BundleTargetContractError("target_candidate_invalid")
+    allowed = set(_TARGET_CANDIDATE_FIELDS)
+    if "implementation_revision_ref" not in value:
+        allowed.remove("implementation_revision_ref")
+    document = _exact_dict(value, allowed, "target_candidate_invalid")
+    raw_impl = document.get("implementation_revision_ref")
+    impl_ref = (
+        None
+        if raw_impl is None
+        else _ref(raw_impl, "ImplementationRevisionRef")
     )
     return TargetCandidate(
         local_label=_ref(document["local_label"], "Target local label"),
@@ -1372,9 +1382,7 @@ def _candidate_from_dict(value: object) -> TargetCandidate:
                 document["held_fixed_bindings"], "held_fixed_bindings"
             )
         ),
-        implementation_revision_ref=_ref(
-            document["implementation_revision_ref"], "ImplementationRevisionRef"
-        ),
+        implementation_revision_ref=impl_ref,
         code_changed=_exact_bool(document["code_changed"], "code_changed"),
         routes=tuple(
             _route_from_dict(item)

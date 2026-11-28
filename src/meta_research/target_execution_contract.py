@@ -155,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error("--check-result needs the exact ProtocolVersion ref, its two key lists, and a valid result_schema_ref if supplied")
 
-    from meta_research.formal_entities import check_primary_metric_keys
+    from meta_research.formal_entities import _declared_work, check_primary_metric_keys
     from meta_research.target_run_finalizer import read_reserved_target_result_draft
 
     details: dict[str, object] = {"protocol_version_ref": protocol.pop("protocol_version_ref")}
@@ -164,15 +164,74 @@ def main(argv: list[str] | None = None) -> int:
         draft = read_reserved_target_result_draft(Path.cwd())
         details["draft_sha256"] = draft.raw_sha256
         content = draft.document.as_dict()
-        check = check_primary_metric_keys(content, **protocol)
-        status = "keys_match" if check.conforms else "metric_key_mismatch"
-        details.update(
-            status="no_completed_assessment" if check.run_only else status,
-            run_key=check.run_key,
-            attempt_key=check.attempt_key,
-            missing_metric_keys=list(check.missing_keys),
-            unexpected_metric_keys=list(check.unexpected_keys),
-        )
+        work = _declared_work(content)
+        check = check_primary_metric_keys(content, work=work, **protocol)
+        required_keys = set(protocol["required_metric_keys"])
+        allowed_keys = required_keys | set(protocol["optional_metric_keys"])
+        failures: list[dict[str, object]] = []
+        for run, attempt in work:
+            if attempt is None or attempt.get("evaluation_ref") is not None:
+                continue
+            metrics = attempt.get("metrics")
+            if not isinstance(metrics, dict):
+                continue
+            metric_keys = set(metrics)
+            missing = sorted(required_keys - metric_keys)
+            unexpected = sorted(metric_keys - allowed_keys)
+            invalid_values = sorted(
+                str(key)
+                for key, value in metrics.items()
+                if not isinstance(key, str) or not valid_target_metric_value(value)
+            )
+            if missing or unexpected or invalid_values:
+                entry: dict[str, object] = {
+                    "run_key": run["run_key"],
+                    "attempt_key": attempt["attempt_key"],
+                    "missing_metric_keys": missing,
+                    "unexpected_metric_keys": unexpected,
+                }
+                if invalid_values:
+                    entry["invalid_metric_values"] = invalid_values
+                failures.append(entry)
+        if check.run_only and not failures:
+            details.update(
+                status="no_completed_assessment",
+                run_key=check.run_key,
+                attempt_key=check.attempt_key,
+                missing_metric_keys=[],
+                unexpected_metric_keys=[],
+            )
+        elif not failures:
+            details.update(
+                status="keys_match",
+                run_key=check.run_key,
+                attempt_key=check.attempt_key,
+                missing_metric_keys=[],
+                unexpected_metric_keys=[],
+            )
+        else:
+            key_failures = [
+                item
+                for item in failures
+                if item["missing_metric_keys"] or item["unexpected_metric_keys"]
+            ]
+            if key_failures:
+                chosen_status = "metric_key_mismatch"
+                primary_fail = key_failures[0]
+            else:
+                chosen_status = "metric_value_invalid"
+                primary_fail = failures[0]
+            details.update(
+                status=chosen_status,
+                run_key=primary_fail["run_key"],
+                attempt_key=primary_fail["attempt_key"],
+                missing_metric_keys=primary_fail["missing_metric_keys"],
+                unexpected_metric_keys=primary_fail["unexpected_metric_keys"],
+            )
+            if primary_fail.get("invalid_metric_values"):
+                details["invalid_metric_values"] = primary_fail["invalid_metric_values"]
+            if len(work) > 1 or len(failures) > 1:
+                details["failing_evaluations"] = failures
         if expected_schema is not None and draft.document.schema_ref is not None:
             try:
                 check_copied_target_identity(content, "schema_ref", expected_schema)

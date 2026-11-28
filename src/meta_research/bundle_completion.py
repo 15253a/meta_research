@@ -155,10 +155,11 @@ def _verify_candidate(
         raise BundleProtocolError(
             "Target candidate does not bind every held-fixed slot exactly once"
         )
-    _require_ref(
-        candidate.implementation_revision_ref,
-        "ImplementationRevisionRef",
-    )
+    if candidate.implementation_revision_ref is not None:
+        _require_ref(
+            candidate.implementation_revision_ref,
+            "ImplementationRevisionRef",
+        )
 
     route_refs = tuple(route.route_ref for route in candidate.routes)
     if not route_refs or len(route_refs) != len(set(route_refs)):

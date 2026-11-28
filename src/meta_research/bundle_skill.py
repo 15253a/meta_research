@@ -1323,10 +1323,10 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
         raise BundleSkillUnavailable("codex_operation_spool_invalid")
 
     def _terminal_contract_checkpoint(self, *, marker, operation_name, failure_code,
-            detail_code, verified_native_session_ref):
+            detail_code, verified_native_session_ref, detail_path: str | None = None):
         checkpoint = super()._terminal_contract_checkpoint(marker=marker,
             operation_name=operation_name, failure_code=failure_code, detail_code=detail_code,
-            verified_native_session_ref=verified_native_session_ref)
+            verified_native_session_ref=verified_native_session_ref, detail_path=detail_path)
         if (operation_name.startswith(("dispatch-", "target-batch-"))
                 and self._is_reconciliation_operation_name(operation_name)
                 and isinstance(verified_native_session_ref, str) and verified_native_session_ref):
@@ -2503,7 +2503,7 @@ def _formal_target_candidate_schema(
                         "uniqueItems": True,
                         "items": _held_fixed_binding_schema(),
                     },
-                    "implementation_revision_ref": text,
+                    "implementation_revision_ref": {"anyOf": [{"type": "null"}, text]},
                     "code_changed": {"type": "boolean"},
                     "routes": {
                         "type": "array",

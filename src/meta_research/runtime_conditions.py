@@ -509,9 +509,17 @@ def resume_runtime_conditions(conditions: str, previous: tuple[str, ...], *, ord
         if changed or removed:
             lines.append("工作目录授权更新=" + json.dumps({"directories": current_directories,
                 "removed_workspace_refs": removed}, ensure_ascii=False, separators=(",", ":")))
-    prior_mounted_lists = [mounted for _, _, mounted in observed if mounted is not None]
+    current_mounted_page = _mounted_materials_page_from_conditions(conditions)
+    observed_mounted_pages = [_mounted_materials_page_from_conditions(value) for value in previous]
+    prior_mounted_entries = [
+        (mounted, page)
+        for (_, _, mounted), page in zip(observed, observed_mounted_pages)
+        if mounted is not None
+    ]
     if ordered:
-        prior_mounted_lists = prior_mounted_lists[:1]
+        prior_mounted_entries = prior_mounted_entries[:1]
+    prior_mounted_lists = [mounted for mounted, _ in prior_mounted_entries]
+    prior_mounted_pages = [page for _, page in prior_mounted_entries]
     if current_mounted is not None or prior_mounted_lists:
         current_list = current_mounted or []
         current_by_ref = {item["reference_ref"]: item for item in current_list}
@@ -519,11 +527,21 @@ def resume_runtime_conditions(conditions: str, previous: tuple[str, ...], *, ord
         changed = [item for item in current_list
                    if not prior_mounted_lists or any(item not in mounted for mounted in prior_mounted_lists)]
         removed = sorted(known_refs - current_by_ref.keys())
-        if changed or removed:
-            lines.append("挂载材料授权更新=" + json.dumps({
+        has_page_info = current_mounted_page is not None or any(
+            page is not None for page in prior_mounted_pages
+        )
+        page_changed = has_page_info and (
+            not prior_mounted_pages
+            or any(page != current_mounted_page for page in prior_mounted_pages)
+        )
+        if changed or removed or page_changed:
+            payload: dict[str, object] = {
                 "mounted_materials": current_list,
                 "removed_reference_refs": removed,
-            }, ensure_ascii=False, separators=(",", ":")))
+            }
+            if has_page_info:
+                payload["mounted_materials_page"] = current_mounted_page
+            lines.append("挂载材料授权更新=" + json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     return "\n".join(lines)
 
 
@@ -553,6 +571,23 @@ def _runtime_prompt_values(conditions):
         elif "Work directories: " in line:
             directories = json.loads(line.split("Work directories: ", 1)[1])
     return values, directories, mounted
+
+
+_MOUNTED_MATERIALS_PAGE_MARKER = "Mounted server materials page: "
+
+
+def _mounted_materials_page_from_conditions(conditions: str) -> dict[str, object] | None:
+    page = None
+    for line in conditions.splitlines():
+        if line.startswith(_MOUNTED_MATERIALS_PAGE_MARKER):
+            page = json.loads(line.split(_MOUNTED_MATERIALS_PAGE_MARKER, 1)[1])
+        elif line.startswith("挂载材料授权更新="):
+            parsed = json.loads(line.split("=", 1)[1])
+            if "mounted_materials_page" in parsed:
+                page = parsed["mounted_materials_page"]
+            else:
+                page = None
+    return page
 
 
 def split_runtime_prompt(prompt: str) -> tuple[str, str]:

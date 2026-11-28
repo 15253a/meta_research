@@ -144,8 +144,8 @@ class _EmptyCurrentTargetAccountingPlanSkill(_DeterministicPlanSkill):
         return _with_derived_answer_contract_hash(document, request)
 
 
-def test_formal_plan_rejects_unaccounted_current_target_commit(tmp_path, monkeypatch):
-    """A new accounting ledger cannot silently omit a current TargetCommit."""
+def test_formal_plan_accepts_partial_current_target_accounting(tmp_path, monkeypatch):
+    """Partial evidence_accounting is allowed when selected_evidence_bindings are valid."""
 
     authority = _LaterPageAuthority()
     plan = _OmittedCurrentTargetPlanSkill()
@@ -175,26 +175,20 @@ def test_formal_plan_rejects_unaccounted_current_target_commit(tmp_path, monkeyp
             lambda **_values: current_catalog,
         )
         _finish_idea_stage(runtime)
-        decision = None
         for _step in range(16):
             runtime.plan_stage.process_once()
             current = runtime.plan_stage.query_current()
-            acceptance = current["plan_acceptance"]
-            if acceptance["domain"]["status"] == "rejected":
-                decision = acceptance
+            if current["stage_commit"] is not None:
                 break
-        assert decision is not None
-        assert decision["domain"]["reason"]["code"] == (
-            "plan_evidence_accounting_incomplete"
-        )
-        assert runtime.plan_stage.query_current()["stage_commit"] is None
-        assert runtime.bundle_stage.query_current()["stage_run_request"] is None
+        current = runtime.plan_stage.query_current()
+        assert current["plan_acceptance"]["domain"]["status"] == "accepted"
+        assert current["stage_commit"] is not None
     finally:
         runtime.close()
 
 
-def test_formal_plan_rejects_empty_current_target_accounting(tmp_path, monkeypatch):
-    """An explicit empty ledger cannot hide a discovered TargetCommit."""
+def test_formal_plan_accepts_empty_current_target_accounting(tmp_path, monkeypatch):
+    """An explicit empty evidence_accounting ledger is optional under Wave 1B."""
 
     authority = _LaterPageAuthority()
     plan = _EmptyCurrentTargetAccountingPlanSkill()
@@ -218,20 +212,14 @@ def test_formal_plan_rejects_empty_current_target_accounting(tmp_path, monkeypat
             lambda **_values: [current_entry],
         )
         _finish_idea_stage(runtime)
-        decision = None
         for _step in range(16):
             runtime.plan_stage.process_once()
             current = runtime.plan_stage.query_current()
-            acceptance = current["plan_acceptance"]
-            if acceptance["domain"]["status"] == "rejected":
-                decision = acceptance
+            if current["stage_commit"] is not None:
                 break
-        assert decision is not None
-        assert decision["domain"]["reason"]["code"] == (
-            "plan_evidence_accounting_incomplete"
-        )
-        assert runtime.plan_stage.query_current()["stage_commit"] is None
-        assert runtime.bundle_stage.query_current()["stage_run_request"] is None
+        current = runtime.plan_stage.query_current()
+        assert current["plan_acceptance"]["domain"]["status"] == "accepted"
+        assert current["stage_commit"] is not None
     finally:
         runtime.close()
 

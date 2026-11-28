@@ -75,7 +75,7 @@ notes 先交代当前认识、本轮变化或认识未变的原因、主要未�
 
 委派原生独立子智能体检查完整草稿与关键原文，核对来源、结论、全局取舍是否有据，以及抽象关系是否被误作已证因果；同时检查：即使当前结论成立，拟选下一步是否仍值得优先投入，是否遗漏有依据的竞争方向或会改变选择的信息。审阅者提出实质异议及依据；没有发现问题时如实反馈，不为不同意见制造替代路线。根根据自由格式反馈和自身判断核实并修订最终内容，保留实际未解决的分歧；没有具体问题也可改稿。同根自查不替代独立审阅，Owner 绑定内容 hash 并校验科研来源，不要求审查表单、审阅者身份证明或批准记录。
 
-最终 transition 恰为 `NextCycleProposal | CandidateCompletion` 一项。前者选择已接纳且 present／open 的 Question／Anchor，给出合法入口、精确 skip basis 与非空 `cycle_focus`；等待外部条件时明确触发条件，并沿现有 HumanRequest／Owner 路径处理，不用重复 Cycle 轮询同一障碍。若等待使后继尚不能合理决定，保留待输入或具体阻塞，沿原根接续；唯一 transition 的要求适用于实际最终提交，不要求等待中交出虚构的后继。后者不含 `cycle_focus`，须有 Quest 整体目标和里程碑依据，并经人类明确确认及 Owner 接纳。字段与准确来源合同见语义契约。
+最终 transition 恰为 `NextCycleProposal | CandidateCompletion` 一项。前者选择已接纳且 present／open 的 Question／Anchor，给出合法入口、精确 skip basis 与非空 `cycle_focus`；等待外部条件时明确触发条件，并沿现有 HumanRequest／Owner 路径处理，不用重复 Cycle 轮询同一障碍。若等待使后继尚不能合理决定，保留待输入或具体阻塞，沿原根接续；唯一 transition 的要求适用于实际最终提交，不要求等待中交出虚构的后继。后者不含 `cycle_focus`，须有 Quest 整体目标和里程碑依据；需要人类审批 Quest 收口时，直接提交 `CandidateCompletion`（由系统自动触发人类完成确认与 Owner 接纳），切勿先调用 `human_request.open` 请求审批而将本会话挂起死锁。字段与准确来源合同见语义契约。
 
 提交前按语义契约核对实际采用的引用及各问题影响，输出一份简短、完整闭合的 JSON。收到截断、引用或身份冲突反馈时，在同一会话回到指出的精确对象修正后重新提交完整结果，不沿未闭合字符串继续重复引用或拼接多份结果。
 

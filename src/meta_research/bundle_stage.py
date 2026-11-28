@@ -814,10 +814,17 @@ class BundleStageWorker:
                     self._observation = BundleObservation("waiting", "bundle_strategy_incomplete")
                     return False
                 if error.code in BASELINE_METHOD_REJECTION_FEEDBACK:
+                    detail_path = (
+                        str(error.details["path"])
+                        if isinstance(error.details, dict)
+                        and isinstance(error.details.get("path"), str)
+                        else None
+                    )
                     return self._correct_rolling_result(
                         run=run, unit_ref=batch_unit_ref, job_ref=batch_operation_ref,
                         operation_name=f"target-batch-{graph.head_generation + 1}",
                         native_session_ref=pending.native_session_ref, detail_code=error.code,
+                        detail_path=detail_path,
                     )
                 raise
             self._observation = BundleObservation("ready")
@@ -3321,6 +3328,7 @@ class BundleStageWorker:
 
     def _correct_rolling_result(
         self, *, run, unit_ref, job_ref, operation_name, native_session_ref, detail_code,
+        detail_path: str | None = None,
     ) -> bool:
         """Correct a retained rolling output through its original Root Session."""
         self._agent_runtime.begin_provider_unit(
@@ -3333,6 +3341,7 @@ class BundleStageWorker:
                 unit_ref=unit_ref, run=run, job_ref=job_ref, operation_name=operation_name,
                 native_session_ref=native_session_ref,
                 failure_code="bundle_review_result_contract_invalid", detail_code=detail_code,
+                detail_path=detail_path,
             )
             self._observation = BundleObservation("ready") if corrected else BundleObservation("failure", detail_code)
             return corrected
@@ -3356,6 +3365,7 @@ class BundleStageWorker:
         native_session_ref: str,
         failure_code: str,
         detail_code: str,
+        detail_path: str | None = None,
     ) -> bool:
         """Preserve the non-completion rolling-operation failure path."""
 
@@ -3368,13 +3378,25 @@ class BundleStageWorker:
             if run.native_session_ref is None:
                 raise BundleSkillUnavailable("codex_operation_reconciliation_pending")
             return False
-        checkpoint = checkpoint_factory(
-            job_ref=job_ref,
-            operation_name=operation_name,
-            native_session_ref=native_session_ref,
-            failure_code=failure_code,
-            detail_code=detail_code,
-        )
+        checkpoint_kwargs: dict[str, object] = {
+            "job_ref": job_ref,
+            "operation_name": operation_name,
+            "native_session_ref": native_session_ref,
+            "failure_code": failure_code,
+            "detail_code": detail_code,
+        }
+        if detail_path is not None:
+            import inspect
+
+            try:
+                params = inspect.signature(checkpoint_factory).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "detail_path" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            ):
+                checkpoint_kwargs["detail_path"] = detail_path
+        checkpoint = checkpoint_factory(**checkpoint_kwargs)
         if not isinstance(checkpoint, dict):
             raise BundleSkillUnavailable(
                 "codex_contract_failure_checkpoint_invalid"

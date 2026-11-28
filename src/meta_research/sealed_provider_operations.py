@@ -464,17 +464,24 @@ def native_session_unavailable(directory, marker, native_session_ref):
 
 
 def _provider_terminal_contract_checkpoint(
-    marker: dict[str, object], failure_code: str, detail_code: str
+    marker: dict[str, object],
+    failure_code: str,
+    detail_code: str,
+    *,
+    detail_path: str | None = None,
 ) -> dict[str, object]:
     checkpoint = hard_ceiling_checkpoint(marker)
     if checkpoint.get("termination_reason") != "completed":
         raise ProviderOperationUnavailable("codex_operation_spool_invalid")
-    return {
+    payload: dict[str, object] = {
         **checkpoint,
         "schema_ref": "meta-research/provider-terminal-contract-failure/v1",
         "contract_failure_code": failure_code,
         "contract_failure_detail_code": detail_code,
     }
+    if isinstance(detail_path, str) and detail_path.strip():
+        payload["contract_failure_detail_path"] = detail_path.strip()
+    return payload
 
 
 def completed_native_inputs(workspace: Path, native_session_ref: str, *, key: bytes,

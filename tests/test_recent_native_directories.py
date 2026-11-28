@@ -48,6 +48,6 @@ def test_native_paths_follow_the_foregrounds_three_cycle_window(tmp_path):
     assert changed['removed_workspace_refs'] == [cycles['previous2'][1].workspace_ref]
     assert {row['workspace_ref'] for row in changed['directories']} == {
         item.workspace_ref for cycle in ('now', 'previous1') for item in cycles[cycle]}
-    assert all(set(row) == {'workspace_ref', 'work_ref', 'root_kind', 'quest_ref', 'cycle_ref',
-                            'directory', 'access'} for row in changed['directories'])
+    assert all(set(row) == {'workspace_ref', 'work_ref', 'root_kind', 'workspace_kind', 'quest_ref', 'cycle_ref',
+                            'directory', 'access', 'purpose'} for row in changed['directories'])
     assert resume_runtime_conditions(current_prompt, (update, previous), ordered=True) == ''

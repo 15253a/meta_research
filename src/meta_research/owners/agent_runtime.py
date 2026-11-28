@@ -9882,6 +9882,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
             if not isinstance(provider_exit, dict):
                 raise OwnerConflict("stage_provider_feedback_invalid")
             code = provider_exit.get("contract_failure_detail_code")
+            detail_path = provider_exit.get("contract_failure_detail_path")
+            path_prefix = (
+                f"{detail_path}: "
+                if isinstance(detail_path, str) and detail_path.strip()
+                else ""
+            )
             return {
                 "safe_point_ref": row.safe_point_ref,
                 "rejected_attempt_ref": row.attempt_ref,
@@ -9894,7 +9900,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin, GuidanceRuntimeMixin):
                     + "; continue the exact work in the same native session. Native error: "
                     + canonical_json(provider_exit["native_error"])
                     + ". Reconcile original external effects before repeating them."
-                    if provider_exit.get("schema_ref") == "meta-research/provider-native-turn-terminal/v1" else {
+                    if provider_exit.get("schema_ref") == "meta-research/provider-native-turn-terminal/v1" else path_prefix + {
                     **BASELINE_METHOD_REJECTION_FEEDBACK,
                     "protocol_metric_sets_overlap": METRIC_SET_REPAIR,
                     "bundle_propose_targets_replan_basis_not_null": (
@@ -27535,7 +27541,9 @@ def _bundle_report_target_evidence(
                 ),
                 expected_review_scopes=context.review_scopes,
                 expected_initial_implementation_revision_ref=(
-                    "goal-work-disposition"
+                    handoff.terminal.implementation_revision_ref
+                    if root_completion
+                    else "goal-work-disposition"
                     if goal_disposition or root_interruption
                     else context.candidate.implementation_revision_ref
                 ),
@@ -30236,6 +30244,15 @@ def _validated_stage_provider_hard_ceiling(
         expected_fields.update(
             {"contract_failure_code", "contract_failure_detail_code"}
         )
+        if "contract_failure_detail_path" in provider_exit:
+            raw_detail_path = provider_exit.get("contract_failure_detail_path")
+            if (
+                not isinstance(raw_detail_path, str)
+                or not 1 <= len(raw_detail_path.strip()) <= 512
+                or any(char in raw_detail_path for char in ("\x00", "\r", "\n"))
+            ):
+                raise OwnerConflict("stage_provider_hard_ceiling_invalid")
+            expected_fields.add("contract_failure_detail_path")
         contract_failure_code = provider_exit.get("contract_failure_code")
         contract_failure_detail_code = provider_exit.get(
             "contract_failure_detail_code"
@@ -30265,6 +30282,7 @@ def _validated_stage_provider_hard_ceiling(
         "result_file_hash",
         "contract_failure_code",
         "contract_failure_detail_code",
+        "contract_failure_detail_path",
         "native_session_ref",
     }
     result_hash = provider_exit.get("result_file_hash")

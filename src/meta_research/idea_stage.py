@@ -526,6 +526,15 @@ class IdeaStageWorker:
                 {"invocation_ref": invocation.invocation_ref, "job_ref": job_ref}
             )[:64]
         )
+        creation_understanding = None
+        creation_binding = request.context_pack.get("creation_basis")
+        creation_bases = getattr(self._research_memory, "creation_bases", None)
+        if isinstance(creation_binding, dict) and creation_bases is not None:
+            basis = creation_bases.for_question(
+                current.question.question_ref, current.question.quest_ref
+            )
+            if basis is not None and creation_bases.reference(basis) == creation_binding:
+                creation_understanding = creation_bases.understanding_view(basis)
         skill_request = IdeaSkillRequest(
             native_replacement_context=self._agent_runtime.query_stage_native_replacement_context(
                 run_ref=run.run_ref, attempt_ref=run.attempt_ref, fence_ref=run.fence_ref),
@@ -571,6 +580,7 @@ class IdeaStageWorker:
             replayable_primary_attempts=(
                 run.replayable_primary_attempts if job_ref == base_job_ref else ()
             ),
+            creation_understanding=creation_understanding,
         )
         if run.primary_draft is None:
             try:

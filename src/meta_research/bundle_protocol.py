@@ -341,7 +341,7 @@ class TargetCandidate:
     experiment_keys: Tuple[str, ...]
     measurement_unit_keys: Tuple[str, ...]
     held_fixed_bindings: Tuple[HeldFixedBinding, ...]
-    implementation_revision_ref: str
+    implementation_revision_ref: Optional[str]
     code_changed: bool
     routes: Tuple[RouteSpec, ...]
     depends_on_labels: Tuple[str, ...] = ()

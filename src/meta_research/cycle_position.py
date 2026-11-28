@@ -21,7 +21,9 @@ def validate_cycle_position(position, *, cycle_ref: str) -> None:
         raise ValueError("cycle_position_invalid")
 
 
-def format_cycle_position_line(position, *, stage: str, cycle_ref: str) -> str:
+def format_cycle_position_line(
+    position, *, stage: str, cycle_ref: str, focus_same_as_goal: bool = False
+) -> str:
     if (
         not isinstance(position, dict)
         or position.get("cycle_ref") != cycle_ref
@@ -39,9 +41,10 @@ def format_cycle_position_line(position, *, stage: str, cycle_ref: str) -> str:
         else f"当前 Cycle（{cycle_ref}）"
     )
     focus = position.get("cycle_focus")
-    focus_text = (
-        f"当前 cycle focus 是：‘{focus}’。"
-        if isinstance(focus, str) and focus.strip()
-        else "当前 cycle focus 尚未形成。"
-    )
+    if focus_same_as_goal and isinstance(focus, str) and focus.strip():
+        focus_text = "当前 cycle focus 同本次冻结 Quest Goal。"
+    elif isinstance(focus, str) and focus.strip():
+        focus_text = f"当前 cycle focus 是：‘{focus}’。"
+    else:
+        focus_text = "当前 cycle focus 尚未形成。"
     return f"当前你处于{round_text}的 {label} 阶段。{focus_text}\n"

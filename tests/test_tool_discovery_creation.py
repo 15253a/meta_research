@@ -36,7 +36,11 @@ def test_protected_creation_can_load_its_readers_contract_without_research_grant
             assert 'UTF-8 byte offsets' in contract['returns']
             assert 'content_version_unbound' in contract['errors']['operation_codes']
             catalog = _structured(call('tools.catalog.page', {'view': 'operations'}))
-            assert {item['operation_id'] for item in catalog['items']} == set(access.operation_ids)
+            assert {item['operation_id'] for item in catalog['items']} == {
+                op for op in access.operation_ids if not op.endswith('.reconcile')
+            }
+            all_catalog = _structured(call('tools.catalog.page', {'view': 'all_contracts'}))
+            assert {item['operation_id'] for item in all_catalog['items']} == set(access.operation_ids)
             assert call('tools.contracts.read', {
                 'operation_id': 'research_graph.datasets.register',
             })['structuredContent']['code'] == 'capability_unavailable'
