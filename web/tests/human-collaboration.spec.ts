@@ -1160,10 +1160,9 @@ test("the HumanRequest surface keeps raw Agent requests across six categories an
   await expect(dialog).toBeVisible();
   const categories = dialog.getByRole("navigation", { name: "求助类别" });
   const category = (name: string) => categories.getByRole("button", { name: new RegExp(name) });
-  await expect(categories.getByRole("button")).toHaveCount(6);
-  await expect(category("研究延时")).toBeVisible();
-  await expect(category("研究延时")).toBeDisabled();
-  await expect(category("图书馆重连")).toHaveAttribute("aria-current", "page");
+  await expect(categories.getByRole("button")).toHaveCount(5);
+  await expect(category("预算调整")).toHaveCount(0);
+  await expect(category("图书馆访问")).toHaveAttribute("aria-current", "page");
   await expect(dialog.getByRole("heading", {
     name: "恢复当前图书馆会话，或选择合法全文替代路线。",
   })).toBeVisible();
@@ -1175,7 +1174,7 @@ test("the HumanRequest surface keeps raw Agent requests across six categories an
   await expect(dialog).not.toContainText("不要粘贴密码");
   await expect(dialog.getByText("Human Waiting Projection", { exact: true })).toHaveCount(0);
   await expect(dialog.getByText(
-    "选择助手说明或工作空间中的产物后，在正式回应区明确提交，才会交回本请求原根。",
+    "这里的交流不会自动提交回应；勾选助手说明后，请在左侧正式回应区确认提交。",
     { exact: true },
   )).toBeVisible();
   const libraryDraft = dialog.getByLabel("就图书馆恢复事项发消息");
@@ -1208,8 +1207,8 @@ test("the HumanRequest surface keeps raw Agent requests across six categories an
     },
   });
 
-  await category("线上获取").click();
-  await expect(category("线上获取")).toHaveAttribute("aria-current", "page");
+  await category("外部材料或 API").click();
+  await expect(category("外部材料或 API")).toHaveAttribute("aria-current", "page");
   await expect(dialog.getByRole("heading", {
     name: "本人完成外部材料申请并交回批准结果。",
   })).toBeVisible();
@@ -1242,8 +1241,8 @@ test("the HumanRequest surface keeps raw Agent requests across six categories an
   await expect(dialog.getByRole("heading", { name: "回应已提交" })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "提交", exact: true })).toHaveCount(0);
 
-  await category("现实世界操作").click();
-  await expect(category("现实世界操作")).toHaveAttribute("aria-current", "page");
+  await category("线下操作").click();
+  await expect(category("线下操作")).toHaveAttribute("aria-current", "page");
   await expect(dialog.getByRole("heading", {
     name: "按已接纳协议完成线下校准并交回原始结果。",
   })).toBeVisible();
@@ -1266,8 +1265,8 @@ test("the HumanRequest surface keeps raw Agent requests across six categories an
   expect(assetIntakes).toHaveLength(0);
   await expect(dialog.getByRole("button", { name: "提交", exact: true })).toHaveCount(0);
 
-  await category("执行能力授权").click();
-  await expect(category("执行能力授权")).toHaveAttribute("aria-current", "page");
+  await category("低频权限").click();
+  await expect(category("低频权限")).toHaveAttribute("aria-current", "page");
   await expect(dialog.getByRole("heading", {
     name: "决定是否允许当前 Run 访问一个新增外部目的地。",
   })).toBeVisible();
@@ -1322,8 +1321,8 @@ test("the HumanRequest surface keeps raw Agent requests across six categories an
   await expect(dialog.getByRole("heading", { name: "回应已提交" })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "提交授权回应" })).toHaveCount(0);
 
-  await category("系统故障协助").click();
-  await expect(category("系统故障协助")).toHaveAttribute("aria-current", "page");
+  await category("系统操作协助").click();
+  await expect(category("系统操作协助")).toHaveAttribute("aria-current", "page");
   await expect(dialog.getByRole("heading", {
     name: "重试失败的助手操作：https://status.example.invalid/run-219",
   })).toBeVisible();
@@ -1371,6 +1370,7 @@ test("the HumanRequest surface keeps raw Agent requests across six categories an
     .toBeVisible();
   await expect(dialog.getByRole("button", { name: "重试", exact: true })).toBeVisible();
   await dialog.getByRole("button", { name: "重试", exact: true }).click();
+  await expect(dialog.locator(".hc-response-boundary")).toHaveClass(/hc-response-boundary--success/);
   await expect(dialog.locator(".hc-response-boundary b")).toHaveText("原任务已收到重试请求");
   await expect(dialog.getByRole("button", { name: "重试", exact: true })).toHaveCount(0);
 });
@@ -1805,7 +1805,8 @@ test("a selected request keeps its receipt after becoming non-open with another 
   await expect(dialog).toContainText("已回应，未满足");
   await expect(dialog.getByRole("heading", { name: "按已接纳协议完成线下校准并交回原始结果。" })).toBeVisible();
   await expect(dialog).toContainText("original-unsatisfied");
-  await expect(dialog).toContainText("提交不表示原根已恢复");
+  await expect(dialog.locator(".hc-response-boundary")).toHaveClass(/hc-response-boundary--warning/);
+  await expect(dialog).toContainText("当前条件尚未完全满足，相关任务暂未恢复");
 });
 
 test("a new HumanRequest does not interrupt a formal creation window", async ({ page }) => {
@@ -2037,7 +2038,7 @@ test("HumanRequest deep links select the exact route and keep the background ine
   await expect(page).toHaveURL(/\?panel=human-request$/);
 });
 
-test("the HumanRequest workspace puts assistant work first and preserves overflow at 1440/800/390", async ({
+test("the HumanRequest workspace puts primary action first with collapsible dialogue and preserves overflow at 1440/800/390", async ({
   page,
 }, testInfo) => {
   await installHumanCollaborationSnapshot(page);
@@ -2066,19 +2067,25 @@ test("the HumanRequest workspace puts assistant work first and preserves overflo
   });
 
   const desktop = await regions();
-  expect(desktop.draft.x + desktop.draft.width).toBeLessThanOrEqual(desktop.core.x + 1);
-  expect(desktop.draft.width).toBeGreaterThan(desktop.core.width);
+  expect(desktop.core.x + desktop.core.width).toBeLessThanOrEqual(desktop.draft.x + 1);
+  expect(desktop.core.width).toBeGreaterThan(desktop.draft.width);
   expect(desktop.pageWidth).toBeLessThanOrEqual(desktop.viewportWidth);
+
+  const dialogueToggle = dialog.locator(".hc-dialogue-toggle");
+  await dialogueToggle.click();
+  await expect(dialog.locator(".hc-request-draft")).toBeHidden();
+  await dialogueToggle.click();
+  await expect(dialog.locator(".hc-request-draft")).toBeVisible();
 
   await page.setViewportSize({ width: 800, height: 900 });
   const tablet = await regions();
-  expect(tablet.core.y).toBeGreaterThanOrEqual(tablet.draft.y + tablet.draft.height - 1);
+  expect(tablet.draft.y).toBeGreaterThanOrEqual(tablet.core.y + tablet.core.height - 1);
   expect(tablet.pageWidth).toBeLessThanOrEqual(tablet.viewportWidth);
   await page.screenshot({ path: testInfo.outputPath("human-request-v4-800.png") });
 
   await page.setViewportSize({ width: 390, height: 844 });
   const mobile = await regions();
-  expect(mobile.core.y).toBeGreaterThanOrEqual(mobile.draft.y + mobile.draft.height - 1);
+  expect(mobile.draft.y).toBeGreaterThanOrEqual(mobile.core.y + mobile.core.height - 1);
   expect(mobile.pageWidth).toBeLessThanOrEqual(mobile.viewportWidth);
   await page.screenshot({ path: testInfo.outputPath("human-request-v4-390.png") });
   await page.keyboard.press("Escape");
@@ -2164,7 +2171,7 @@ test("human request Draft streams before its snapshot and keeps request conversa
   await expect(dialog.locator(".hc-draft-transcript")).toContainText("事项正式完整回答。");
   await expect(dialog.getByText("正在回复…", { exact: true })).toHaveCount(0);
   await dialog.getByRole("navigation", { name: "求助类别" })
-    .getByRole("button", { name: /线上获取/ }).click();
+    .getByRole("button", { name: /外部材料或 API/ }).click();
   await expect(dialog.getByLabel("就外部材料事项发消息")).toHaveValue("");
   await expect(dialog.locator(".hc-draft-transcript")).not.toContainText("事项正式完整回答。");
   await expect(dialog.locator(".hc-draft-transcript")).not.toContainText("这个事项请分段解释");

@@ -60,7 +60,7 @@ test("system-help retry keeps the operator note with the exact response after re
   await expect(dialog).toContainText("重试进行中");
   await expect(dialog).toContainText(note);
   await dialog.getByText("查看重试回执").click();
-  await expect(dialog.getByText("retry-receipt", { exact: true })).toBeVisible();
+  await expect(dialog.locator("details", { hasText: "查看重试回执" }).getByText("retry-receipt", { exact: true })).toBeVisible();
 });
 
 test("lost acknowledgement remains unknown and automatically reconciles the sealed original in its window", async ({ page }, testInfo) => {
@@ -143,7 +143,8 @@ test("a late original acknowledgement does not select over another request or cl
   });
   const dialog = await submit(page, "原请求的封存回应");
   await expect(dialog).toContainText("提交结果待确认");
-  await dialog.getByRole("button", { name: /2\. 线上获取/ }).click();
+  const categories = dialog.getByRole("navigation", { name: "求助类别" });
+  await categories.getByRole("button", { name: /外部材料或 API/ }).click();
   await expect(dialog.getByRole("heading", { name: "另一个请求仍待处理" })).toBeVisible();
   const note = dialog.getByRole("textbox", { name: "自然语言回应", exact: true });
   await note.fill("另一请求的新草稿，不可被迟到回执覆盖");
@@ -151,10 +152,10 @@ test("a late original acknowledgement does not select over another request or cl
   release();
   await expect(note).toHaveValue("另一请求的新草稿，不可被迟到回执覆盖");
   await expect(dialog.getByRole("heading", { name: "另一个请求仍待处理" })).toBeVisible();
-  await dialog.getByRole("button", { name: /3\. 现实世界操作/ }).click();
+  await categories.getByRole("button", { name: /线下操作/ }).click();
   await expect(dialog).toContainText("回应已提交");
   expect(attempts[1]).toEqual(attempts[0]);
-  await dialog.getByRole("button", { name: /2\. 线上获取/ }).click();
+  await categories.getByRole("button", { name: /外部材料或 API/ }).click();
   await expect(note).toHaveValue("另一请求的新草稿，不可被迟到回执覆盖");
 });
 

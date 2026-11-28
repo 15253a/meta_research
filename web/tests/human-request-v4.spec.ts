@@ -62,9 +62,9 @@ test("review stays inside its HumanRequest and Escape returns to the editable re
   await expect(outer.getByRole("button", { name: "提交", exact: true })).toBeFocused();
   for (const viewport of [{ width: 1440, height: 900 }, { width: 800, height: 500 }, { width: 390, height: 600 }]) {
     await page.setViewportSize(viewport);
-    await expect(outer.getByRole("navigation", { name: "求助处理阶段" })).toBeVisible();
-    const category = outer.getByRole("navigation", { name: "求助类别" });
-    await expect(category.locator('button[aria-current="page"]')).toBeInViewport({ ratio: 1 });
+    await expect(outer.getByRole("navigation", { name: "求助处理阶段" })).toHaveCount(0);
+    await expect(outer.getByRole("navigation", { name: "求助类别" })).toHaveCount(0);
+    await expect(outer.locator(".hc-dialogue-toggle")).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
     await page.screenshot({ path: testInfo.outputPath(`request-${viewport.width}.png`) });
   }
