@@ -149,6 +149,7 @@ class HarnessAdapterUnavailable(RuntimeError):
         transport_receipt: dict[str, object] | None = None,
         native_session_ref: str | None = None,
         native_terminal_checkpoint: dict[str, object] | None = None,
+        upstream_classification: str | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
@@ -156,6 +157,7 @@ class HarnessAdapterUnavailable(RuntimeError):
         self.transport_receipt = transport_receipt
         self.native_session_ref = native_session_ref
         self.native_terminal_checkpoint = native_terminal_checkpoint
+        self.upstream_classification = upstream_classification
 
 
 class HarnessRunnerOutcomeUnknown(RuntimeError):
@@ -485,17 +487,27 @@ class _NativeCliHarnessAdapter:
         events = _parse_jsonl(completed.stdout)
         native_terminal = getattr(completed, "meta_research_native_terminal_checkpoint", None)
         if isinstance(native_terminal, dict):
+            from meta_research.native_codex_bridge import extract_native_error_classification
+
             raise HarnessAdapterUnavailable("provider_native_turn_" + native_terminal["native_turn_status"],
                 durable_outcome="terminal", native_session_ref=native_terminal["native_session_ref"],
                 transport_receipt=getattr(completed, "meta_research_transport_receipt", None),
-                native_terminal_checkpoint=native_terminal)
+                native_terminal_checkpoint=native_terminal,
+                upstream_classification=extract_native_error_classification(
+                    events, native_error=native_terminal.get("native_error")
+                ))
         if completed.returncode == 75 and any(
             event.get("type") == "meta_research.native_outcome_unknown" for event in events
         ):
+            from meta_research.native_codex_bridge import extract_native_error_classification
+
             raise HarnessAdapterUnavailable("provider_outcome_unknown", durable_outcome="unknown",
                 native_session_ref=_verified_failed_native_session_ref(family=self.family,
-                    events=events, expected_native_session_ref=invocation.native_session_ref))
+                    events=events, expected_native_session_ref=invocation.native_session_ref),
+                upstream_classification=extract_native_error_classification(events))
         if completed.returncode != 0:
+            from meta_research.native_codex_bridge import extract_native_error_classification
+
             receipt = getattr(completed, "meta_research_transport_receipt", None)
             reason = (
                 receipt.get("termination_reason")
@@ -533,6 +545,7 @@ class _NativeCliHarnessAdapter:
                     events=events,
                     expected_native_session_ref=invocation.native_session_ref,
                 ),
+                upstream_classification=extract_native_error_classification(events),
             )
         if not events:
             raise HarnessAdapterUnavailable("provider_stream_invalid",
@@ -570,6 +583,7 @@ class _NativeCliHarnessAdapter:
                         ),
                     )
                 ),
+                upstream_classification=error.upstream_classification,
             ) from error
         root_diagnostics: dict[str, object] | None = None
         if invocation.root_kind is not None:

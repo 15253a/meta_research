@@ -230,10 +230,17 @@ _TARGET_ROOT_HUMAN_REQUEST_CONTINUATION = """\
 
 
 class HarnessAdmissionError(RuntimeError):
-    def __init__(self, code: str, *, next_retry_at: float | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        next_retry_at: float | None = None,
+        upstream_classification: str | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.next_retry_at = next_retry_at
+        self.upstream_classification = upstream_classification
 
     def as_error_contract(self, *, operation_id: str = "harness.admission"):
         return error_contract_from_legacy(
@@ -2136,7 +2143,10 @@ class HarnessRuntime:
             if settled.status == "unknown_outcome":
                 return settled
         except (AgentRuntimeHarnessError, HarnessAdapterUnavailable) as error:
-            raise HarnessAdmissionError(error.code) from error
+            raise HarnessAdmissionError(
+                error.code,
+                upstream_classification=getattr(error, "upstream_classification", None),
+            ) from error
         except OSError as error:
             raise HarnessAdmissionError("provider_terminal_proof_missing") from error
         generation = settled.reconciliation_generation
@@ -2229,8 +2239,11 @@ class HarnessRuntime:
                 raise HarnessAdmissionError(str(getattr(error, "code", "target_run_workspace_unavailable"))) from error
         if resume:
             prior = self._owner.prior_target_inputs(admission.run.run_ref)
-            conditions = resume_runtime_conditions(conditions,
-                tuple(value for text in prior if (value := runtime_conditions_from_prompt(text))), ordered=True)
+            conditions = resume_runtime_conditions(
+                conditions,
+                tuple(value for text in reversed(prior) if (value := runtime_conditions_from_prompt(text))),
+                ordered=True,
+            )
         return compose_runtime_prompt(prompt, conditions)
 
     def _operation_requires_resume(self, request_ref: str) -> bool:
@@ -2358,9 +2371,17 @@ class HarnessRuntime:
                     prompt = target_execution_reading_prompt(prompt, working_directory)
                 external_snapshot = self._external_mcp.operation_snapshot(operation_identity=operation_ref,
                     root_kind="target", task_prompt=prompt)
-                prompt = compose_external_mcp_prompt(prompt, external_snapshot, resume=resume,
-                    previous_prompts=self._owner.prior_target_inputs(admission.run.run_ref) if resume else (),
-                    ordered=True)
+                prompt = compose_external_mcp_prompt(
+                    prompt,
+                    external_snapshot,
+                    resume=resume,
+                    previous_prompts=(
+                        tuple(reversed(self._owner.prior_target_inputs(admission.run.run_ref)))
+                        if resume
+                        else ()
+                    ),
+                    ordered=True,
+                )
             except (ExternalMcpError, ExternalMcpClientError) as error:
                 raise HarnessAdmissionError(error.code) from error
         invocation_material = _turn_invocation_material(
@@ -2531,7 +2552,10 @@ class HarnessRuntime:
                         owner_invocation_hash=operation.invocation_hash,
                     ))
                 except HarnessAdapterUnavailable as error:
-                    raise HarnessAdmissionError(error.code) from error
+                    raise HarnessAdmissionError(
+                        error.code,
+                        upstream_classification=error.upstream_classification,
+                    ) from error
             terminal_replay_only = terminal_replay_only or frozen_prompt is not None
             if frozen_prompt is None and isinstance(request, TargetHarnessRequest):
                 # The Owner records the first input before transport starts.
@@ -2887,6 +2911,7 @@ class HarnessRuntime:
                 next_retry_at=(
                     None if retry is None else retry.next_retry_at
                 ),
+                upstream_classification=error.upstream_classification,
             ) from error
         if isinstance(request, TargetHarnessRequest):
             parked = self._checkpoint_target_root_human_request_session(

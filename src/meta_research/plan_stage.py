@@ -112,12 +112,25 @@ class PlanStageWorker:
         self._research_graph = research_graph
         self._provider = provider
         self._transient_error: str | None = None
+        self._transient_error_classification: str | None = None
         self._provider_cursor_cycle_ref: str | None = None
         self._provider_boundary_attempted: bool = False
 
     @property
     def transient_error(self) -> str | None:
         return self._transient_error
+
+    @property
+    def transient_error_classification(self) -> str | None:
+        return self._transient_error_classification
+
+    def _clear_transient_error(self) -> None:
+        self._transient_error = None
+        self._transient_error_classification = None
+
+    def _set_transient_error_from(self, error: BaseException) -> None:
+        self._transient_error = getattr(error, "code", str(error))
+        self._transient_error_classification = getattr(error, "upstream_classification", None)
 
     def process_once(self) -> bool:
         """Advance recoverable Plan work without requiring a per-Run click."""
@@ -127,9 +140,10 @@ class PlanStageWorker:
             unit_kinds=("plan_primary",),
         ):
             return True
-        self._transient_error = None
+        self._clear_transient_error()
         cycles = list(self._discover_cycles())
         transient_error: str | None = self._transient_error
+        transient_error_classification: str | None = self._transient_error_classification
         if self._provider_cursor_cycle_ref is not None:
             cursor = next(
                 (
@@ -142,7 +156,7 @@ class PlanStageWorker:
             if cursor is not None:
                 cycles = cycles[cursor + 1 :] + cycles[: cursor + 1]
         for current in cycles:
-            self._transient_error = None
+            self._clear_transient_error()
             self._provider_boundary_attempted = False
             try:
                 foreground = self._advancement_engine.query_foreground(
@@ -172,7 +186,11 @@ class PlanStageWorker:
                     break
                 continue
             if self._transient_error is not None:
-                transient_error = transient_error or self._transient_error
+                if transient_error is None:
+                    transient_error = self._transient_error
+                    transient_error_classification = self._transient_error_classification
+                elif transient_error_classification is None and self._transient_error_classification is not None:
+                    transient_error_classification = self._transient_error_classification
             if step.provider_boundary_attempted:
                 self._provider_cursor_cycle_ref = current.cycle_ref
             # A pass is a single durable transaction boundary globally, not
@@ -180,10 +198,16 @@ class PlanStageWorker:
             # the next missing boundary from fresh Owner reads.
             if step.advanced:
                 self._transient_error = transient_error
+                self._transient_error_classification = (
+                    transient_error_classification if transient_error is not None else None
+                )
                 return True
             if step.provider_boundary_attempted:
                 break
         self._transient_error = transient_error
+        self._transient_error_classification = (
+            transient_error_classification if transient_error is not None else None
+        )
         return False
 
     def _process_cycle(self, eligible: _EligiblePlan) -> _CycleStep:
@@ -222,7 +246,7 @@ class PlanStageWorker:
             try:
                 runtime_binding = stage_provider(self._provider, quest_ref=current.question.quest_ref).runtime_binding()
             except PlanSkillUnavailable as error:
-                self._transient_error = error.code
+                self._set_transient_error_from(error)
                 return _CycleStep(False, provider_boundary_attempted=True)
             self._agent_runtime.admit_plan_stage(
                 request,
@@ -454,7 +478,7 @@ class PlanStageWorker:
             provider = stage_provider(self._provider, model_ref=run.runtime_binding.model_ref)
             runtime_binding = provider.runtime_binding()
         except PlanSkillUnavailable as error:
-            self._transient_error = error.code
+            self._set_transient_error_from(error)
             return _CycleStep(False, provider_boundary_attempted=True)
         if not plan_bindings_compatible(runtime_binding, run.runtime_binding):
             self._transient_error = "plan_runtime_binding_drift"
@@ -539,7 +563,7 @@ class PlanStageWorker:
                     unit_kind="plan_primary",
                 )
             except OwnerConflict as error:
-                self._transient_error = error.code
+                self._set_transient_error_from(error)
                 return _CycleStep(False, provider_boundary_attempted=True)
             provider_safe = True
             draft = None
@@ -582,7 +606,7 @@ class PlanStageWorker:
                             detail_code=error.rejected_detail_code,
                         )
                         provider_safe = False
-                        self._transient_error = error.code
+                        self._set_transient_error_from(error)
                         return _CycleStep(
                             True, provider_boundary_attempted=True
                         )
@@ -597,7 +621,7 @@ class PlanStageWorker:
                             fence_ref=run.fence_ref,
                         ),
                     )
-                    self._transient_error = error.code
+                    self._set_transient_error_from(error)
                     return _CycleStep(False, provider_boundary_attempted=True)
                 except RecoverablePlanSkillCandidateError as error:
                     if draft is None:
@@ -694,7 +718,7 @@ class PlanStageWorker:
                 )
                 self._transient_error = "plan_local_result_contract_invalid"
                 return _CycleStep(True)
-            self._transient_error = error.code
+            self._set_transient_error_from(error)
             return _CycleStep(False)
         except RecoverablePlanSkillCandidateError as error:
             if result is None:

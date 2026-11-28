@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import gzip
 import json
 import os
 import re
@@ -33,7 +34,292 @@ def _uuid(value):
 
 # Bound CLI latency for a sweep, independently of research database access.
 # Native deletion and filesystem work never hold the research Owner writer.
-_NATIVE_DELETE_BATCH_SECONDS = 2.0
+_NATIVE_DELETE_BATCH_SECONDS = 60.0
+_CODEX_LOGS_DB_MAX_BYTES = 64 * 1024 * 1024
+_CODEX_LOGS_DB_MAX_ARCHIVES = 2
+
+
+def _other_process_holds_path(path: Path) -> bool:
+    """Return True if another process holds an open file descriptor to ``path`` (Linux POSIX)."""
+    if os.name != "posix":
+        return False
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return False
+    try:
+        target = path.stat()
+    except OSError:
+        return False
+    target_id = (target.st_dev, target.st_ino)
+    target_name = path.name
+    my_pid = str(os.getpid())
+    try:
+        entries = os.listdir(proc)
+    except OSError:
+        return False
+    for pid in entries:
+        if not pid.isdigit() or pid == my_pid:
+            continue
+        fd_dir = proc / pid / "fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            fd_path = fd_dir / fd
+            try:
+                link = os.readlink(fd_path)
+                if target_name not in link:
+                    continue
+                st = os.stat(fd_path)
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) == target_id:
+                return True
+    return False
+
+
+def _codex_logs_db_total_bytes(codex_home: Path) -> int:
+    total = 0
+    for name in ("logs_2.sqlite", "logs_2.sqlite-wal", "logs_2.sqlite-shm"):
+        candidate = codex_home / name
+        try:
+            if candidate.is_file() and not candidate.is_symlink():
+                total += candidate.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _prune_logs_archives(archive_dir: Path, keep: int) -> tuple[int, int]:
+    """Delete oldest archived logs_2 files so at most ``keep`` remain."""
+    if keep < 0 or not archive_dir.is_dir() or archive_dir.is_symlink():
+        return 0, 0
+    archives = sorted(
+        (
+            p
+            for p in archive_dir.iterdir()
+            if p.name.startswith("logs_2.")
+            and (p.name.endswith(".sqlite") or p.name.endswith(".sqlite.gz"))
+            and p.is_file()
+            and not p.is_symlink()
+        ),
+        key=lambda p: p.name,
+    )
+    pruned_count = 0
+    pruned_bytes = 0
+    while len(archives) > keep:
+        victim = archives.pop(0)
+        try:
+            size = victim.stat().st_size
+            victim.unlink()
+            pruned_count += 1
+            pruned_bytes += size
+        except OSError:
+            continue
+    return pruned_count, pruned_bytes
+
+
+def rotate_codex_logs_db(
+    root,
+    *,
+    dry_run: bool,
+    max_bytes: int | None = None,
+    max_archives: int | None = None,
+    protected_paths=(),
+):
+    """Safely checkpoint, archive, and bound Codex's ``logs_2.sqlite`` diagnostic log DB.
+
+    Never touches ``state_5.sqlite`` and never rotates while locked or held open by
+    another process.
+    """
+    codex_home = root.codex_home
+    if codex_home.resolve() != codex_home:
+        raise OSError("unsafe managed Codex home")
+    logs_db = codex_home / "logs_2.sqlite"
+    wal_path = codex_home / "logs_2.sqlite-wal"
+    shm_path = codex_home / "logs_2.sqlite-shm"
+    for candidate in (logs_db, wal_path, shm_path):
+        if candidate.is_symlink() or (candidate.exists() and not candidate.is_file()):
+            return [{
+                "root_kind": "codex_logs_db",
+                "path": str(logs_db),
+                "bytes": 0,
+                "action": "skipped",
+                "reason": "unsafe_codex_logs_db",
+            }]
+    if not logs_db.exists():
+        return []
+    if any(
+        logs_db == origin or origin in logs_db.parents
+        for origin in protected_paths
+    ):
+        return [{
+            "root_kind": "codex_logs_db",
+            "path": str(logs_db),
+            "bytes": 0,
+            "action": "skipped",
+            "reason": "protected_original",
+        }]
+    total_bytes = _codex_logs_db_total_bytes(codex_home)
+    limit_bytes = _CODEX_LOGS_DB_MAX_BYTES if max_bytes is None else max_bytes
+    if total_bytes < limit_bytes:
+        return []
+    if dry_run:
+        return [{
+            "root_kind": "codex_logs_db",
+            "path": str(logs_db),
+            "bytes": total_bytes,
+            "action": "candidate",
+            "reason": "codex_logs_db_rotation_threshold",
+        }]
+    if any(_other_process_holds_path(p) for p in (logs_db, wal_path, shm_path) if p.exists()):
+        return [{
+            "root_kind": "codex_logs_db",
+            "path": str(logs_db),
+            "bytes": total_bytes,
+            "action": "skipped",
+            "reason": "codex_logs_db_in_use",
+        }]
+    # Non-blocking exclusive lock probe, then WAL checkpoint outside a
+    # transaction (an open transaction on our own connection would cause
+    # wal_checkpoint to report busy=1), then switch to DELETE mode so SQLite
+    # itself flushes and removes -wal/-shm sidecars safely.
+    conn = None
+    try:
+        conn = sqlite3.connect(str(logs_db), timeout=0.0, isolation_level=None)
+        conn.execute("PRAGMA busy_timeout = 0")
+        conn.execute("BEGIN EXCLUSIVE")
+        conn.execute("COMMIT")
+        ckpt = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if ckpt is not None and int(ckpt[0]) != 0:
+            return [{
+                "root_kind": "codex_logs_db",
+                "path": str(logs_db),
+                "bytes": total_bytes,
+                "action": "skipped",
+                "reason": "codex_logs_db_busy",
+            }]
+        mode_row = conn.execute("PRAGMA journal_mode = DELETE").fetchone()
+        if mode_row is None or str(mode_row[0]).strip().lower() != "delete":
+            return [{
+                "root_kind": "codex_logs_db",
+                "path": str(logs_db),
+                "bytes": total_bytes,
+                "action": "skipped",
+                "reason": "codex_logs_db_busy",
+            }]
+    except sqlite3.OperationalError:
+        return [{
+            "root_kind": "codex_logs_db",
+            "path": str(logs_db),
+            "bytes": total_bytes,
+            "action": "skipped",
+            "reason": "codex_logs_db_locked",
+        }]
+    except sqlite3.DatabaseError:
+        return [{
+            "root_kind": "codex_logs_db",
+            "path": str(logs_db),
+            "bytes": total_bytes,
+            "action": "skipped",
+            "reason": "codex_logs_db_invalid",
+        }]
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+    if any(_other_process_holds_path(p) for p in (logs_db, wal_path, shm_path) if p.exists()):
+        return [{
+            "root_kind": "codex_logs_db",
+            "path": str(logs_db),
+            "bytes": total_bytes,
+            "action": "skipped",
+            "reason": "codex_logs_db_in_use",
+        }]
+    # After PRAGMA journal_mode = DELETE + conn.close(), SQLite itself must have
+    # removed -wal and -shm. If either remains, another reader/writer is active
+    # or WAL teardown did not complete; abort before os.replace (never unlink
+    # sidecars after os.replace, which could corrupt a newly-created live DB).
+    if wal_path.exists() or shm_path.exists():
+        return [{
+            "root_kind": "codex_logs_db",
+            "path": str(logs_db),
+            "bytes": total_bytes,
+            "action": "skipped",
+            "reason": "wal_sidecar_present",
+        }]
+    archive_dir = codex_home / "logs-archive"
+    if archive_dir.is_symlink() or (archive_dir.exists() and not archive_dir.is_dir()):
+        return [{
+            "root_kind": "codex_logs_db",
+            "path": str(logs_db),
+            "bytes": total_bytes,
+            "action": "skipped",
+            "reason": "unsafe_codex_logs_archive",
+        }]
+    archive_dir.mkdir(mode=0o700, exist_ok=True)
+    if archive_dir.resolve() != archive_dir:
+        return [{
+            "root_kind": "codex_logs_db",
+            "path": str(logs_db),
+            "bytes": total_bytes,
+            "action": "skipped",
+            "reason": "unsafe_codex_logs_archive",
+        }]
+    keep = _CODEX_LOGS_DB_MAX_ARCHIVES if max_archives is None else max(1, int(max_archives))
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    stem = f"logs_2.{stamp}-{time.time_ns() % 1_000_000_000:09d}"
+    staged = archive_dir / f"{stem}.sqlite"
+    os.replace(logs_db, staged)
+    final_archive = staged
+    gz_tmp = archive_dir / f".{stem}.sqlite.gz.tmp"
+    gz_path = archive_dir / f"{stem}.sqlite.gz"
+    try:
+        with staged.open("rb") as src, gzip.open(gz_tmp, "wb", compresslevel=1) as dst:
+            while chunk := src.read(256 * 1024):
+                dst.write(chunk)
+        os.replace(gz_tmp, gz_path)
+        staged.unlink()
+        final_archive = gz_path
+    except OSError:
+        try:
+            if gz_tmp.exists():
+                gz_tmp.unlink()
+        except OSError:
+            pass
+    # Clean up stale orphan temp files left behind by any prior interrupted gzip pass
+    for orphan in archive_dir.iterdir():
+        if (
+            orphan.name.startswith(".logs_2.")
+            and orphan.name.endswith(".tmp")
+            and orphan.is_file()
+            and not orphan.is_symlink()
+        ):
+            try:
+                orphan.unlink()
+            except OSError:
+                pass
+    # Prune old archives strictly AFTER the new archive is durably in place
+    pruned_count, pruned_bytes = _prune_logs_archives(archive_dir, keep)
+    try:
+        archive_bytes = final_archive.stat().st_size
+    except OSError:
+        archive_bytes = 0
+    reclaimed = max(0, total_bytes - archive_bytes) + pruned_bytes
+    return [{
+        "root_kind": "codex_logs_db",
+        "path": str(logs_db),
+        "archive_path": str(final_archive),
+        "bytes": reclaimed,
+        "original_bytes": total_bytes,
+        "archive_bytes": archive_bytes,
+        "pruned_archives": pruned_count,
+        "action": "rotated",
+        "reason": "codex_logs_db_rotated",
+    }]
 
 
 def delete_codex_sessions(root, executable, native_ids, *, dry_run, protected_paths=(), cursors=None):
@@ -632,6 +918,73 @@ class NativeSessionCleanup:
         self.offsets[key] = offset + len(rows) if len(rows) == limit else 0
         return rows
 
+    def rotate_logs_db(self, database, *, dry_run: bool):
+        logs_db = self.root.codex_home / "logs_2.sqlite"
+        if not logs_db.exists() or _codex_logs_db_total_bytes(self.root.codex_home) < _CODEX_LOGS_DB_MAX_BYTES:
+            return []
+        try:
+            with database.read_snapshot() as connection:
+                active = connection.execute(text("""
+                    SELECT 1 WHERE
+                      EXISTS (SELECT 1 FROM ar_harness_provider_operations WHERE status IN ('running', 'unknown_outcome'))
+                      OR EXISTS (SELECT 1 FROM ar_provider_units WHERE status IN ('active', 'revocation_pending'))
+                      OR EXISTS (SELECT 1 FROM ar_acquisition_requests WHERE status='running')
+                      OR EXISTS (SELECT 1 FROM ar_deepfetch_runs WHERE status='running')
+                      OR EXISTS (SELECT 1 FROM ar_run_controls WHERE status='running')
+                      OR EXISTS (SELECT 1 FROM hc_companion_turns WHERE assistant_status='processing')
+                      OR EXISTS (SELECT 1 FROM hc_intent_drafting_turns WHERE assistant_status='running')
+                      OR EXISTS (SELECT 1 FROM hc_manual_drafting_turns WHERE assistant_status='running')
+                      OR EXISTS (SELECT 1 FROM hc_proposal_generation_attempts WHERE status='running')
+                """)).first() is not None
+                if active:
+                    return [{
+                        "root_kind": "codex_logs_db",
+                        "path": str(logs_db),
+                        "bytes": _codex_logs_db_total_bytes(self.root.codex_home),
+                        "action": "skipped",
+                        "reason": "codex_logs_db_in_use",
+                    }]
+                locators = _original_locators(connection)
+                pending_intakes = _pending_intake_paths(connection)
+            protected = _resolve_protected_paths((*locators, *pending_intakes))
+        except (OwnerConflict, OSError, ValueError):
+            return []
+        recorder = self.root.root / "research-recorder" / "summaries.sqlite3"
+        if recorder.exists() and not recorder.is_symlink() and recorder.resolve() == recorder:
+            try:
+                with sqlite3.connect(recorder.as_uri() + "?mode=ro", uri=True, timeout=2) as rdb:
+                    has_jobs = rdb.execute(
+                        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='jobs'"
+                    ).fetchone() is not None
+                    if has_jobs and rdb.execute(
+                        "SELECT 1 FROM jobs WHERE status='active' LIMIT 1"
+                    ).fetchone() is not None:
+                        return [{
+                            "root_kind": "codex_logs_db",
+                            "path": str(logs_db),
+                            "bytes": _codex_logs_db_total_bytes(self.root.codex_home),
+                            "action": "skipped",
+                            "reason": "codex_logs_db_in_use",
+                        }]
+            except sqlite3.Error:
+                return [{
+                    "root_kind": "codex_logs_db",
+                    "path": str(logs_db),
+                    "bytes": _codex_logs_db_total_bytes(self.root.codex_home),
+                    "action": "skipped",
+                    "reason": "codex_logs_db_in_use",
+                }]
+        try:
+            return rotate_codex_logs_db(self.root, dry_run=dry_run, protected_paths=protected)
+        except (OSError, sqlite3.Error, ValueError):
+            return [{
+                "root_kind": "codex_logs_db",
+                "path": str(logs_db),
+                "bytes": 0,
+                "action": "skipped",
+                "reason": "codex_logs_db_unavailable",
+            }]
+
     def long_lived(self, database, *, dry_run, limit):
         with database.read_snapshot() as connection:
             ids = set(self.page("companion", connection, """
@@ -706,8 +1059,9 @@ class NativeSessionCleanup:
                      WHERE a.status IN ('queued','running') OR f.operation_ref IS NOT NULL
                 """, ids).scalars())
         recorder = self.root.root / "research-recorder" / "summaries.sqlite3"
+        logs_report = self.rotate_logs_db(database, dry_run=dry_run)
         if not ids and not recorder.exists():
-            return []
+            return logs_report
         # Load source protection once, and only if a bound retired UUID exists.
         def reclaim(refs):
             if not any(_uuid(ref) for ref in refs):
@@ -731,7 +1085,7 @@ class NativeSessionCleanup:
                 if tables != {"jobs", "quests"}:
                     return [*reclaim(ids), {"root_kind": "native_session", "session_ref": None,
                         "path": str(recorder), "bytes": 0, "action": "skipped",
-                        "reason": "native_recorder_schema_unavailable"}]
+                        "reason": "native_recorder_schema_unavailable"}, *logs_report]
                 offset = self.offsets.get("recorder", 0)
                 retired = [r[0] for r in db.execute("""
                     SELECT DISTINCT j.native_session_ref FROM jobs j WHERE j.native_session_ref IS NOT NULL
@@ -744,5 +1098,5 @@ class NativeSessionCleanup:
                       )
                     ORDER BY 1 LIMIT ? OFFSET ?""", (limit, offset))]
                 self.offsets["recorder"] = offset + len(retired) if len(retired) == limit else 0
-                return reclaim(ids | set(retired))
-        return reclaim(ids)
+                return [*reclaim(ids | set(retired)), *logs_report]
+        return [*reclaim(ids), *logs_report]

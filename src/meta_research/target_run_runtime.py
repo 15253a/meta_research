@@ -97,6 +97,7 @@ class TargetRunRuntimeStatus:
     operator_required: bool = False
     audit_ref: str | None = None
     correlation_ref: str | None = None
+    upstream_classification: str | None = None
 
 
 class TargetRunRuntime:
@@ -179,7 +180,12 @@ class TargetRunRuntime:
             try:
                 operation = self._harnesses.reconcile_failed_target_operation(harness.harness_request_ref)
             except HarnessAdmissionError as error:
-                self._set_status(target_ref, "failed", error.code)
+                self._set_status(
+                    target_ref,
+                    "failed",
+                    error.code,
+                    upstream_classification=error.upstream_classification,
+                )
                 return False
             if operation.status == "unknown_outcome":
                 self._set_status(target_ref, "failed", "provider_terminal_proof_missing")
@@ -249,6 +255,7 @@ class TargetRunRuntime:
                     "harness_pending",
                     error.code,
                     next_retry_at=error.next_retry_at,
+                    upstream_classification=error.upstream_classification,
                 )
                 return False
             self._set_status(target_ref, "harness_admitted")
@@ -461,6 +468,7 @@ class TargetRunRuntime:
                     "harness_recovery_pending",
                     error.code,
                     next_retry_at=error.next_retry_at,
+                    upstream_classification=error.upstream_classification,
                 )
                 return False
             self._set_status(target_ref, "harness_recovered")
@@ -579,6 +587,7 @@ class TargetRunRuntime:
                 "root_pending",
                 error.code,
                 next_retry_at=error.next_retry_at,
+                upstream_classification=error.upstream_classification,
             )
             return False
 
@@ -746,6 +755,7 @@ class TargetRunRuntime:
                 "revision_required",
                 error.code,
                 next_retry_at=error.next_retry_at,
+                upstream_classification=error.upstream_classification,
             )
             return False
         self._set_status(handle.target_ref, "root_revision_turn_completed")
@@ -911,6 +921,7 @@ class TargetRunRuntime:
         operator_required: bool = False,
         audit_ref: str | None = None,
         correlation_ref: str | None = None,
+        upstream_classification: str | None = None,
     ) -> None:
         self._status_by_target[target_ref] = TargetRunRuntimeStatus(
             target_ref=target_ref,
@@ -920,6 +931,7 @@ class TargetRunRuntime:
             operator_required=operator_required,
             audit_ref=audit_ref,
             correlation_ref=correlation_ref,
+            upstream_classification=upstream_classification,
         )
 
 

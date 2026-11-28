@@ -1096,7 +1096,10 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 required_capabilities=("semantic_mcp",),
             )
         except HarnessAdmissionError as error:
-            raise ReasoningSkillUnavailable(error.code) from error
+            raise ReasoningSkillUnavailable(
+                error.code,
+                upstream_classification=error.upstream_classification,
+            ) from error
         if not set(operation_ids) <= set(conformance.required_operation_ids):
             raise ReasoningSkillUnavailable(
                 "reasoning_semantic_mcp_operation_binding_incomplete"
@@ -1239,7 +1242,10 @@ class CodexReasoningSkillAdapter(CodexPlanSkillAdapter):
                 required_capabilities=("semantic_mcp",),
             )
         except HarnessAdmissionError as error:
-            raise ReasoningSkillUnavailable(error.code) from error
+            raise ReasoningSkillUnavailable(
+                error.code,
+                upstream_classification=error.upstream_classification,
+            ) from error
         operation_ids = self._reasoning_semantic_operation_ids()
         if not set(operation_ids) <= set(conformance.required_operation_ids):
             raise ReasoningSkillUnavailable(

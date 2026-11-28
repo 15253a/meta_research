@@ -2500,9 +2500,18 @@ class SQLiteAgentRuntimeHarness:
     def prior_target_inputs(self, run_ref: str) -> tuple[str, ...]:
         with self._database.read() as connection:
             rows = connection.execute(text(
-                "SELECT frozen_prompt FROM ar_harness_provider_operations "
-                "WHERE run_ref=:run_ref AND status='completed' "
-                "AND frozen_prompt IS NOT NULL ORDER BY generation DESC"
+                "SELECT generation, frozen_prompt FROM ("
+                "  SELECT generation, frozen_prompt FROM ar_harness_provider_operations "
+                "  WHERE run_ref=:run_ref AND status='executed' AND frozen_prompt IS NOT NULL "
+                "  ORDER BY generation ASC LIMIT 1"
+                ") "
+                "UNION "
+                "SELECT generation, frozen_prompt FROM ("
+                "  SELECT generation, frozen_prompt FROM ar_harness_provider_operations "
+                "  WHERE run_ref=:run_ref AND status='executed' AND frozen_prompt IS NOT NULL "
+                "  ORDER BY generation DESC LIMIT 3"
+                ") "
+                "ORDER BY generation ASC"
             ), {"run_ref": run_ref}).all()
         return tuple(row.frozen_prompt for row in rows)
 

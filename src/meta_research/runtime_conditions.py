@@ -466,12 +466,24 @@ def resume_runtime_conditions(conditions: str, previous: tuple[str, ...], *, ord
         compared = previous[:1] if ordered else previous
         return "" if all(value == conditions for value in compared) else conditions
     updates = {}
+    time_policy_changed = False
     for field, value in current_values.items():
         if field == "research_time":
-            updates[field] = {key: value[key] for key in (
+            snapshot = {key: value[key] for key in (
                 "budget_revision", "approved_seconds", "used_seconds", "remaining_seconds",
                 "overrun_seconds", "observed_at", "accuracy", "status", "budget_policy",
                 "accounting_corrections", "unknown_intervals") if key in value}
+            updates[field] = snapshot
+            known_policies = [
+                values["research_time"].get("budget_policy")
+                for values, _, _ in observed
+                if isinstance(values.get("research_time"), dict)
+            ]
+            if ordered:
+                known_policies = known_policies[:1]
+            current_policy = snapshot.get("budget_policy")
+            if not known_policies or any(policy != current_policy for policy in known_policies):
+                time_policy_changed = True
         else:
             known = [values[field] for values, _, _ in observed if field in values]
             if ordered:
@@ -481,7 +493,7 @@ def resume_runtime_conditions(conditions: str, previous: tuple[str, ...], *, ord
     lines = []
     if updates:
         lines.append("当前运行条件更新=" + json.dumps(updates, ensure_ascii=False, separators=(",", ":")))
-        if "research_time" in updates:
+        if "research_time" in updates and time_policy_changed:
             lines.append(_RESEARCH_TIME_GUIDANCE.rstrip())
         if "research_style" in updates:
             lines.append(render_research_style(updates["research_style"]))

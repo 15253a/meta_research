@@ -1250,7 +1250,10 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
                 required_capabilities=("semantic_mcp",),
             )
         except HarnessAdmissionError as error:
-            raise BundleSkillUnavailable(error.code) from error
+            raise BundleSkillUnavailable(
+                error.code,
+                upstream_classification=error.upstream_classification,
+            ) from error
         rebound = bind_bundle_runtime_to_full_conformance(
             self._base_runtime_binding(),
             conformance,

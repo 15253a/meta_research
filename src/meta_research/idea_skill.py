@@ -2985,7 +2985,12 @@ class CodexIdeaSkillAdapter:
                 )
                 effective_returncode = cast(int, exit_marker["returncode"])
                 if effective_returncode == 75 and (directory / "native-turn-start.json").is_file():
-                    raise IdeaSkillUnavailable("codex_operation_reconciliation_pending")
+                    from meta_research.native_codex_bridge import extract_native_error_classification
+
+                    raise IdeaSkillUnavailable(
+                        "codex_operation_reconciliation_pending",
+                        upstream_classification=extract_native_error_classification(completed.stdout),
+                    )
                 native_failure = _provider_native_session_unavailable(directory, exit_marker, native_session_ref)
                 if native_failure is not None:
                     raise native_failure
@@ -3013,6 +3018,7 @@ class CodexIdeaSkillAdapter:
                 _parse_jsonl,
                 _stream_has_auth_failure,
             )
+            from meta_research.native_codex_bridge import extract_native_error_classification
 
             events = _parse_jsonl(completed.stdout)
             if _codex_turn_insufficient_balance(events):
@@ -3026,6 +3032,7 @@ class CodexIdeaSkillAdapter:
             raise IdeaSkillUnavailable(
                 failure_code,
                 native_session_ref=failed_native_session_ref,
+                upstream_classification=extract_native_error_classification(events),
             )
         try:
             decoded = json.loads(
